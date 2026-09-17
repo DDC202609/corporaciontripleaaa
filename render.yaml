@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: corporacion-triple-aaa
+    runtime: python
+    region: ohio
+    plan: 0.5c-512mb
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn --workers 1 --bind 0.0.0.0:$PORT server:app
+    healthCheckPath: /login
+    domains:
+      - corporaciontripleaaa.com
+      - www.corporaciontripleaaa.com
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: DATA_DIR
+        value: /var/data
+      - key: SECRET_KEY
+        generateValue: true
+      - key: SESSION_COOKIE_SECURE
+        value: "true"
+    disk:
+      name: corporacion-triple-aaa-data
+      mountPath: /var/data
+      sizeGB: 1

@@ -1,0 +1,10 @@
+# Mantener solo la base inicial al crear el repositorio de despliegue.
+data/*
+!data/autolote.sqlite
+
+# Secretos y archivos locales.
+data/.session_secret
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
