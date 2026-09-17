@@ -25,10 +25,112 @@ app=Flask(__name__)
 app.config.update(SECRET_KEY=SECRET_KEY,SESSION_COOKIE_HTTPONLY=True,SESSION_COOKIE_SAMESITE='Lax',SESSION_COOKIE_SECURE=os.environ.get('SESSION_COOKIE_SECURE','').lower() in {'1','true','yes'})
 ESTADOS_VEHICULO=('En Tránsito','Nacionalizado','En Taller','DPV','Reservado','Vendido')
 
+# Módulos que se pueden asignar a un perfil.  Los permisos se validan tanto en
+# la interfaz como en cada solicitud al servidor.
+ACCESS_MODULES=(
+    ('dashboard','Dashboard'),('vehiculos','Vehículos'),('informacion_vehiculo','Información de vehículo'),
+    ('proveedores','Proveedores'),('adquisiciones','Adquisiciones'),('taller','Taller'),('costeo','Costeo'),
+    ('ventas','Ventas y cobros'),('vendedores','Vendedores'),('inventario','Consulta de inventario'),
+    ('catalogo','Catálogo contable'),('centros_costo','Centros de costo'),('contabilidad','Contabilidad'),
+    ('caja_bancos','Caja y bancos'),('gastos','Registro de gastos'),('comisiones','Comisiones'),
+)
+
+def init_access_control_schema():
+    """Migración aislada y segura para perfiles y permisos de acceso."""
+    c=db()
+    c.execute('''CREATE TABLE IF NOT EXISTS perfiles(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        nombre TEXT NOT NULL UNIQUE COLLATE NOCASE,
+        descripcion TEXT,
+        activo INTEGER NOT NULL DEFAULT 1,
+        es_administrador INTEGER NOT NULL DEFAULT 0,
+        es_sistema INTEGER NOT NULL DEFAULT 0,
+        creado_en TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS perfil_permisos(
+        perfil_id INTEGER NOT NULL REFERENCES perfiles(id) ON DELETE CASCADE,
+        modulo TEXT NOT NULL,
+        puede_ver INTEGER NOT NULL DEFAULT 0,
+        puede_modificar INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY(perfil_id,modulo)
+    )''')
+    # La tabla usuarios existe en todas las instalaciones actuales.  Esta
+    # columna es aditiva y preserva las cuentas que ya estaban creadas.
+    try:
+        user_columns={row['name'] for row in c.execute('PRAGMA table_info(usuarios)')}
+        if user_columns and 'perfil_id' not in user_columns:
+            c.execute('ALTER TABLE usuarios ADD COLUMN perfil_id INTEGER REFERENCES perfiles(id)')
+    except sqlite3.OperationalError:
+        c.close(); return
+
+    defaults=(
+        ('Administrador','Acceso completo al sistema.',1,1),
+        ('Operaciones','Inventario, adquisiciones, taller y costeo.',0,1),
+        ('Ventas','Ventas, clientes, vehículos disponibles y cobros.',0,1),
+        ('Consulta','Acceso de solo lectura a indicadores y consultas.',0,1),
+    )
+    for name,description,is_admin,is_system in defaults:
+        c.execute('INSERT OR IGNORE INTO perfiles(nombre,descripcion,es_administrador,es_sistema) VALUES(?,?,?,?)',
+                  (name,description,is_admin,is_system))
+    profiles={row['nombre']:row['id'] for row in c.execute('SELECT id,nombre FROM perfiles')}
+    all_modules={key for key,_ in ACCESS_MODULES}
+    operational={'dashboard','vehiculos','informacion_vehiculo','proveedores','adquisiciones','taller','costeo','inventario'}
+    sales={'dashboard','vehiculos','ventas','vendedores','inventario','caja_bancos','comisiones'}
+    consultation={'dashboard','vehiculos','inventario','contabilidad','caja_bancos','ventas'}
+    for profile_name,allowed in (('Administrador',all_modules),('Operaciones',operational),('Ventas',sales),('Consulta',consultation)):
+        profile_id=profiles.get(profile_name)
+        if not profile_id: continue
+        is_admin=profile_name=='Administrador'
+        for module,_ in ACCESS_MODULES:
+            can_view=1 if (is_admin or module in allowed) else 0
+            can_edit=1 if (is_admin or (profile_name!='Consulta' and module in allowed)) else 0
+            c.execute('''INSERT OR IGNORE INTO perfil_permisos(perfil_id,modulo,puede_ver,puede_modificar)
+                         VALUES(?,?,?,?)''',(profile_id,module,can_view,can_edit))
+    admin_id=profiles.get('Administrador')
+    if admin_id:
+        # No se le quita acceso al administrador histórico durante la migración.
+        c.execute('UPDATE usuarios SET perfil_id=? WHERE perfil_id IS NULL',(admin_id,))
+    c.commit(); c.close()
+
+def user_access(user_id):
+    c=db()
+    row=c.execute('''SELECT u.id,u.username,u.nombre,u.email,u.activo,u.perfil_id,
+        p.nombre perfil_nombre,COALESCE(p.es_administrador,0) es_administrador
+        FROM usuarios u LEFT JOIN perfiles p ON p.id=u.perfil_id WHERE u.id=?''',(user_id,)).fetchone()
+    if not row:
+        c.close(); return None
+    data=dict(row)
+    permissions={item['modulo']:{'ver':bool(item['puede_ver']),'modificar':bool(item['puede_modificar'])}
+                 for item in c.execute('SELECT modulo,puede_ver,puede_modificar FROM perfil_permisos WHERE perfil_id=?',(data.get('perfil_id'),))}
+    c.close(); data['permisos']=permissions
+    return data
+
+def request_module(path):
+    if path.startswith('/api/usuarios') or path.startswith('/api/perfiles'): return 'usuarios'
+    if path.startswith('/api/dashboard'): return 'dashboard'
+    if path.startswith('/api/contabilidad') or path.startswith('/api/cuentas-por-'): return 'contabilidad'
+    if path.startswith('/api/caja'): return 'caja_bancos'
+    if path.startswith('/api/gastos') or path.startswith('/api/conceptos-gasto'): return 'gastos'
+    if path.startswith('/api/comisiones'): return 'comisiones'
+    if path.startswith('/api/vendedores'): return 'vendedores'
+    if path.startswith('/api/ventas'): return 'ventas'
+    if path.startswith('/api/proveedores') or path.startswith('/api/financieras'): return 'proveedores'
+    if path.startswith('/api/informacion-vehiculo'): return 'informacion_vehiculo'
+    if path.startswith('/api/catalogo'): return 'catalogo'
+    if path.startswith('/api/areas') or path.startswith('/api/departamentos'): return 'centros_costo'
+    if path.startswith('/api/inventario'): return 'inventario'
+    if path.startswith('/api/adquisiciones'): return 'adquisiciones'
+    if path.startswith('/api/ordenes-trabajo'): return 'taller'
+    if path.startswith('/api/vehiculos'):
+        return 'vehiculos'
+    return None
+
 LOGIN_TEMPLATE='''<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{{ title }} · Corporación Triple AAA</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#f4f7fb;font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#182230}.card{width:min(410px,calc(100vw - 40px));background:#fff;border:1px solid #d9e0ea;border-radius:18px;padding:34px;box-shadow:0 16px 42px #18223016}h1{margin:0 0 8px;font-size:2rem}.sub{color:#667085;margin-bottom:28px}label{font-weight:700;display:block;margin:16px 0 7px}input{box-sizing:border-box;width:100%;border:1px solid #cbd5e1;border-radius:9px;padding:12px;font-size:1rem}button{width:100%;border:0;border-radius:9px;padding:13px;background:#175cd3;color:#fff;font-weight:800;font-size:1rem;margin-top:24px;cursor:pointer}.error{margin:14px 0;padding:10px;border-radius:8px;background:#fef3f2;color:#b42318}.brand{color:#175cd3;font-weight:800;margin-bottom:10px}</style></head><body><main class="card"><div class="brand">Corporación Triple AAA</div><h1>{{ title }}</h1><div class="sub">{{ subtitle }}</div>{% if error %}<div class="error">{{ error }}</div>{% endif %}<form method="post"><label>Usuario</label><input name="username" required autocomplete="username" minlength="3" autofocus><label>Contraseña</label><input name="password" type="password" required autocomplete="{{ 'new-password' if setup else 'current-password' }}" minlength="8"><button>{{ button }}</button></form></main></body></html>'''
 
 def db():
     c=sqlite3.connect(DB); c.row_factory=sqlite3.Row; c.execute('PRAGMA foreign_keys=ON'); return c
+
+init_access_control_schema()
 
 def user_count():
     c=db()
@@ -44,8 +146,17 @@ def require_authenticated_user():
         return redirect(url_for('setup'))
     user_id=session.get('user_id')
     if user_id:
-        c=db(); user=c.execute('SELECT id FROM usuarios WHERE id=? AND activo=1',(user_id,)).fetchone(); c.close()
-        if user: return None
+        user=user_access(user_id)
+        if user and user.get('activo'):
+            module=request_module(request.path)
+            if module=='usuarios':
+                if user.get('es_administrador'): return None
+                return jsonify(error='No tiene permisos para administrar accesos.'),403
+            if module and not user.get('es_administrador'):
+                required='ver' if request.method in {'GET','HEAD','OPTIONS'} else 'modificar'
+                if not user.get('permisos',{}).get(module,{}).get(required,False):
+                    return jsonify(error='No tiene permisos para realizar esta acción.'),403
+            return None
     session.clear()
     if request.path.startswith('/api/'):
         return jsonify(error='Sesión requerida.'),401
@@ -664,7 +775,138 @@ def logout():
 
 @app.get('/api/sesion')
 def sesion_actual():
-    return jsonify(usuario=session.get('username'))
+    user=user_access(session.get('user_id'))
+    if not user: return jsonify(error='Sesión requerida.'),401
+    return jsonify(usuario=user['username'],nombre=user.get('nombre') or user['username'],
+                   perfil=user.get('perfil_nombre') or 'Sin perfil',es_administrador=bool(user.get('es_administrador')),
+                   permisos=user.get('permisos',{}))
+
+def profile_permissions(c, profile_id):
+    rows={row['modulo']:{'ver':bool(row['puede_ver']),'modificar':bool(row['puede_modificar'])}
+          for row in c.execute('SELECT modulo,puede_ver,puede_modificar FROM perfil_permisos WHERE perfil_id=?',(profile_id,))}
+    return {key:rows.get(key,{'ver':False,'modificar':False}) for key,_ in ACCESS_MODULES}
+
+def profile_payload(c, row):
+    data=dict(row)
+    data['activo']=bool(data['activo']); data['es_administrador']=bool(data['es_administrador'])
+    data['es_sistema']=bool(data['es_sistema']); data['permisos']=profile_permissions(c,data['id'])
+    return data
+
+@app.get('/api/perfiles')
+def get_perfiles():
+    c=db(); rows=[profile_payload(c,row) for row in c.execute('SELECT * FROM perfiles ORDER BY es_administrador DESC,nombre')]
+    c.close(); return jsonify(rows)
+
+def save_profile_permissions(c, profile_id, permissions, is_admin=False):
+    permissions=permissions if isinstance(permissions,dict) else {}
+    for module,_ in ACCESS_MODULES:
+        item=permissions.get(module,{}) if isinstance(permissions.get(module,{}),dict) else {}
+        can_view=bool(item.get('ver')) or bool(item.get('modificar'))
+        can_edit=bool(item.get('modificar'))
+        if is_admin: can_view=can_edit=True
+        c.execute('''INSERT INTO perfil_permisos(perfil_id,modulo,puede_ver,puede_modificar) VALUES(?,?,?,?)
+            ON CONFLICT(perfil_id,modulo) DO UPDATE SET puede_ver=excluded.puede_ver,puede_modificar=excluded.puede_modificar''',
+                  (profile_id,module,int(can_view),int(can_edit)))
+
+def profile_input(data):
+    name=(data.get('nombre') or '').strip()
+    if len(name)<3: return None,'El nombre del perfil debe tener al menos 3 caracteres.'
+    return (name,(data.get('descripcion') or '').strip() or None,1 if data.get('activo',True) not in (False,0,'0') else 0),None
+
+@app.post('/api/perfiles')
+def post_perfil():
+    data=request.get_json(silent=True) or {}; values,error=profile_input(data)
+    if error: return jsonify(error=error),400
+    c=db()
+    try:
+        cur=c.execute('INSERT INTO perfiles(nombre,descripcion,activo) VALUES(?,?,?)',values)
+        save_profile_permissions(c,cur.lastrowid,data.get('permisos'))
+        c.commit()
+    except sqlite3.IntegrityError:
+        c.rollback(); c.close(); return jsonify(error='Ya existe un perfil con ese nombre.'),409
+    row=c.execute('SELECT * FROM perfiles WHERE id=?',(cur.lastrowid,)).fetchone(); result=profile_payload(c,row); c.close()
+    return jsonify(result),201
+
+@app.put('/api/perfiles/<int:profile_id>')
+def put_perfil(profile_id):
+    data=request.get_json(silent=True) or {}; values,error=profile_input(data)
+    if error: return jsonify(error=error),400
+    c=db(); profile=c.execute('SELECT * FROM perfiles WHERE id=?',(profile_id,)).fetchone()
+    if not profile: c.close(); return jsonify(error='Perfil no encontrado.'),404
+    try:
+        c.execute('UPDATE perfiles SET nombre=?,descripcion=?,activo=? WHERE id=?',(*values,profile_id))
+        save_profile_permissions(c,profile_id,data.get('permisos'),bool(profile['es_administrador']))
+        c.commit()
+    except sqlite3.IntegrityError:
+        c.rollback(); c.close(); return jsonify(error='Ya existe otro perfil con ese nombre.'),409
+    row=c.execute('SELECT * FROM perfiles WHERE id=?',(profile_id,)).fetchone(); result=profile_payload(c,row); c.close()
+    return jsonify(result)
+
+@app.get('/api/usuarios')
+def get_usuarios():
+    c=db(); rows=[]
+    for row in c.execute('''SELECT u.id,u.username,u.nombre,u.email,u.activo,u.creado_en,u.ultimo_acceso,u.perfil_id,
+        p.nombre perfil_nombre,p.es_administrador FROM usuarios u LEFT JOIN perfiles p ON p.id=u.perfil_id ORDER BY u.nombre,u.username'''):
+        data=dict(row); data['activo']=bool(data['activo']); data['es_administrador']=bool(data['es_administrador']); rows.append(data)
+    c.close(); return jsonify(rows)
+
+def user_input(data, password_required=False):
+    username=(data.get('username') or '').strip()
+    name=(data.get('nombre') or '').strip()
+    # La instalación inicial tenía email como NOT NULL; se conserva un valor
+    # interno cuando el usuario no desea registrar correo.
+    email=(data.get('email') or '').strip() or f'{username}@local'
+    password=data.get('password') or ''
+    try: profile_id=int(data.get('perfil_id'))
+    except (TypeError,ValueError): profile_id=0
+    if len(username)<3: return None,'El usuario debe tener al menos 3 caracteres.'
+    if not name: return None,'El nombre es obligatorio.'
+    if password_required and len(password)<8: return None,'La contraseña debe tener al menos 8 caracteres.'
+    if password and len(password)<8: return None,'La contraseña debe tener al menos 8 caracteres.'
+    return (username,name,email,profile_id,password),None
+
+@app.post('/api/usuarios')
+def post_usuario():
+    data=request.get_json(silent=True) or {}; values,error=user_input(data,True)
+    if error: return jsonify(error=error),400
+    username,name,email,profile_id,password=values; c=db()
+    if not c.execute('SELECT id FROM perfiles WHERE id=? AND activo=1',(profile_id,)).fetchone():
+        c.close(); return jsonify(error='Seleccione un perfil activo.'),400
+    try:
+        cur=c.execute('''INSERT INTO usuarios(username,password_hash,nombre,email,rol,activo,perfil_id)
+            VALUES(?,?,?,?,?,1,?)''',(username,generate_password_hash(password,method='pbkdf2:sha256'),name,email,'Usuario',profile_id))
+        c.commit()
+    except sqlite3.IntegrityError:
+        c.rollback(); c.close(); return jsonify(error='Ese usuario ya existe.'),409
+    c.close(); return jsonify(id=cur.lastrowid),201
+
+@app.put('/api/usuarios/<int:target_id>')
+def put_usuario(target_id):
+    data=request.get_json(silent=True) or {}; values,error=user_input(data,False)
+    if error: return jsonify(error=error),400
+    username,name,email,profile_id,password=values; active=1 if data.get('activo',True) not in (False,0,'0') else 0
+    c=db(); previous=c.execute('SELECT * FROM usuarios WHERE id=?',(target_id,)).fetchone()
+    profile=c.execute('SELECT * FROM perfiles WHERE id=?',(profile_id,)).fetchone()
+    if not previous: c.close(); return jsonify(error='Usuario no encontrado.'),404
+    if not profile or (not profile['activo'] and active): c.close(); return jsonify(error='Seleccione un perfil válido y activo.'),400
+    # Siempre debe permanecer al menos un administrador activo.
+    old_profile=c.execute('SELECT es_administrador FROM perfiles WHERE id=?',(previous['perfil_id'],)).fetchone()
+    leaving_admin=bool(old_profile and old_profile['es_administrador']) and (not active or not profile['es_administrador'])
+    if leaving_admin:
+        admins=c.execute('''SELECT COUNT(*) FROM usuarios u JOIN perfiles p ON p.id=u.perfil_id
+            WHERE u.activo=1 AND p.es_administrador=1 AND u.id<>?''',(target_id,)).fetchone()[0]
+        if not admins: c.close(); return jsonify(error='Debe mantenerse al menos un administrador activo.'),400
+    try:
+        if password:
+            c.execute('''UPDATE usuarios SET username=?,nombre=?,email=?,perfil_id=?,activo=?,password_hash=? WHERE id=?''',
+                      (username,name,email,profile_id,active,generate_password_hash(password,method='pbkdf2:sha256'),target_id))
+        else:
+            c.execute('UPDATE usuarios SET username=?,nombre=?,email=?,perfil_id=?,activo=? WHERE id=?',
+                      (username,name,email,profile_id,active,target_id))
+        c.commit()
+    except sqlite3.IntegrityError:
+        c.rollback(); c.close(); return jsonify(error='Ese usuario ya existe.'),409
+    c.close(); return jsonify(ok=True)
 
 @app.get('/')
 def home(): return send_from_directory(APP,'index.html')
