@@ -1,6 +1,6 @@
-from flask import Flask, request, jsonify, send_from_directory, session, redirect, url_for, render_template_string
+from flask import Flask, request, jsonify, send_from_directory, send_file, session, redirect, url_for, render_template_string
 from werkzeug.security import check_password_hash, generate_password_hash
-import sqlite3, os, shutil, uuid
+import sqlite3, os, shutil, uuid, hmac, io, json, tempfile, zipfile
 from datetime import datetime
 ROOT=os.path.dirname(os.path.abspath(__file__))
 BUNDLED_DATA=os.path.join(ROOT,'data')
@@ -140,7 +140,7 @@ def user_count():
 
 @app.before_request
 def require_authenticated_user():
-    if request.endpoint in {'login','setup','logout','static'} or request.path.startswith('/static/'):
+    if request.endpoint in {'login','setup','logout','static','download_system_backup'} or request.path.startswith('/static/'):
         return None
     if not user_count():
         return redirect(url_for('setup'))
@@ -772,6 +772,39 @@ def login():
 @app.post('/logout')
 def logout():
     session.clear(); return jsonify(ok=True)
+
+@app.get('/respaldo/sistema.zip')
+def download_system_backup():
+    """Entrega una copia consistente del sistema para el respaldo local autorizado."""
+    configured_token=os.environ.get('BACKUP_TOKEN','')
+    header=request.headers.get('Authorization','')
+    supplied_token=header[7:] if header.startswith('Bearer ') else ''
+    if not configured_token:
+        return jsonify(error='El respaldo local aún no está configurado.'),503
+    if not supplied_token or not hmac.compare_digest(supplied_token,configured_token):
+        return jsonify(error='No autorizado.'),401
+    created=datetime.now().astimezone().isoformat()
+    with tempfile.TemporaryDirectory(prefix='aaa-backup-') as temporary_directory:
+        database_copy=os.path.join(temporary_directory,'autolote.sqlite')
+        source=sqlite3.connect(DB); target=sqlite3.connect(database_copy)
+        source.backup(target); target.close(); source.close()
+        content=io.BytesIO(); files=['datos/autolote.sqlite']
+        with zipfile.ZipFile(content,'w',zipfile.ZIP_DEFLATED,compresslevel=6) as archive:
+            archive.write(database_copy,'datos/autolote.sqlite')
+            for relative in ('server.py','requirements.txt','render.yaml'):
+                path=os.path.join(ROOT,relative)
+                if os.path.isfile(path): archive.write(path,f'sistema/{relative}'); files.append(f'sistema/{relative}')
+            for folder,_,names in os.walk(APP):
+                for name in names:
+                    path=os.path.join(folder,name); relative=os.path.relpath(path,ROOT)
+                    archive.write(path,f'sistema/{relative}'); files.append(f'sistema/{relative}')
+            archive.writestr('manifiesto.json',json.dumps({
+                'generado_en':created,'contenido':files,
+                'nota':'Las variables de entorno y secretos no se incluyen por seguridad.'
+            },ensure_ascii=False,indent=2))
+        content.seek(0)
+        return send_file(content,mimetype='application/zip',as_attachment=True,
+                         download_name=f'corporacion-triple-aaa-{datetime.now().strftime("%Y-%m-%d_%H%M%S")}.zip')
 
 @app.get('/api/sesion')
 def sesion_actual():
