@@ -484,5 +484,17 @@ async function saveAccessProfile(event){event.preventDefault();let form=event.ta
 function accessModuleForNavigation(id){return {dash:'dashboard',veh:'vehiculos',vehInfo:'informacion_vehiculo',maint:'proveedores',buy:'adquisiciones',cat:'catalogo',cc:'centros_costo',com:'comisiones',accounting:'contabilidad',cash:'caja_bancos',expenses:'gastos',sellers:'vendedores',sales:'ventas',inventory:'inventario',workshop:'taller',costing:'costeo'}[id]}
 function applyAccessUI(){if(!accessSession)return;let isAdmin=accessSession.es_administrador;let nav=document.querySelector('aside nav');nav?.querySelectorAll('button[onclick*="go("]').forEach(button=>{let action=button.getAttribute('onclick')||'',id=(action.split("go('")[1]||'').split("'")[0],module=accessModuleForNavigation(id);if(module&&!isAdmin&&!accessSession.permisos?.[module]?.ver)button.classList.add('hidden')});let adminNav=$('accessNavigation');if(adminNav)adminNav.closest('.nav-group').classList.toggle('hidden',!isAdmin)}
 accessRequest('/api/sesion').then(sessionData=>{accessSession=sessionData;applyAccessUI()}).catch(()=>{});
+function compactDashboardOnPhone(){let dashboard=document.querySelector('.executive-dashboard');if(!dashboard)return;dashboard.querySelectorAll('.dashboard-report th').forEach(header=>{if(header.textContent.trim()==='Unidades')header.textContent='Unid.'});let textNodes=[],walker=document.createTreeWalker(dashboard,NodeFilter.SHOW_TEXT);while(walker.nextNode())textNodes.push(walker.currentNode);textNodes.forEach(node=>{node.nodeValue=node.nodeValue.replace(/(L\s[\d,.]+)\.\d{2}\b/g,'$1')})}
+const dashWithPhoneDashboardCompact=dash;
+dash=async function(){await dashWithPhoneDashboardCompact();compactDashboardOnPhone()};
+document.head.insertAdjacentHTML('beforeend',`<style>
+@media(max-width:700px){
+  .dashboard-report:not(.aging-report) table{font-size:12px}
+  .dashboard-report:not(.aging-report) th,.dashboard-report:not(.aging-report) td{padding:9px 6px}
+  .dashboard-report:not(.aging-report) th:last-child,.dashboard-report:not(.aging-report) td:last-child{display:none}
+  .dashboard-report:not(.aging-report) td:first-child{white-space:normal;min-width:90px}
+  .dashboard-report:not(.aging-report) th:nth-child(2),.dashboard-report:not(.aging-report) td:nth-child(2){min-width:42px}
+}
+</style>`);
 dash();
 </script></body></html>
