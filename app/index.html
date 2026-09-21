@@ -562,5 +562,58 @@ const renderAccountingWithPartsPayables=renderAccounting;
 renderAccounting=function(){if(currentAccountingTab!=='cxp')return renderAccountingWithPartsPayables();let rows=accountingData.cxp||[];$('accountingContent').innerHTML=reportTable(rows,[{label:'Fecha',value:row=>esc(row.fecha)},{label:'Origen',value:row=>esc(row.origen||'Adquisición')},{label:'Documento',value:row=>esc(row.documento||'Adquisición')},{label:'Proveedor',value:row=>esc(row.proveedor_nombre)},{label:'Vehículo',value:row=>esc(`${row.vin} · ${row.marca||''} ${row.modelo||''}`)},{label:'Monto',value:row=>money(row.monto_original)},{label:'Saldo',value:row=>money(row.saldo)},{label:'Estado',value:row=>`<span class="pill">${esc(row.estado)}</span>`},{label:'',value:row=>Number(row.saldo)>0?`<button class="primary" onclick="openPortfolioPayment('${row.origen==='Repuesto / OT'?'cxp_repuesto':row.origen==='OT'?'cxp_ot':'cxp'}','${esc(row.id)}',${Number(row.saldo)})">Registrar pago</button>`:'—'}]);};
 const savePortfolioPaymentWithParts=savePortfolioPayment;
 savePortfolioPayment=async function(event){if(portfolioPaymentTarget?.type!=='cxp_repuesto')return savePortfolioPaymentWithParts(event);event.preventDefault();let data=Object.fromEntries(new FormData(event.target).entries());data.monto=Number(data.monto);let id=String(portfolioPaymentTarget.id).replace('repuesto:',''),response=await fetch('/api/cuentas-por-pagar-repuestos/'+id+'/pagos',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)}),result=await response.json();if(!response.ok)return showNotice(result.error||'No se pudo registrar el pago.','error');closePortfolioPayment();showNotice('Pago de repuesto registrado correctamente.');await Promise.all([loadAccounting(),loadCash(),dash()])};
+/* Correcciones de navegación: OT consultable y Kardex buscable por VIN. */
+const renderWorkshopOrdersWithDetailLink=renderWorkshopOrdersForVin;
+renderWorkshopOrdersForVin=function(vin=''){
+  renderWorkshopOrdersWithDetailLink(vin);
+  let selectedVin=String(vin||'').trim().toUpperCase(),rows=selectedVin?workshopOrderRows.filter(order=>String(order.vin||'').toUpperCase()===selectedVin):workshopOrderRows;
+  [...$('workOrderBody').querySelectorAll('tr')].forEach((row,index)=>{
+    let order=rows[index],cell=row.querySelector('td');
+    if(!order||!cell)return;
+    cell.innerHTML=`<button class="link-btn" type="button" title="Ver detalle de la OT" onclick="openWorkOrderEdit(${order.id})">${esc(order.numero_ot||'OT pendiente')}</button>`;
+  });
+};
+const openWorkOrderEditWithFullDetail=openWorkOrderEdit;
+openWorkOrderEdit=async function(id){
+  await openWorkOrderEditWithFullDetail(id);
+  let costs=await get('/api/ordenes-trabajo/'+id+'/gastos');
+  $('workOrderEditCosts').innerHTML=`<div class="sub" style="margin-bottom:8px">Detalle de todos los conceptos asociados a esta OT.</div><div class="wide-table"><table><thead><tr><th>Fecha</th><th>Origen</th><th>Tipo</th><th>Descripción</th><th>Proveedor</th><th>Documento</th><th>Pago</th><th>Total</th></tr></thead><tbody>${costs.map(cost=>`<tr><td>${esc(cost.fecha||'—')}</td><td>${esc(cost.origen||'OT')}</td><td>${esc(cost.categoria||'—')}</td><td>${esc(cost.descripcion||'—')}</td><td>${esc(cost.proveedor_nombre||'—')}</td><td>${esc(cost.factura||'—')}</td><td>${esc(cost.metodo_pago||'—')}</td><td><b>${money(cost.total||0)}</b></td></tr>`).join('')||'<tr><td colspan="8" class="sub">Esta OT no tiene conceptos registrados.</td></tr>'}</tbody></table></div>`;
+};
+loadKardexPage=async function(){
+  let vehicles=await get('/api/vehiculos'),field=$('kardexVehicle')?.closest('.field');
+  if(!field)return;
+  let choices=vehicles.map(vehicle=>({id:String(vehicle.id),vin:String(vehicle.vin||''),label:`${vehicle.vin||''} · ${(vehicle.marca||'')} ${(vehicle.modelo||'')}`.trim()}));
+  field.innerHTML=`<label>Buscar vehículo por VIN *</label><div class="toolbar" style="gap:8px"><input id="kardexVehicle" list="kardexVehicleOptions" autocomplete="off" placeholder="Digite el VIN" aria-label="Digite el VIN"><button class="primary" type="button" onclick="searchKardexVin()">Buscar VIN</button></div><datalist id="kardexVehicleOptions">${choices.map(choice=>`<option value="${esc(choice.vin)}">${esc(choice.label)}</option>`).join('')}</datalist><select id="kardexVehicleList" aria-label="Seleccionar vehículo" style="margin-top:8px"><option value="">O seleccione un vehículo…</option>${choices.map(choice=>`<option value="${esc(choice.id)}">${esc(choice.label)}</option>`).join('')}</select><input id="kardexVehicleId" type="hidden">`;
+  window.kardexVehicleChoices=choices;
+  $('kardexVehicle').addEventListener('keydown',event=>{if(event.key==='Enter'){event.preventDefault();searchKardexVin()}});
+  $('kardexVehicle').addEventListener('change',searchKardexVin);
+  $('kardexVehicleList').addEventListener('change',()=>selectKardexVehicle($('kardexVehicleList').value));
+  $('kardexSummary').classList.add('hidden');
+  $('kardexHistory').innerHTML='<div class="sub">Digite un VIN o seleccione un vehículo para consultar su Kardex.</div>';
+};
+function selectKardexVehicle(id){
+  let choice=(window.kardexVehicleChoices||[]).find(item=>item.id===String(id));
+  if(!choice)return;
+  $('kardexVehicleId').value=choice.id;$('kardexVehicle').value=choice.vin;$('kardexVehicleList').value=choice.id;loadKardexVehicle();
+}
+function searchKardexVin(){
+  let vin=String($('kardexVehicle').value||'').trim().toUpperCase(),choices=window.kardexVehicleChoices||[];
+  let choice=choices.find(item=>item.vin.toUpperCase()===vin);
+  if(!choice){$('kardexVehicleId').value='';$('kardexSummary').classList.add('hidden');$('kardexHistory').innerHTML='<div class="form-feedback error" style="display:block">No se encontró un vehículo con ese VIN. Puede escogerlo en la lista.</div>';return}
+  selectKardexVehicle(choice.id);
+}
+async function showTransitTrace(){
+  let rows=await get('/api/contabilidad/inventario-transito/movimientos'+(accountingQuery()?'?'+accountingQuery():''));
+  $('accountingContent').innerHTML=`<div class="panel"><div class="detailhead"><div><h2 style="margin:0">Movimientos de Vehículos en Tránsito</h2><div class="sub">Cada salida identifica el documento que reclasificó el vehículo; no representa una pérdida de inventario.</div></div><button class="btn2" type="button" onclick="accountingTab('balance',document.querySelector('[data-accounting=\"balance\"]'))">Volver al balance</button></div><div class="wide-table">${reportTable(rows,[{label:'Fecha',value:r=>esc(r.fecha)},{label:'Vehículo',value:r=>esc(`${r.vin||'—'} · ${r.marca||''} ${r.modelo||''}`)},{label:'Documento / causa',value:r=>esc(r.asiento_descripcion||r.descripcion||r.referencia_tipo)},{label:'Entrada',value:r=>r.debe?money(r.debe):'—'},{label:'Salida',value:r=>r.haber?money(r.haber):'—'}])}</div></div>`;
+}
+const renderAccountingWithTransitTrace=renderAccounting;
+renderAccounting=function(){
+  let result=renderAccountingWithTransitTrace();
+  if(currentAccountingTab==='balance'&&$('accountingContent')&&!$('transitTraceButton')){
+    $('accountingContent').insertAdjacentHTML('afterbegin','<div class="sub" style="margin-bottom:12px">¿Cambió el saldo de Tránsito? <button id="transitTraceButton" class="link-btn" type="button" onclick="showTransitTrace()">Ver sus movimientos y documentos</button>.</div>');
+  }
+  return result;
+};
+document.head.insertAdjacentHTML('beforeend','<style>.link-btn{border:0;background:transparent;color:#2563d9;font:inherit;font-weight:700;padding:0;cursor:pointer;text-decoration:underline;text-underline-offset:3px}.link-btn:hover{color:#1747a6}</style>');
 dash();
 </script></body></html>

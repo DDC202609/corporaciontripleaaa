@@ -2149,9 +2149,50 @@ def get_repuestos_ot(oid):
 
 @app.get('/api/ordenes-trabajo/<int:oid>/gastos')
 def get_gastos_ot(oid):
-    c=db(); items=c.execute('''SELECT g.*,p.nombre proveedor_nombre FROM gastos_ot g
-        LEFT JOIN proveedores p ON p.id=g.proveedor_id WHERE g.orden_trabajo_id=? ORDER BY g.fecha,g.id''',(oid,)).fetchall(); c.close()
+    # El detalle de una OT no puede depender solo de la tabla histórica de
+    # gastos: los repuestos y la mano de obra final también son costos propios
+    # de la orden. Se entrega una vista unificada, sin duplicar el costo que
+    # ya se registró en costos_vehiculo.
+    c=db(); items=c.execute('''
+        SELECT g.fecha,g.taller_origen,g.categoria,g.descripcion,
+               p.nombre proveedor_nombre,g.factura,g.total,
+               NULL metodo_pago,'Gasto registrado' origen,g.id orden
+          FROM gastos_ot g
+          LEFT JOIN proveedores p ON p.id=g.proveedor_id
+         WHERE g.orden_trabajo_id=?
+        UNION ALL
+        SELECT r.fecha,o.taller,'Repuestos / insumos',r.descripcion,
+               p.nombre,r.factura,r.total,r.metodo_pago,'Repuesto / insumo',r.id
+          FROM repuestos_ot r
+          JOIN ordenes_trabajo o ON o.id=r.orden_trabajo_id
+          JOIN proveedores p ON p.id=r.proveedor_id
+         WHERE r.orden_trabajo_id=?
+        UNION ALL
+        SELECT cv.fecha,o.taller,'Mano de obra / cierre',cv.concepto,
+               cv.proveedor,cv.documento,cv.monto,o.metodo_pago,'Cierre de OT',cv.id
+          FROM costos_vehiculo cv
+          JOIN ordenes_trabajo o ON o.vehiculo_id=cv.vehiculo_id
+         WHERE o.id=? AND cv.documento=o.numero_ot
+           AND COALESCE(cv.categoria,'')='Mano de obra'
+         ORDER BY fecha,orden
+    ''',(oid,oid,oid)).fetchall(); c.close()
     return jsonify([dict(x) for x in items])
+
+@app.get('/api/contabilidad/inventario-transito/movimientos')
+def movimientos_inventario_transito():
+    """Trazabilidad de los asientos que aumentan o disminuyen Tránsito."""
+    _,hasta=rango_reporte(); c=db(); where=['cc.codigo=?']; args=['1105']
+    if hasta:
+        where.append('p.fecha<=?'); args.append(hasta)
+    rows=c.execute('''SELECT p.fecha,p.debe,p.haber,p.vehiculo_id,p.referencia_tipo,
+                             p.referencia_id,p.descripcion,a.descripcion asiento_descripcion,
+                             v.vin,v.marca,v.modelo
+                        FROM partidas p
+                        JOIN cuentas_contables cc ON cc.id=p.cuenta_id
+                        LEFT JOIN asientos_contables a ON a.id=p.asiento_id
+                        LEFT JOIN vehiculos v ON v.id=p.vehiculo_id
+                       WHERE '''+' AND '.join(where)+''' ORDER BY p.fecha DESC,p.id DESC''',args).fetchall()
+    c.close(); return jsonify([dict(row) for row in rows])
 
 @app.post('/api/ordenes-trabajo/<int:oid>/repuestos')
 def post_repuesto_ot(oid):
