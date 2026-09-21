@@ -480,7 +480,7 @@ def asegurar_informacion_vehiculo(c, data):
     version=(data.get('version') or '').strip()
     if tipo or marca or modelo or version:
         c.execute('''INSERT OR IGNORE INTO informacion_vehiculo(tipo_vehiculo,marca,modelo,version)
-            VALUES(?,?,?,?,1)''',(tipo,marca,modelo,version))
+            VALUES(?,?,?,?)''',(tipo,marca,modelo,version))
 
 def add_movimiento(c, vehiculo_id, fecha, tipo, estado_anterior=None, estado_nuevo=None,
                     ubicacion_anterior=None, ubicacion_nueva=None, referencia=None, observaciones=None):
