@@ -1991,9 +1991,18 @@ def put_orden_trabajo(oid):
             c.close(); return jsonify(error='La OT debe tener un taller/proveedor activo para registrar su pago.'),400
         fecha=datetime.now().strftime('%Y-%m-%d')
         c.execute('UPDATE ordenes_trabajo SET metodo_pago=?,banco_pago=?,referencia_pago=? WHERE id=?',(metodo_pago,banco,referencia,oid))
+        documento=order['numero_ot'] or f'OT-{oid}'
+        existing_cost=c.execute('''SELECT id FROM costos_vehiculo WHERE vehiculo_id=? AND documento=?
+            AND categoria='Mano de obra / OT' ORDER BY id DESC LIMIT 1''',(order['vehiculo_id'],documento)).fetchone()
+        if not existing_cost and float(order['valor_final'] or 0):
+            c.execute('''INSERT INTO costos_vehiculo(vehiculo_id,fecha,concepto,categoria,monto,proveedor,documento,observaciones)
+                VALUES(?,?,?,?,?,?,?,?)''',(order['vehiculo_id'],fecha,order['descripcion'] or order['detalle'] or 'Trabajo de taller',
+                'Mano de obra / OT',float(order['valor_final']),provider['nombre'],documento,'Costo regularizado desde cierre de OT anterior.'))
+        c.execute('UPDATE ordenes_trabajo SET costo_cargado=1 WHERE id=?',(oid,))
         contabilizar_cierre_ot(c,order,provider,float(order['valor_final'] or 0),metodo_pago,banco,referencia,fecha)
         vehicle=c.execute('SELECT estado,ubicacion FROM vehiculos WHERE id=?',(order['vehiculo_id'],)).fetchone()
-        add_movimiento(c,order['vehiculo_id'],fecha,'Regularización contable de OT',vehicle['estado'],vehicle['estado'],vehicle['ubicacion'],vehicle['ubicacion'],referencia=order['numero_ot'],observaciones=f'Método de pago: {metodo_pago}. Partida de cierre registrada.')
+        total=costo_consolidado(c,order['vehiculo_id'])
+        add_movimiento(c,order['vehiculo_id'],fecha,'Regularización contable de OT',vehicle['estado'],vehicle['estado'],vehicle['ubicacion'],vehicle['ubicacion'],referencia=documento,observaciones=f'Método de pago: {metodo_pago}. Partida de cierre registrada. Costo consolidado: {total:.2f}')
         c.commit(); c.close(); return jsonify(ok=True,vehiculo_id=order['vehiculo_id'])
     if accion:
         if order['estado']!='Pendiente': c.close(); return jsonify(error='La OT ya está finalizada'),400

@@ -207,6 +207,31 @@ class CriticalFlowsTest(unittest.TestCase):
         self.assertEqual(payment.status_code, 201)
         self.assertEqual(payment.get_json()['estado'], 'Pagada')
 
+    def test_legacy_closed_order_regularization_adds_missing_cost_once(self):
+        self.login_as_admin()
+        connection = self.server.db()
+        vehicle = connection.execute('SELECT id FROM vehiculos ORDER BY id LIMIT 1').fetchone()
+        provider = connection.execute('SELECT id,nombre FROM proveedores WHERE activo=1 ORDER BY id LIMIT 1').fetchone()
+        order_id, order_number = self.server.crear_orden_trabajo(
+            connection, vehicle['id'], None, '2026-09-20', provider['nombre'], 'Prueba histórica', 450, 'OT cerrada antes del pago'
+        )
+        connection.execute("UPDATE ordenes_trabajo SET estado='Finalizada',valor_final=450,costo_cargado=0 WHERE id=?", (order_id,))
+        connection.commit()
+        connection.close()
+        response = self.client.put(
+            f'/api/ordenes-trabajo/{order_id}',
+            json={'accion': 'contabilizar_cierre_existente', 'metodo_pago': 'Efectivo'},
+        )
+        self.assertEqual(response.status_code, 200)
+        connection = self.server.db()
+        cost = connection.execute(
+            "SELECT monto FROM costos_vehiculo WHERE vehiculo_id=? AND documento=? AND categoria='Mano de obra / OT'",
+            (vehicle['id'], order_number),
+        ).fetchone()
+        connection.close()
+        self.assertIsNotNone(cost)
+        self.assertAlmostEqual(cost['monto'], 450, places=2)
+
     def test_unexpected_write_error_rolls_back_and_returns_json(self):
         self.login_as_admin()
         original = self.server.asegurar_informacion_vehiculo
