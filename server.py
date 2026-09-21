@@ -2180,6 +2180,24 @@ def post_repuesto_ot(oid):
     add_movimiento(c,order['vehiculo_id'],fecha,'Repuesto cargado a OT',vehicle['estado'],vehicle['estado'],vehicle['ubicacion'],vehicle['ubicacion'],referencia=factura,observaciones=f'{order["numero_ot"] or "OT"}: {descripcion}. Método: {metodo_pago}. Costo consolidado: {total_consolidado:.2f}')
     c.commit(); c.close(); return jsonify(ok=True,total=total),201
 
+@app.put('/api/repuestos-ot/<int:part_id>/regularizar-pago')
+def regularizar_pago_repuesto(part_id):
+    d=request.get_json(silent=True) or {}; c=db(); part=c.execute('''SELECT r.*,o.vehiculo_id,o.numero_ot,o.estado,p.nombre proveedor_nombre
+        FROM repuestos_ot r JOIN ordenes_trabajo o ON o.id=r.orden_trabajo_id
+        JOIN proveedores p ON p.id=r.proveedor_id WHERE r.id=?''',(part_id,)).fetchone()
+    if not part: c.close(); return jsonify(error='Repuesto no encontrado'),404
+    if part['metodo_pago']:
+        c.close(); return jsonify(error='Este repuesto ya tiene método de pago contabilizado.'),409
+    pago,error=validar_pago_repuesto(d)
+    if error: c.close(); return jsonify(error=error),400
+    metodo_pago,banco,referencia=pago; fecha=d.get('fecha') or part['fecha'] or datetime.now().strftime('%Y-%m-%d')
+    provider=c.execute('SELECT * FROM proveedores WHERE id=?',(part['proveedor_id'],)).fetchone()
+    c.execute('UPDATE repuestos_ot SET metodo_pago=?,banco_pago=?,referencia_pago=? WHERE id=?',(metodo_pago,banco,referencia,part_id))
+    contabilizar_repuesto_ot(c,part_id,part,provider,float(part['total']),metodo_pago,banco,referencia,fecha,part['factura'],part['descripcion'])
+    vehicle=c.execute('SELECT estado,ubicacion FROM vehiculos WHERE id=?',(part['vehiculo_id'],)).fetchone()
+    add_movimiento(c,part['vehiculo_id'],fecha,'Regularización contable de repuesto',vehicle['estado'],vehicle['estado'],vehicle['ubicacion'],vehicle['ubicacion'],referencia=part['factura'],observaciones=f'Método de pago: {metodo_pago}. Partida de repuesto registrada.')
+    c.commit(); c.close(); return jsonify(ok=True)
+
 @app.post('/api/adquisiciones')
 def post_adquisicion():
     d=request.get_json(silent=True)

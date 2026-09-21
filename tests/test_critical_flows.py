@@ -250,7 +250,7 @@ class CriticalFlowsTest(unittest.TestCase):
         self.assertEqual(response.status_code, 201)
         connection = self.server.db()
         move = connection.execute(
-            "SELECT salida FROM movimientos_caja WHERE referencia_tipo='pago_repuesto_ot'"
+            "SELECT salida FROM movimientos_caja WHERE referencia_tipo='pago_repuesto_ot' ORDER BY id DESC LIMIT 1"
         ).fetchone()
         journal = connection.execute(
             "SELECT 1 FROM asientos_contables WHERE referencia_tipo='repuesto_ot'"
@@ -258,6 +258,36 @@ class CriticalFlowsTest(unittest.TestCase):
         connection.close()
         self.assertAlmostEqual(move['salida'], 115, places=2)
         self.assertIsNotNone(journal)
+
+    def test_legacy_parts_can_be_regularized_against_bac(self):
+        self.login_as_admin()
+        connection = self.server.db()
+        vehicle = connection.execute('SELECT id FROM vehiculos ORDER BY id LIMIT 1').fetchone()
+        provider = connection.execute('SELECT id,nombre FROM proveedores WHERE activo=1 ORDER BY id LIMIT 1').fetchone()
+        order_id, _ = self.server.crear_orden_trabajo(
+            connection, vehicle['id'], None, '2026-09-20', provider['nombre'], 'Prueba histórica', 0, 'OT histórica'
+        )
+        cursor = connection.execute(
+            '''INSERT INTO repuestos_ot(orden_trabajo_id,proveedor_id,factura,fecha,descripcion,subtotal,isv,total)
+               VALUES(?,?,?,?,?,?,?,?)''',
+            (order_id, provider['id'], 'QA-LEGACY-BAC-0001', '2026-09-20', 'Repuesto histórico', 200, 30, 230),
+        )
+        connection.commit()
+        connection.close()
+        response = self.client.put(
+            f'/api/repuestos-ot/{cursor.lastrowid}/regularizar-pago',
+            json={'metodo_pago': 'Transferencia', 'banco': 'BAC Credomatic'},
+        )
+        self.assertEqual(response.status_code, 200)
+        connection = self.server.db()
+        part = connection.execute('SELECT metodo_pago,banco_pago FROM repuestos_ot WHERE id=?', (cursor.lastrowid,)).fetchone()
+        move = connection.execute(
+            "SELECT salida,banco FROM movimientos_caja WHERE referencia_tipo='pago_repuesto_ot' AND referencia_id=?", (cursor.lastrowid,)
+        ).fetchone()
+        connection.close()
+        self.assertEqual(part['metodo_pago'], 'Transferencia')
+        self.assertEqual(part['banco_pago'], 'BAC Credomatic')
+        self.assertAlmostEqual(move['salida'], 230, places=2)
 
     def test_unexpected_write_error_rolls_back_and_returns_json(self):
         self.login_as_admin()
