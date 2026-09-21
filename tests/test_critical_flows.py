@@ -96,6 +96,24 @@ class CriticalFlowsTest(unittest.TestCase):
         self.assertEqual(response.status_code, 409)
         self.assertEqual(response.get_json()['error'], 'El VIN ya existe')
 
+    def test_vehicle_list_includes_associated_purchase_summary(self):
+        self.login_as_admin()
+        connection = self.server.db()
+        purchase = connection.execute(
+            '''SELECT a.vehiculo_id,a.id,a.fecha,a.costo_compra,p.nombre proveedor_nombre
+               FROM adquisiciones a JOIN proveedores p ON p.id=a.proveedor_id
+               ORDER BY a.id DESC LIMIT 1'''
+        ).fetchone()
+        connection.close()
+        self.assertIsNotNone(purchase)
+        response = self.client.get('/api/vehiculos')
+        self.assertEqual(response.status_code, 200)
+        vehicle = next(item for item in response.get_json() if item['id'] == purchase['vehiculo_id'])
+        self.assertEqual(vehicle['compra_id'], purchase['id'])
+        self.assertEqual(vehicle['compra_fecha'], purchase['fecha'])
+        self.assertEqual(vehicle['compra_costo'], purchase['costo_compra'])
+        self.assertEqual(vehicle['compra_proveedor'], purchase['proveedor_nombre'])
+
     def test_unexpected_write_error_rolls_back_and_returns_json(self):
         self.login_as_admin()
         original = self.server.asegurar_informacion_vehiculo

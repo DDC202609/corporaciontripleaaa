@@ -1473,7 +1473,16 @@ def get_veh():
     if q:
         like='%'+q+'%'; where.append('(vin LIKE ? OR marca LIKE ? OR modelo LIKE ? OR placa LIKE ? OR lote LIKE ?)'); args += [like]*5
     if estado: where.append('estado=?'); args.append(estado)
-    sql='SELECT * FROM vehiculos'+((' WHERE '+' AND '.join(where)) if where else '')+' ORDER BY id DESC'
+    # Incluimos la última compra en el listado para que las pantallas que
+    # seleccionan un VIN puedan confirmar de inmediato si ya fue adquirido.
+    # El subquery evita duplicar vehículos si hubiera registros históricos.
+    sql='''SELECT v.*,a.id compra_id,a.fecha compra_fecha,a.costo_compra compra_costo,
+        a.anticipo compra_anticipo,a.saldo compra_saldo,a.metodo_pago compra_metodo_pago,
+        p.nombre compra_proveedor
+        FROM vehiculos v
+        LEFT JOIN adquisiciones a ON a.id=(SELECT id FROM adquisiciones
+            WHERE vehiculo_id=v.id ORDER BY fecha DESC,id DESC LIMIT 1)
+        LEFT JOIN proveedores p ON p.id=a.proveedor_id'''+((' WHERE '+' AND '.join(where)) if where else '')+' ORDER BY v.id DESC'
     r=c.execute(sql,args).fetchall(); c.close(); return jsonify([dict(x) for x in r])
 
 @app.get('/api/informacion-vehiculo')
