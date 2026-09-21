@@ -335,7 +335,7 @@ def init_db(sync_history=True):
     if 'placa_nacionalizacion' not in costing_columns:
         c.execute('ALTER TABLE costos_adquisicion ADD COLUMN placa_nacionalizacion TEXT')
     work_columns={row['name'] for row in c.execute('PRAGMA table_info(ordenes_trabajo)')}
-    for name, definition in [('correlativo','INTEGER'),('numero_ot','TEXT'),('taller','TEXT'),('tipo_reparacion','TEXT'),('valor_negociado','REAL NOT NULL DEFAULT 0'),('valor_final','REAL'),('descripcion','TEXT'),('costo_cargado','INTEGER NOT NULL DEFAULT 0'),('migracion_historica','INTEGER NOT NULL DEFAULT 0')]:
+    for name, definition in [('correlativo','INTEGER'),('numero_ot','TEXT'),('taller','TEXT'),('tipo_reparacion','TEXT'),('valor_negociado','REAL NOT NULL DEFAULT 0'),('valor_final','REAL'),('descripcion','TEXT'),('costo_cargado','INTEGER NOT NULL DEFAULT 0'),('migracion_historica','INTEGER NOT NULL DEFAULT 0'),('metodo_pago','TEXT'),('banco_pago','TEXT'),('referencia_pago','TEXT')]:
         if name not in work_columns:
             c.execute(f'ALTER TABLE ordenes_trabajo ADD COLUMN {name} {definition}')
     existing_orders=c.execute('SELECT id FROM ordenes_trabajo WHERE correlativo IS NULL ORDER BY id').fetchall()
@@ -430,6 +430,14 @@ def init_db(sync_history=True):
         id INTEGER PRIMARY KEY AUTOINCREMENT,adquisicion_id INTEGER NOT NULL UNIQUE REFERENCES adquisiciones(id) ON DELETE CASCADE,
         proveedor_id INTEGER NOT NULL REFERENCES proveedores(id),fecha TEXT NOT NULL,monto_original REAL NOT NULL,
         saldo REAL NOT NULL,estado TEXT NOT NULL DEFAULT 'Pendiente',creado_en TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)''')
+    # Las CxP de taller se conservan separadas de las adquisiciones para no
+    # alterar la relación histórica obligatoria adquisicion_id de la tabla
+    # original. Ambas aparecen unificadas en la cartera.
+    c.execute('''CREATE TABLE IF NOT EXISTS cuentas_por_pagar_ot(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,orden_trabajo_id INTEGER NOT NULL UNIQUE REFERENCES ordenes_trabajo(id) ON DELETE CASCADE,
+        proveedor_id INTEGER NOT NULL REFERENCES proveedores(id),fecha TEXT NOT NULL,monto_original REAL NOT NULL,
+        saldo REAL NOT NULL,estado TEXT NOT NULL DEFAULT 'Pendiente',metodo_pago TEXT NOT NULL DEFAULT 'Crédito',
+        banco TEXT,referencia TEXT,creado_en TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)''')
     c.execute('''CREATE TABLE IF NOT EXISTS cuentas_por_cobrar(
         id INTEGER PRIMARY KEY AUTOINCREMENT,venta_id INTEGER NOT NULL REFERENCES ventas(id) ON DELETE CASCADE,
         financiera_id INTEGER REFERENCES proveedores(id),financiera_nombre TEXT NOT NULL,fecha TEXT NOT NULL,
@@ -486,6 +494,9 @@ def init_db(sync_history=True):
     c.execute('''CREATE TABLE IF NOT EXISTS pagos_cuentas_por_pagar(
         id INTEGER PRIMARY KEY AUTOINCREMENT,cuenta_por_pagar_id INTEGER NOT NULL REFERENCES cuentas_por_pagar(id) ON DELETE CASCADE,
         fecha TEXT NOT NULL,tipo_pago TEXT NOT NULL,banco TEXT,referencia TEXT,monto REAL NOT NULL,creado_en TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS pagos_cuentas_por_pagar_ot(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,cuenta_por_pagar_ot_id INTEGER NOT NULL REFERENCES cuentas_por_pagar_ot(id) ON DELETE CASCADE,
+        fecha TEXT NOT NULL,tipo_pago TEXT NOT NULL,banco TEXT,referencia TEXT,monto REAL NOT NULL,creado_en TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)''')
     c.execute('''CREATE TABLE IF NOT EXISTS cobros_cuentas_por_cobrar(
         id INTEGER PRIMARY KEY AUTOINCREMENT,cuenta_por_cobrar_id INTEGER NOT NULL REFERENCES cuentas_por_cobrar(id) ON DELETE CASCADE,
         fecha TEXT NOT NULL,tipo_pago TEXT NOT NULL,banco TEXT,referencia TEXT,monto REAL NOT NULL,creado_en TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)''')
@@ -539,10 +550,11 @@ def asegurar_informacion_vehiculo(c, data):
 
 def add_movimiento(c, vehiculo_id, fecha, tipo, estado_anterior=None, estado_nuevo=None,
                     ubicacion_anterior=None, ubicacion_nueva=None, referencia=None, observaciones=None):
-    c.execute('''INSERT INTO movimientos_vehiculo
+    cursor=c.execute('''INSERT INTO movimientos_vehiculo
         (vehiculo_id,fecha,tipo,estado_anterior,estado_nuevo,ubicacion_anterior,ubicacion_nueva,referencia,observaciones)
         VALUES(?,?,?,?,?,?,?,?,?)''',
         (vehiculo_id,fecha,tipo,estado_anterior,estado_nuevo,ubicacion_anterior,ubicacion_nueva,referencia,observaciones))
+    return cursor.lastrowid
 
 def crear_orden_trabajo(c, vehiculo_id, adquisicion_id, fecha, taller, tipo_reparacion, valor_negociado, descripcion):
     correlativo=c.execute('SELECT COALESCE(MAX(correlativo),0)+1 FROM ordenes_trabajo').fetchone()[0]
@@ -681,6 +693,38 @@ def cuenta_inventario_por_estado(estado):
         'En Taller':'inventario_taller',
         'DPV':'inventario_dpv'
     }.get(estado, 'inventario_transito')
+
+def validar_pago_cierre_ot(data):
+    """Valida el método que documenta la contrapartida al cerrar una OT."""
+    metodo=(data.get('metodo_pago') or '').strip()
+    banco=(data.get('banco') or '').strip()
+    referencia=(data.get('referencia') or '').strip()
+    if metodo not in ('Efectivo','Transferencia','Crédito'):
+        return None,'Seleccione Efectivo, Transferencia o Crédito como método de pago.'
+    if metodo=='Transferencia' and not banco:
+        return None,'Seleccione el banco desde el cual se realizó la transferencia.'
+    if metodo=='Transferencia' and not referencia:
+        return None,'Ingrese el número de referencia de la transferencia.'
+    return (metodo,banco or None,referencia or None),None
+
+def contabilizar_cierre_ot(c, order, provider, valor_final, metodo_pago, banco, referencia, fecha):
+    """Capitaliza la mano de obra y registra Caja/Bancos o CxP del taller."""
+    value=round(float(valor_final or 0),2)
+    if not value:
+        return
+    vehicle=c.execute('SELECT estado FROM vehiculos WHERE id=?',(order['vehiculo_id'],)).fetchone()
+    inventory=cuenta_inventario_por_estado(vehicle['estado'] if vehicle else 'En Taller')
+    description=f"Cierre {order['numero_ot'] or 'OT'} · {provider['nombre']}"
+    lines=[{'cuenta_id':cuenta_contable_id(c,inventory),'debe':value}]
+    if metodo_pago=='Crédito':
+        lines.append({'cuenta_id':cuenta_contable_id(c,'cxp'),'haber':value})
+        c.execute('''INSERT INTO cuentas_por_pagar_ot(orden_trabajo_id,proveedor_id,fecha,monto_original,saldo,estado,metodo_pago,banco,referencia)
+            VALUES(?,?,?,?,?,'Pendiente',?,?,?)''',(order['id'],provider['id'],fecha,value,value,metodo_pago,banco,referencia))
+    else:
+        lines.append({'cuenta_id':cuenta_contable_id(c,'caja_bancos'),'haber':value})
+        medio,banco_caja=medio_caja(metodo_pago,banco)
+        registrar_movimiento_caja(c,fecha,'Pago de OT',medio,banco_caja,0,value,description,'pago_ot',order['id'])
+    registrar_asiento(c,fecha,description,'cierre_ot',order['id'],lines,order['vehiculo_id'])
 
 def registrar_vehiculo_recibido_cambio(c, cambio, fecha, cliente_nombre, numero_venta):
     """Registra la unidad recibida como parte de pago, sin movimiento de caja.
@@ -835,7 +879,18 @@ def recalcular_estado(c, vehiculo_id, motivo='Actualización automática de etap
         next_status='DPV'
     if next_status != vehicle['estado']:
         c.execute('UPDATE vehiculos SET estado=? WHERE id=?',(next_status,vehiculo_id))
-        add_movimiento(c,vehiculo_id,datetime.now().strftime('%Y-%m-%d'),'Cambio automático de etapa',vehicle['estado'],next_status,vehicle['ubicacion'],vehicle['ubicacion'],observaciones=motivo)
+        move_id=add_movimiento(c,vehiculo_id,datetime.now().strftime('%Y-%m-%d'),'Cambio automático de etapa',vehicle['estado'],next_status,vehicle['ubicacion'],vehicle['ubicacion'],observaciones=motivo)
+        old_inventory=cuenta_inventario_por_estado(vehicle['estado'])
+        new_inventory=cuenta_inventario_por_estado(next_status)
+        # El traslado entre etapas no modifica el costo: solo reclasifica el
+        # activo para que Taller, Tránsito y DPV reflejen dónde está la unidad.
+        if next_status!='Vendido' and old_inventory!=new_inventory:
+            value=round(costo_consolidado(c,vehiculo_id),2)
+            if value:
+                registrar_asiento(c,datetime.now().strftime('%Y-%m-%d'),f'Reclasificación de inventario · {vehicle["estado"]} a {next_status}','traslado_inventario',move_id,[
+                    {'cuenta_id':cuenta_contable_id(c,new_inventory),'debe':value},
+                    {'cuenta_id':cuenta_contable_id(c,old_inventory),'haber':value},
+                ],vehiculo_id)
     return next_status
 
 @app.route('/setup',methods=['GET','POST'])
@@ -1405,6 +1460,13 @@ def cuentas_por_pagar():
         FROM cuentas_por_pagar cp JOIN proveedores p ON p.id=cp.proveedor_id JOIN adquisiciones a ON a.id=cp.adquisicion_id
         JOIN vehiculos v ON v.id=a.vehiculo_id ORDER BY cp.fecha DESC,cp.id DESC''').fetchall(); c.close(); return jsonify([dict(row) for row in rows])
 
+@app.get('/api/cuentas-por-pagar-taller')
+def cuentas_por_pagar_taller():
+    c=db(); rows=c.execute('''SELECT cp.*,p.nombre proveedor_nombre,o.numero_ot,o.tipo_reparacion,v.vin,v.marca,v.modelo
+        FROM cuentas_por_pagar_ot cp JOIN proveedores p ON p.id=cp.proveedor_id
+        JOIN ordenes_trabajo o ON o.id=cp.orden_trabajo_id JOIN vehiculos v ON v.id=o.vehiculo_id
+        ORDER BY cp.fecha DESC,cp.id DESC''').fetchall(); c.close(); return jsonify([dict(row) for row in rows])
+
 @app.get('/api/cuentas-por-cobrar')
 def cuentas_por_cobrar():
     c=db(); rows=c.execute('''SELECT cc.*,COALESCE(cl.nombre,fc.nombre,cc.financiera_nombre) tercero_nombre,
@@ -1455,6 +1517,26 @@ def registrar_pago_cxp(cid):
     registrar_movimiento_caja(c,fecha,'Pago de cuenta por pagar',medio,banco_caja,0,monto,descripcion,'pago_cxp',cur.lastrowid)
     lineas=[{'cuenta_id':cuenta_contable_id(c,'cxp'),'debe':monto},{'cuenta_id':cuenta_contable_id(c,'caja_bancos'),'haber':monto}]
     registrar_asiento(c,fecha,descripcion,'pago_cxp',cur.lastrowid,lineas)
+    c.commit(); c.close(); return jsonify(ok=True,saldo=max(saldo,0),estado=estado),201
+
+@app.post('/api/cuentas-por-pagar-taller/<int:cid>/pagos')
+def registrar_pago_cxp_taller(cid):
+    data=request.get_json(silent=True) or {}; c=db(); account=c.execute('''SELECT cp.*,p.nombre proveedor_nombre,o.numero_ot,o.vehiculo_id
+        FROM cuentas_por_pagar_ot cp JOIN proveedores p ON p.id=cp.proveedor_id
+        JOIN ordenes_trabajo o ON o.id=cp.orden_trabajo_id WHERE cp.id=?''',(cid,)).fetchone()
+    if not account: c.close(); return jsonify(error='Cuenta por pagar de taller no encontrada'),404
+    values,error=validar_pago_cartera(data,account['saldo'])
+    if error: c.close(); return jsonify(error=error),400
+    monto,tipo,banco,referencia=values; fecha=data.get('fecha') or datetime.now().strftime('%Y-%m-%d'); saldo=round(float(account['saldo'])-monto,2); estado='Pagada' if saldo<=0.01 else 'Pendiente'
+    if not referencia_pago_disponible(c,referencia): c.close(); return jsonify(error='El número de referencia ya fue utilizado'),409
+    try:
+        cur=c.execute('''INSERT INTO pagos_cuentas_por_pagar_ot(cuenta_por_pagar_ot_id,fecha,tipo_pago,banco,referencia,monto) VALUES(?,?,?,?,?,?)''',(cid,fecha,tipo,banco,referencia,monto))
+    except sqlite3.IntegrityError: c.close(); return jsonify(error='El número de referencia ya fue utilizado'),409
+    c.execute('UPDATE cuentas_por_pagar_ot SET saldo=?,estado=? WHERE id=?',(max(saldo,0),estado,cid))
+    medio,banco_caja=medio_caja(tipo,banco); descripcion=f"Pago OT {account['numero_ot']} · {account['proveedor_nombre']}"
+    registrar_movimiento_caja(c,fecha,'Pago de cuenta por pagar · OT',medio,banco_caja,0,monto,descripcion,'pago_cxp_ot',cur.lastrowid)
+    lineas=[{'cuenta_id':cuenta_contable_id(c,'cxp'),'debe':monto},{'cuenta_id':cuenta_contable_id(c,'caja_bancos'),'haber':monto}]
+    registrar_asiento(c,fecha,descripcion,'pago_cxp_ot',cur.lastrowid,lineas,account['vehiculo_id'])
     c.commit(); c.close(); return jsonify(ok=True,saldo=max(saldo,0),estado=estado),201
 
 @app.post('/api/cuentas-por-cobrar/<int:cid>/pagos')
@@ -1844,7 +1926,7 @@ def get_ordenes_trabajo():
 @app.put('/api/ordenes-trabajo/<int:oid>')
 def put_orden_trabajo(oid):
     d=request.get_json(silent=True) or {}; estado=d.get('estado'); accion=d.get('accion')
-    if accion not in (None,'finalizar_reparacion','continuar_mantenimiento','modificar','corregir_cierre') and estado not in ('Pendiente','Finalizada'):
+    if accion not in (None,'finalizar_reparacion','continuar_mantenimiento','modificar','corregir_cierre','contabilizar_cierre_existente') and estado not in ('Pendiente','Finalizada'):
         return jsonify(error='Acción de orden de trabajo inválida'),400
     c=db(); order=c.execute('SELECT * FROM ordenes_trabajo WHERE id=?',(oid,)).fetchone()
     if not order: c.close(); return jsonify(error='Orden de trabajo no encontrada'),404
@@ -1872,6 +1954,8 @@ def put_orden_trabajo(oid):
             c.close(); return jsonify(error='El valor final de la OT debe ser numérico.'),400
         if valor_final<0:
             c.close(); return jsonify(error='El valor final de la OT no puede ser negativo.'),400
+        if order['metodo_pago'] and abs(float(order['valor_final'] or 0)-valor_final)>0.01:
+            c.close(); return jsonify(error='Esta OT ya tiene pago y partida contable. Registre un ajuste contable antes de cambiar su valor final.'),409
         fecha=datetime.now().strftime('%Y-%m-%d'); documento=order['numero_ot'] or f'OT-{oid}'
         existing=c.execute('''SELECT id FROM costos_vehiculo WHERE vehiculo_id=? AND documento=?
             AND categoria='Mano de obra / OT' ORDER BY id DESC LIMIT 1''',(order['vehiculo_id'],documento)).fetchone()
@@ -1891,6 +1975,26 @@ def put_orden_trabajo(oid):
         add_movimiento(c,order['vehiculo_id'],fecha,'Corrección de cierre de OT',vehicle['estado'],vehicle['estado'],vehicle['ubicacion'],vehicle['ubicacion'],
             referencia=documento,observaciones=f'Valor final de mano de obra: {valor_final:.2f}. Costo consolidado: {total:.2f}')
         c.commit(); c.close(); return jsonify(ok=True,vehiculo_id=order['vehiculo_id'],costo_total=total)
+    if accion=='contabilizar_cierre_existente':
+        if order['estado']!='Finalizada':
+            c.close(); return jsonify(error='Solo se puede contabilizar una OT finalizada.'),400
+        if order['metodo_pago']:
+            c.close(); return jsonify(error='Esta OT ya tiene método de pago y partida de cierre.'),409
+        pago,error=validar_pago_cierre_ot(d)
+        if error:
+            c.close(); return jsonify(error=error),400
+        metodo_pago,banco,referencia=pago
+        if referencia and not referencia_pago_disponible(c,referencia):
+            c.close(); return jsonify(error='El número de referencia ya fue utilizado'),409
+        provider=c.execute('SELECT * FROM proveedores WHERE nombre=? AND activo=1',(order['taller'],)).fetchone()
+        if not provider:
+            c.close(); return jsonify(error='La OT debe tener un taller/proveedor activo para registrar su pago.'),400
+        fecha=datetime.now().strftime('%Y-%m-%d')
+        c.execute('UPDATE ordenes_trabajo SET metodo_pago=?,banco_pago=?,referencia_pago=? WHERE id=?',(metodo_pago,banco,referencia,oid))
+        contabilizar_cierre_ot(c,order,provider,float(order['valor_final'] or 0),metodo_pago,banco,referencia,fecha)
+        vehicle=c.execute('SELECT estado,ubicacion FROM vehiculos WHERE id=?',(order['vehiculo_id'],)).fetchone()
+        add_movimiento(c,order['vehiculo_id'],fecha,'Regularización contable de OT',vehicle['estado'],vehicle['estado'],vehicle['ubicacion'],vehicle['ubicacion'],referencia=order['numero_ot'],observaciones=f'Método de pago: {metodo_pago}. Partida de cierre registrada.')
+        c.commit(); c.close(); return jsonify(ok=True,vehiculo_id=order['vehiculo_id'])
     if accion:
         if order['estado']!='Pendiente': c.close(); return jsonify(error='La OT ya está finalizada'),400
         try:
@@ -1899,23 +2003,33 @@ def put_orden_trabajo(oid):
             c.close(); return jsonify(error='El valor final de la OT debe ser numérico'),400
         if valor_final<0:
             c.close(); return jsonify(error='El valor final de la OT no puede ser negativo'),400
-        c.execute("UPDATE ordenes_trabajo SET estado='Finalizada',valor_final=? WHERE id=?",(valor_final,oid))
+        pago,error=validar_pago_cierre_ot(d)
+        if error:
+            c.close(); return jsonify(error=error),400
+        metodo_pago,banco,referencia=pago
+        if referencia and not referencia_pago_disponible(c,referencia):
+            c.close(); return jsonify(error='El número de referencia ya fue utilizado'),409
+        provider=c.execute('SELECT * FROM proveedores WHERE nombre=? AND activo=1',(order['taller'],)).fetchone()
+        if not provider:
+            c.close(); return jsonify(error='La OT debe tener un taller/proveedor activo para registrar su pago.'),400
+        fecha_cierre=datetime.now().strftime('%Y-%m-%d')
+        c.execute("UPDATE ordenes_trabajo SET estado='Finalizada',valor_final=?,metodo_pago=?,banco_pago=?,referencia_pago=? WHERE id=?",(valor_final,metodo_pago,banco,referencia,oid))
+        contabilizar_cierre_ot(c,order,provider,valor_final,metodo_pago,banco,referencia,fecha_cierre)
         # Una continuación no crea documentos en automático. La persona debe
         # completar la pantalla normal de nueva OT y confirmar “Generar OT”.
         nueva_ot=None
-        if accion=='finalizar_reparacion':
-            pending_costs=c.execute("SELECT * FROM ordenes_trabajo WHERE vehiculo_id=? AND costo_cargado=0 AND estado='Finalizada'",(order['vehiculo_id'],)).fetchall()
-            vehicle=c.execute('SELECT estado,ubicacion,precio_compra FROM vehiculos WHERE id=?',(order['vehiculo_id'],)).fetchone()
-            total_trabajo=0
-            for work in pending_costs:
-                value=float(work['valor_final'] if work['valor_final'] is not None else work['valor_negociado'] or 0); total_trabajo+=value
-                if value:
-                    c.execute('''INSERT INTO costos_vehiculo(vehiculo_id,fecha,concepto,categoria,monto,proveedor,documento,observaciones)
-                        VALUES(?,?,?,?,?,?,?,?)''',(order['vehiculo_id'],datetime.now().strftime('%Y-%m-%d'),work['descripcion'] or work['detalle'] or 'Trabajo de taller','Mano de obra / OT',value,work['taller'],work['numero_ot'],f'Costo al finalizar reparación'))
-                c.execute('UPDATE ordenes_trabajo SET costo_cargado=1 WHERE id=?',(work['id'],))
-            if pending_costs:
-                total_consolidado=costo_consolidado(c,order['vehiculo_id'])
-                add_movimiento(c,order['vehiculo_id'],datetime.now().strftime('%Y-%m-%d'),'Cierre de reparación',vehicle['estado'],vehicle['estado'],vehicle['ubicacion'],vehicle['ubicacion'],referencia=order['numero_ot'],observaciones=f'Mano de obra final cargada: {total_trabajo:.2f}. Costo consolidado: {total_consolidado:.2f}')
+        pending_costs=c.execute("SELECT * FROM ordenes_trabajo WHERE vehiculo_id=? AND costo_cargado=0 AND estado='Finalizada'",(order['vehiculo_id'],)).fetchall()
+        vehicle=c.execute('SELECT estado,ubicacion,precio_compra FROM vehiculos WHERE id=?',(order['vehiculo_id'],)).fetchone()
+        total_trabajo=0
+        for work in pending_costs:
+            value=float(work['valor_final'] if work['valor_final'] is not None else work['valor_negociado'] or 0); total_trabajo+=value
+            if value:
+                c.execute('''INSERT INTO costos_vehiculo(vehiculo_id,fecha,concepto,categoria,monto,proveedor,documento,observaciones)
+                    VALUES(?,?,?,?,?,?,?,?)''',(order['vehiculo_id'],fecha_cierre,work['descripcion'] or work['detalle'] or 'Trabajo de taller','Mano de obra / OT',value,work['taller'],work['numero_ot'],f'Costo al cerrar la OT · método: {metodo_pago}'))
+            c.execute('UPDATE ordenes_trabajo SET costo_cargado=1 WHERE id=?',(work['id'],))
+        if pending_costs:
+            total_consolidado=costo_consolidado(c,order['vehiculo_id'])
+            add_movimiento(c,order['vehiculo_id'],fecha_cierre,'Cierre de OT',vehicle['estado'],vehicle['estado'],vehicle['ubicacion'],vehicle['ubicacion'],referencia=order['numero_ot'],observaciones=f'Mano de obra cargada: {total_trabajo:.2f}. Método: {metodo_pago}. Costo consolidado: {total_consolidado:.2f}')
         if accion=='finalizar_reparacion':
             recalcular_estado(c,order['vehiculo_id'],'Reparación finalizada')
         else:

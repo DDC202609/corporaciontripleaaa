@@ -136,7 +136,9 @@ class CriticalFlowsTest(unittest.TestCase):
         self.login_as_admin()
         connection = self.server.db()
         order = connection.execute(
-            "SELECT id,vehiculo_id FROM ordenes_trabajo WHERE estado='Pendiente' ORDER BY id LIMIT 1"
+            '''SELECT o.id,o.vehiculo_id FROM ordenes_trabajo o
+               JOIN proveedores p ON p.nombre=o.taller AND p.activo=1
+               WHERE o.estado='Pendiente' ORDER BY o.id LIMIT 1'''
         ).fetchone()
         self.assertIsNotNone(order)
         before = connection.execute(
@@ -145,7 +147,7 @@ class CriticalFlowsTest(unittest.TestCase):
         connection.close()
         response = self.client.put(
             f"/api/ordenes-trabajo/{order['id']}",
-            json={'accion': 'continuar_mantenimiento', 'valor_final': 0},
+            json={'accion': 'continuar_mantenimiento', 'valor_final': 1234.5, 'metodo_pago': 'Efectivo'},
         )
         self.assertEqual(response.status_code, 200)
         self.assertIsNone(response.get_json()['nueva_ot'])
@@ -157,21 +159,53 @@ class CriticalFlowsTest(unittest.TestCase):
         connection.close()
         self.assertEqual(after, before)
         self.assertEqual(vehicle['estado'], 'En Taller')
-        correction = self.client.put(
-            f"/api/ordenes-trabajo/{order['id']}",
-            json={'accion': 'corregir_cierre', 'valor_final': 1234.5},
-        )
-        self.assertEqual(correction.status_code, 200)
         connection = self.server.db()
-        cost = connection.execute(
-            '''SELECT monto FROM costos_vehiculo
-               WHERE vehiculo_id=? AND documento=(SELECT numero_ot FROM ordenes_trabajo WHERE id=?)
-                 AND categoria='Mano de obra / OT' ''',
-            (order['vehiculo_id'], order['id']),
+        cash_move = connection.execute(
+            "SELECT salida FROM movimientos_caja WHERE referencia_tipo='pago_ot' AND referencia_id=?", (order['id'],)
+        ).fetchone()
+        journal = connection.execute(
+            "SELECT 1 FROM asientos_contables WHERE referencia_tipo='cierre_ot' AND referencia_id=?", (order['id'],)
         ).fetchone()
         connection.close()
-        self.assertIsNotNone(cost)
-        self.assertAlmostEqual(cost['monto'], 1234.5, places=2)
+        self.assertAlmostEqual(cash_move['salida'], 1234.5, places=2)
+        self.assertIsNotNone(journal)
+        correction = self.client.put(
+            f"/api/ordenes-trabajo/{order['id']}",
+            json={'accion': 'corregir_cierre', 'valor_final': 999},
+        )
+        self.assertEqual(correction.status_code, 409)
+        self.assertIn('partida contable', correction.get_json()['error'])
+
+    def test_credit_work_order_creates_payable_then_cash_payment(self):
+        self.login_as_admin()
+        connection = self.server.db()
+        vehicle = connection.execute('SELECT id FROM vehiculos ORDER BY id LIMIT 1').fetchone()
+        provider = connection.execute('SELECT id,nombre FROM proveedores WHERE activo=1 ORDER BY id LIMIT 1').fetchone()
+        self.assertIsNotNone(vehicle)
+        self.assertIsNotNone(provider)
+        order_id, _ = self.server.crear_orden_trabajo(
+            connection, vehicle['id'], None, '2026-09-20', provider['nombre'], 'Prueba contable', 300, 'Prueba de crédito de taller'
+        )
+        connection.commit()
+        connection.close()
+        closing = self.client.put(
+            f'/api/ordenes-trabajo/{order_id}',
+            json={'accion': 'continuar_mantenimiento', 'valor_final': 300, 'metodo_pago': 'Crédito'},
+        )
+        self.assertEqual(closing.status_code, 200)
+        connection = self.server.db()
+        payable = connection.execute(
+            'SELECT id,saldo,estado FROM cuentas_por_pagar_ot WHERE orden_trabajo_id=?', (order_id,)
+        ).fetchone()
+        connection.close()
+        self.assertIsNotNone(payable)
+        self.assertAlmostEqual(payable['saldo'], 300, places=2)
+        payment = self.client.post(
+            f"/api/cuentas-por-pagar-taller/{payable['id']}/pagos",
+            json={'fecha': '2026-09-20', 'tipo_pago': 'Efectivo', 'monto': 300},
+        )
+        self.assertEqual(payment.status_code, 201)
+        self.assertEqual(payment.get_json()['estado'], 'Pagada')
 
     def test_unexpected_write_error_rolls_back_and_returns_json(self):
         self.login_as_admin()
