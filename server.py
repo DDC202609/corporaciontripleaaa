@@ -1,7 +1,7 @@
 from flask import Flask, request, jsonify, send_from_directory, send_file, session, redirect, url_for, render_template_string, g, has_request_context
 from werkzeug.exceptions import HTTPException
 from werkzeug.security import check_password_hash, generate_password_hash
-import sqlite3, os, shutil, uuid, hmac, io, json, tempfile, zipfile
+import sqlite3, os, shutil, uuid, hmac, io, json, tempfile, zipfile, re
 from datetime import datetime
 ROOT=os.path.dirname(os.path.abspath(__file__))
 BUNDLED_DATA=os.path.join(ROOT,'data')
@@ -571,6 +571,46 @@ def costo_consolidado(c, vehiculo_id):
         base+=sum(float(costing[key] or 0) for key in ('ajuste_compra','grua','flete','isv_pagado','cl_std','almacenaje','gastos_aduaneros'))
     extras=c.execute('SELECT COALESCE(SUM(monto),0) FROM costos_vehiculo WHERE vehiculo_id=?',(vehiculo_id,)).fetchone()[0]
     return base+float(extras or 0)
+
+def desglose_costo_consolidado(c, vehiculo_id):
+    """Entrega la trazabilidad documental de cada componente del costo."""
+    vehicle=c.execute('SELECT precio_compra,fecha_adquisicion FROM vehiculos WHERE id=?',(vehiculo_id,)).fetchone()
+    if not vehicle:
+        return []
+    purchase=c.execute('SELECT id,fecha,costo_compra FROM adquisiciones WHERE vehiculo_id=?',(vehiculo_id,)).fetchone()
+    costing=c.execute('SELECT * FROM costos_adquisicion WHERE vehiculo_id=?',(vehiculo_id,)).fetchone()
+    items=[]
+    def add(fecha, documento, origen, concepto, monto):
+        value=round(float(monto or 0),2)
+        if value:
+            items.append({'fecha':fecha or '', 'documento':documento, 'origen':origen,
+                          'concepto':concepto, 'monto':value})
+    # El consolidado toma la base desde la ficha del vehículo; el documento de
+    # adquisición se usa como trazabilidad, no como una segunda fuente de monto.
+    purchase_value=float(vehicle['precio_compra'] or 0)
+    add((purchase['fecha'] if purchase else vehicle['fecha_adquisicion']),
+        f"Adquisición #{purchase['id']}" if purchase else 'Ficha de vehículo',
+        'Adquisición', 'Costo de compra', purchase_value)
+    if costing:
+        cost_date=(costing['fecha_actualizacion'] or '')[:10]
+        for field,label in (
+            ('ajuste_compra','Ajuste de compra'),('grua','Grúa'),('flete','Flete'),
+            ('isv_pagado','ISV pagado'),('cl_std','CL_STD'),('almacenaje','Almacenaje'),
+            ('gastos_aduaneros','Gasto aduanero')):
+            add(cost_date,'Costeo de adquisición','Costeo',label,costing[field])
+    rows=c.execute('SELECT * FROM costos_vehiculo WHERE vehiculo_id=? ORDER BY fecha,id',(vehiculo_id,)).fetchall()
+    for row in rows:
+        observation=row['observaciones'] or ''
+        ot_match=re.search(r'\bOT-\d+\b',f"{row['documento'] or ''} {observation}")
+        document=ot_match.group(0) if ot_match else (row['documento'] or 'Sin documento')
+        origin='OT' if ot_match else ('Factura / costo adicional' if row['documento'] else 'Costo adicional')
+        add(row['fecha'],document,origin,row['concepto'] or row['categoria'] or 'Costo adicional',row['monto'])
+    items.sort(key=lambda item:(item['fecha'],item['documento'],item['concepto']))
+    running=0.0
+    for item in items:
+        running=round(running+item['monto'],2)
+        item['acumulado']=running
+    return items
 
 # Cuentas utilizadas por los asientos automáticos. Se resuelven por código,
 # por lo que respetan el catálogo contable ya cargado por Corporación Triple AAA.
@@ -1804,7 +1844,7 @@ def get_ordenes_trabajo():
 @app.put('/api/ordenes-trabajo/<int:oid>')
 def put_orden_trabajo(oid):
     d=request.get_json(silent=True) or {}; estado=d.get('estado'); accion=d.get('accion')
-    if accion not in (None,'finalizar_reparacion','continuar_mantenimiento','modificar') and estado not in ('Pendiente','Finalizada'):
+    if accion not in (None,'finalizar_reparacion','continuar_mantenimiento','modificar','corregir_cierre') and estado not in ('Pendiente','Finalizada'):
         return jsonify(error='Acción de orden de trabajo inválida'),400
     c=db(); order=c.execute('SELECT * FROM ordenes_trabajo WHERE id=?',(oid,)).fetchone()
     if not order: c.close(); return jsonify(error='Orden de trabajo no encontrada'),404
@@ -1813,6 +1853,8 @@ def put_orden_trabajo(oid):
         descripcion=(d.get('descripcion') or '').strip(); nuevo_estado=d.get('estado')
         if not fecha or not taller or not descripcion or nuevo_estado not in ('Pendiente','Finalizada'):
             c.close(); return jsonify(error='Fecha, taller, descripción y estado válidos son obligatorios'),400
+        if nuevo_estado!=order['estado']:
+            c.close(); return jsonify(error='El cierre debe realizarse con el botón “Cerrar OT” para registrar el valor final.'),400
         historical=int(order['migracion_historica'] or 0)
         c.execute('''UPDATE ordenes_trabajo SET fecha=?,taller=?,descripcion=?,detalle=?,estado=?,
                      valor_final=CASE WHEN ?=1 AND ?='Finalizada' THEN 0 ELSE valor_final END,
@@ -1821,6 +1863,34 @@ def put_orden_trabajo(oid):
                   (fecha,taller,descripcion,descripcion,nuevo_estado,historical,nuevo_estado,historical,nuevo_estado,oid))
         recalcular_estado(c,order['vehiculo_id'],'OT modificada')
         c.commit(); c.close(); return jsonify(ok=True,vehiculo_id=order['vehiculo_id'])
+    if accion=='corregir_cierre':
+        if order['estado']!='Finalizada':
+            c.close(); return jsonify(error='Solo se puede corregir el cierre de una OT finalizada.'),400
+        try:
+            valor_final=round(float(d.get('valor_final')),2)
+        except (TypeError,ValueError):
+            c.close(); return jsonify(error='El valor final de la OT debe ser numérico.'),400
+        if valor_final<0:
+            c.close(); return jsonify(error='El valor final de la OT no puede ser negativo.'),400
+        fecha=datetime.now().strftime('%Y-%m-%d'); documento=order['numero_ot'] or f'OT-{oid}'
+        existing=c.execute('''SELECT id FROM costos_vehiculo WHERE vehiculo_id=? AND documento=?
+            AND categoria='Mano de obra / OT' ORDER BY id DESC LIMIT 1''',(order['vehiculo_id'],documento)).fetchone()
+        if existing and valor_final:
+            c.execute('''UPDATE costos_vehiculo SET fecha=?,concepto=?,monto=?,proveedor=?,observaciones=? WHERE id=?''',
+                (fecha,order['descripcion'] or order['detalle'] or 'Trabajo de taller',valor_final,order['taller'],
+                 'Valor final corregido al cerrar la OT.',existing['id']))
+        elif existing:
+            c.execute('DELETE FROM costos_vehiculo WHERE id=?',(existing['id'],))
+        elif valor_final:
+            c.execute('''INSERT INTO costos_vehiculo(vehiculo_id,fecha,concepto,categoria,monto,proveedor,documento,observaciones)
+                VALUES(?,?,?,?,?,?,?,?)''',(order['vehiculo_id'],fecha,order['descripcion'] or order['detalle'] or 'Trabajo de taller',
+                'Mano de obra / OT',valor_final,order['taller'],documento,'Valor final corregido al cerrar la OT.'))
+        c.execute('UPDATE ordenes_trabajo SET valor_final=?,costo_cargado=1 WHERE id=?',(valor_final,oid))
+        vehicle=c.execute('SELECT estado,ubicacion FROM vehiculos WHERE id=?',(order['vehiculo_id'],)).fetchone()
+        total=costo_consolidado(c,order['vehiculo_id'])
+        add_movimiento(c,order['vehiculo_id'],fecha,'Corrección de cierre de OT',vehicle['estado'],vehicle['estado'],vehicle['ubicacion'],vehicle['ubicacion'],
+            referencia=documento,observaciones=f'Valor final de mano de obra: {valor_final:.2f}. Costo consolidado: {total:.2f}')
+        c.commit(); c.close(); return jsonify(ok=True,vehiculo_id=order['vehiculo_id'],costo_total=total)
     if accion:
         if order['estado']!='Pendiente': c.close(); return jsonify(error='La OT ya está finalizada'),400
         try:
@@ -1830,9 +1900,9 @@ def put_orden_trabajo(oid):
         if valor_final<0:
             c.close(); return jsonify(error='El valor final de la OT no puede ser negativo'),400
         c.execute("UPDATE ordenes_trabajo SET estado='Finalizada',valor_final=? WHERE id=?",(valor_final,oid))
+        # Una continuación no crea documentos en automático. La persona debe
+        # completar la pantalla normal de nueva OT y confirmar “Generar OT”.
         nueva_ot=None
-        if accion=='continuar_mantenimiento':
-            _,nueva_ot=crear_orden_trabajo(c,order['vehiculo_id'],order['adquisicion_id'],datetime.now().strftime('%Y-%m-%d'),order['taller'] or 'Pendiente de asignar',order['tipo_reparacion'] or 'Reparación general',float(order['valor_negociado'] or 0),order['descripcion'] or order['detalle'] or 'Continuación de mantenimiento')
         if accion=='finalizar_reparacion':
             pending_costs=c.execute("SELECT * FROM ordenes_trabajo WHERE vehiculo_id=? AND costo_cargado=0 AND estado='Finalizada'",(order['vehiculo_id'],)).fetchall()
             vehicle=c.execute('SELECT estado,ubicacion,precio_compra FROM vehiculos WHERE id=?',(order['vehiculo_id'],)).fetchone()
@@ -1846,7 +1916,13 @@ def put_orden_trabajo(oid):
             if pending_costs:
                 total_consolidado=costo_consolidado(c,order['vehiculo_id'])
                 add_movimiento(c,order['vehiculo_id'],datetime.now().strftime('%Y-%m-%d'),'Cierre de reparación',vehicle['estado'],vehicle['estado'],vehicle['ubicacion'],vehicle['ubicacion'],referencia=order['numero_ot'],observaciones=f'Mano de obra final cargada: {total_trabajo:.2f}. Costo consolidado: {total_consolidado:.2f}')
-        recalcular_estado(c,order['vehiculo_id'],'Reparación finalizada' if accion=='finalizar_reparacion' else f'Mantenimiento continúa en {nueva_ot}')
+        if accion=='finalizar_reparacion':
+            recalcular_estado(c,order['vehiculo_id'],'Reparación finalizada')
+        else:
+            vehicle=c.execute('SELECT estado,ubicacion FROM vehiculos WHERE id=?',(order['vehiculo_id'],)).fetchone()
+            if vehicle['estado']!='En Taller':
+                c.execute("UPDATE vehiculos SET estado='En Taller' WHERE id=?",(order['vehiculo_id'],))
+                add_movimiento(c,order['vehiculo_id'],datetime.now().strftime('%Y-%m-%d'),'Mantenimiento continúa',vehicle['estado'],'En Taller',vehicle['ubicacion'],vehicle['ubicacion'],referencia=order['numero_ot'],observaciones='Cree una nueva OT desde el formulario para continuar el trabajo.')
         c.commit(); c.close(); return jsonify(ok=True,nueva_ot=nueva_ot,vehiculo_id=order['vehiculo_id'],estado='DPV' if accion=='finalizar_reparacion' else 'En Taller')
     if estado not in ('Pendiente','Finalizada'): c.close(); return jsonify(error='Estado de orden de trabajo inválido'),400
     c.execute('UPDATE ordenes_trabajo SET estado=? WHERE id=?',(estado,oid))
@@ -2044,7 +2120,7 @@ def get_vehicle(vid):
     sale_price=float((sale['precio'] if sale else v['precio_venta']) or 0)
     commission_total=sum(float(x['monto'] or 0) for x in comm)
     base_cost=purchase+acq_total; real_cost=base_cost+float(cost_total or 0); gross=sale_price-real_cost; net=gross-commission_total
-    out=dict(v); out['costos']= [dict(x) for x in costs]; out['movimientos']=[dict(x) for x in movements]; out['compra']=dict(purchase_record) if purchase_record else None; out['ordenes_trabajo']=[dict(x) for x in work_orders]; out['adquisicion']=dict(acq) if acq else None; out['costeo']=costeo; out['costo_adquisicion']=base_cost; out['costo_adicional']=cost_total; out['costo_real']=real_cost
+    out=dict(v); out['costos']= [dict(x) for x in costs]; out['movimientos']=[dict(x) for x in movements]; out['compra']=dict(purchase_record) if purchase_record else None; out['ordenes_trabajo']=[dict(x) for x in work_orders]; out['adquisicion']=dict(acq) if acq else None; out['costeo']=costeo; out['costo_adquisicion']=base_cost; out['costo_adicional']=cost_total; out['costo_real']=real_cost; out['desglose_costos']=desglose_costo_consolidado(c,vid)
     out['venta']=dict(sale) if sale else None; out['comisiones']=[dict(x) for x in comm]
     out['precio_venta_calculado']=sale_price; out['comision_total']=commission_total; out['utilidad_bruta']=gross; out['utilidad_real']=net
     out['margen_real']= (net/sale_price*100) if sale_price else 0

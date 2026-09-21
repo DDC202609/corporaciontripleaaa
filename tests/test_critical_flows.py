@@ -114,6 +114,65 @@ class CriticalFlowsTest(unittest.TestCase):
         self.assertEqual(vehicle['compra_costo'], purchase['costo_compra'])
         self.assertEqual(vehicle['compra_proveedor'], purchase['proveedor_nombre'])
 
+    def test_kardex_breakdown_identifies_cost_documents(self):
+        self.login_as_admin()
+        connection = self.server.db()
+        vehicle = connection.execute(
+            'SELECT id FROM vehiculos WHERE precio_compra>0 ORDER BY id LIMIT 1'
+        ).fetchone()
+        connection.close()
+        self.assertIsNotNone(vehicle)
+        response = self.client.get(f"/api/vehiculos/{vehicle['id']}")
+        self.assertEqual(response.status_code, 200)
+        detail = response.get_json()
+        breakdown = detail['desglose_costos']
+        self.assertTrue(breakdown)
+        self.assertTrue(all(item['documento'] for item in breakdown))
+        self.assertAlmostEqual(
+            sum(item['monto'] for item in breakdown), detail['costo_real'], places=2
+        )
+
+    def test_continuing_workshop_does_not_create_a_new_order(self):
+        self.login_as_admin()
+        connection = self.server.db()
+        order = connection.execute(
+            "SELECT id,vehiculo_id FROM ordenes_trabajo WHERE estado='Pendiente' ORDER BY id LIMIT 1"
+        ).fetchone()
+        self.assertIsNotNone(order)
+        before = connection.execute(
+            'SELECT COUNT(*) FROM ordenes_trabajo WHERE vehiculo_id=?', (order['vehiculo_id'],)
+        ).fetchone()[0]
+        connection.close()
+        response = self.client.put(
+            f"/api/ordenes-trabajo/{order['id']}",
+            json={'accion': 'continuar_mantenimiento', 'valor_final': 0},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(response.get_json()['nueva_ot'])
+        connection = self.server.db()
+        after = connection.execute(
+            'SELECT COUNT(*) FROM ordenes_trabajo WHERE vehiculo_id=?', (order['vehiculo_id'],)
+        ).fetchone()[0]
+        vehicle = connection.execute('SELECT estado FROM vehiculos WHERE id=?', (order['vehiculo_id'],)).fetchone()
+        connection.close()
+        self.assertEqual(after, before)
+        self.assertEqual(vehicle['estado'], 'En Taller')
+        correction = self.client.put(
+            f"/api/ordenes-trabajo/{order['id']}",
+            json={'accion': 'corregir_cierre', 'valor_final': 1234.5},
+        )
+        self.assertEqual(correction.status_code, 200)
+        connection = self.server.db()
+        cost = connection.execute(
+            '''SELECT monto FROM costos_vehiculo
+               WHERE vehiculo_id=? AND documento=(SELECT numero_ot FROM ordenes_trabajo WHERE id=?)
+                 AND categoria='Mano de obra / OT' ''',
+            (order['vehiculo_id'], order['id']),
+        ).fetchone()
+        connection.close()
+        self.assertIsNotNone(cost)
+        self.assertAlmostEqual(cost['monto'], 1234.5, places=2)
+
     def test_unexpected_write_error_rolls_back_and_returns_json(self):
         self.login_as_admin()
         original = self.server.asegurar_informacion_vehiculo
