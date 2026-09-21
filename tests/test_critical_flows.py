@@ -232,6 +232,33 @@ class CriticalFlowsTest(unittest.TestCase):
         self.assertIsNotNone(cost)
         self.assertAlmostEqual(cost['monto'], 450, places=2)
 
+    def test_parts_purchase_requires_payment_and_posts_cash_entry(self):
+        self.login_as_admin()
+        connection = self.server.db()
+        vehicle = connection.execute('SELECT id FROM vehiculos ORDER BY id LIMIT 1').fetchone()
+        provider = connection.execute('SELECT id,nombre FROM proveedores WHERE activo=1 ORDER BY id LIMIT 1').fetchone()
+        order_id, _ = self.server.crear_orden_trabajo(
+            connection, vehicle['id'], None, '2026-09-20', provider['nombre'], 'Prueba repuesto', 0, 'Prueba compra de repuesto'
+        )
+        connection.commit()
+        connection.close()
+        response = self.client.post(
+            f'/api/ordenes-trabajo/{order_id}/repuestos',
+            json={'factura': 'QA-PART-0001', 'fecha': '2026-09-20', 'proveedor_id': provider['id'],
+                  'subtotal': 100, 'isv': 15, 'descripcion': 'Repuesto de prueba', 'metodo_pago': 'Efectivo'},
+        )
+        self.assertEqual(response.status_code, 201)
+        connection = self.server.db()
+        move = connection.execute(
+            "SELECT salida FROM movimientos_caja WHERE referencia_tipo='pago_repuesto_ot'"
+        ).fetchone()
+        journal = connection.execute(
+            "SELECT 1 FROM asientos_contables WHERE referencia_tipo='repuesto_ot'"
+        ).fetchone()
+        connection.close()
+        self.assertAlmostEqual(move['salida'], 115, places=2)
+        self.assertIsNotNone(journal)
+
     def test_unexpected_write_error_rolls_back_and_returns_json(self):
         self.login_as_admin()
         original = self.server.asegurar_informacion_vehiculo

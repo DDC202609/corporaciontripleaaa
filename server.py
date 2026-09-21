@@ -349,6 +349,10 @@ def init_db(sync_history=True):
         proveedor_id INTEGER NOT NULL REFERENCES proveedores(id),factura TEXT NOT NULL,fecha TEXT NOT NULL,descripcion TEXT NOT NULL,
         subtotal REAL NOT NULL,isv REAL NOT NULL DEFAULT 0,total REAL NOT NULL,creado_en TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     )''')
+    parts_columns={row['name'] for row in c.execute('PRAGMA table_info(repuestos_ot)')}
+    for name, definition in [('metodo_pago','TEXT'),('banco_pago','TEXT'),('referencia_pago','TEXT')]:
+        if name not in parts_columns:
+            c.execute(f'ALTER TABLE repuestos_ot ADD COLUMN {name} {definition}')
     c.execute('CREATE UNIQUE INDEX IF NOT EXISTS ux_repuestos_ot_factura ON repuestos_ot(orden_trabajo_id,factura)')
     c.execute('''CREATE TABLE IF NOT EXISTS costos_vehiculo(
         id INTEGER PRIMARY KEY AUTOINCREMENT,vehiculo_id INTEGER NOT NULL REFERENCES vehiculos(id),fecha TEXT NOT NULL,
@@ -438,6 +442,11 @@ def init_db(sync_history=True):
         proveedor_id INTEGER NOT NULL REFERENCES proveedores(id),fecha TEXT NOT NULL,monto_original REAL NOT NULL,
         saldo REAL NOT NULL,estado TEXT NOT NULL DEFAULT 'Pendiente',metodo_pago TEXT NOT NULL DEFAULT 'Crédito',
         banco TEXT,referencia TEXT,creado_en TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS cuentas_por_pagar_repuestos_ot(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,repuesto_ot_id INTEGER NOT NULL UNIQUE REFERENCES repuestos_ot(id) ON DELETE CASCADE,
+        proveedor_id INTEGER NOT NULL REFERENCES proveedores(id),fecha TEXT NOT NULL,monto_original REAL NOT NULL,
+        saldo REAL NOT NULL,estado TEXT NOT NULL DEFAULT 'Pendiente',metodo_pago TEXT NOT NULL DEFAULT 'Crédito',
+        banco TEXT,referencia TEXT,creado_en TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)''')
     c.execute('''CREATE TABLE IF NOT EXISTS cuentas_por_cobrar(
         id INTEGER PRIMARY KEY AUTOINCREMENT,venta_id INTEGER NOT NULL REFERENCES ventas(id) ON DELETE CASCADE,
         financiera_id INTEGER REFERENCES proveedores(id),financiera_nombre TEXT NOT NULL,fecha TEXT NOT NULL,
@@ -496,6 +505,9 @@ def init_db(sync_history=True):
         fecha TEXT NOT NULL,tipo_pago TEXT NOT NULL,banco TEXT,referencia TEXT,monto REAL NOT NULL,creado_en TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)''')
     c.execute('''CREATE TABLE IF NOT EXISTS pagos_cuentas_por_pagar_ot(
         id INTEGER PRIMARY KEY AUTOINCREMENT,cuenta_por_pagar_ot_id INTEGER NOT NULL REFERENCES cuentas_por_pagar_ot(id) ON DELETE CASCADE,
+        fecha TEXT NOT NULL,tipo_pago TEXT NOT NULL,banco TEXT,referencia TEXT,monto REAL NOT NULL,creado_en TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS pagos_cuentas_por_pagar_repuestos_ot(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,cuenta_por_pagar_repuesto_id INTEGER NOT NULL REFERENCES cuentas_por_pagar_repuestos_ot(id) ON DELETE CASCADE,
         fecha TEXT NOT NULL,tipo_pago TEXT NOT NULL,banco TEXT,referencia TEXT,monto REAL NOT NULL,creado_en TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)''')
     c.execute('''CREATE TABLE IF NOT EXISTS cobros_cuentas_por_cobrar(
         id INTEGER PRIMARY KEY AUTOINCREMENT,cuenta_por_cobrar_id INTEGER NOT NULL REFERENCES cuentas_por_cobrar(id) ON DELETE CASCADE,
@@ -725,6 +737,36 @@ def contabilizar_cierre_ot(c, order, provider, valor_final, metodo_pago, banco, 
         medio,banco_caja=medio_caja(metodo_pago,banco)
         registrar_movimiento_caja(c,fecha,'Pago de OT',medio,banco_caja,0,value,description,'pago_ot',order['id'])
     registrar_asiento(c,fecha,description,'cierre_ot',order['id'],lines,order['vehiculo_id'])
+
+def validar_pago_repuesto(data):
+    metodo=(data.get('metodo_pago') or '').strip()
+    banco=(data.get('banco') or '').strip()
+    referencia=(data.get('referencia_pago') or '').strip()
+    if metodo not in ('Efectivo','Transferencia','Crédito'):
+        return None,'Seleccione Efectivo, Transferencia o Crédito como método de pago.'
+    if metodo=='Transferencia' and not banco:
+        return None,'Seleccione el banco desde el cual se realizó la transferencia.'
+    # La factura es el documento obligatorio de esta compra; una referencia
+    # bancaria adicional puede registrarse, pero no se fuerza para el repuesto.
+    return (metodo,banco or None,referencia or None),None
+
+def contabilizar_repuesto_ot(c, part_id, order, provider, total, metodo_pago, banco, referencia, fecha, factura, descripcion):
+    value=round(float(total or 0),2)
+    if not value:
+        return
+    vehicle=c.execute('SELECT estado FROM vehiculos WHERE id=?',(order['vehiculo_id'],)).fetchone()
+    inventory=cuenta_inventario_por_estado(vehicle['estado'] if vehicle else 'En Taller')
+    description_text=f"Repuesto {factura} · {provider['nombre']}"
+    lines=[{'cuenta_id':cuenta_contable_id(c,inventory),'debe':value}]
+    if metodo_pago=='Crédito':
+        lines.append({'cuenta_id':cuenta_contable_id(c,'cxp'),'haber':value})
+        c.execute('''INSERT INTO cuentas_por_pagar_repuestos_ot(repuesto_ot_id,proveedor_id,fecha,monto_original,saldo,estado,metodo_pago,banco,referencia)
+            VALUES(?,?,?,?,?,'Pendiente',?,?,?)''',(part_id,provider['id'],fecha,value,value,metodo_pago,banco,referencia))
+    else:
+        lines.append({'cuenta_id':cuenta_contable_id(c,'caja_bancos'),'haber':value})
+        medio,banco_caja=medio_caja(metodo_pago,banco)
+        registrar_movimiento_caja(c,fecha,'Pago de repuesto OT',medio,banco_caja,0,value,description_text,'pago_repuesto_ot',part_id)
+    registrar_asiento(c,fecha,description_text,'repuesto_ot',part_id,lines,order['vehiculo_id'])
 
 def registrar_vehiculo_recibido_cambio(c, cambio, fecha, cliente_nombre, numero_venta):
     """Registra la unidad recibida como parte de pago, sin movimiento de caja.
@@ -1467,6 +1509,13 @@ def cuentas_por_pagar_taller():
         JOIN ordenes_trabajo o ON o.id=cp.orden_trabajo_id JOIN vehiculos v ON v.id=o.vehiculo_id
         ORDER BY cp.fecha DESC,cp.id DESC''').fetchall(); c.close(); return jsonify([dict(row) for row in rows])
 
+@app.get('/api/cuentas-por-pagar-repuestos')
+def cuentas_por_pagar_repuestos():
+    c=db(); rows=c.execute('''SELECT cp.*,p.nombre proveedor_nombre,r.factura,o.numero_ot,v.vin,v.marca,v.modelo
+        FROM cuentas_por_pagar_repuestos_ot cp JOIN proveedores p ON p.id=cp.proveedor_id
+        JOIN repuestos_ot r ON r.id=cp.repuesto_ot_id JOIN ordenes_trabajo o ON o.id=r.orden_trabajo_id
+        JOIN vehiculos v ON v.id=o.vehiculo_id ORDER BY cp.fecha DESC,cp.id DESC''').fetchall(); c.close(); return jsonify([dict(row) for row in rows])
+
 @app.get('/api/cuentas-por-cobrar')
 def cuentas_por_cobrar():
     c=db(); rows=c.execute('''SELECT cc.*,COALESCE(cl.nombre,fc.nombre,cc.financiera_nombre) tercero_nombre,
@@ -1537,6 +1586,26 @@ def registrar_pago_cxp_taller(cid):
     registrar_movimiento_caja(c,fecha,'Pago de cuenta por pagar · OT',medio,banco_caja,0,monto,descripcion,'pago_cxp_ot',cur.lastrowid)
     lineas=[{'cuenta_id':cuenta_contable_id(c,'cxp'),'debe':monto},{'cuenta_id':cuenta_contable_id(c,'caja_bancos'),'haber':monto}]
     registrar_asiento(c,fecha,descripcion,'pago_cxp_ot',cur.lastrowid,lineas,account['vehiculo_id'])
+    c.commit(); c.close(); return jsonify(ok=True,saldo=max(saldo,0),estado=estado),201
+
+@app.post('/api/cuentas-por-pagar-repuestos/<int:cid>/pagos')
+def registrar_pago_cxp_repuesto(cid):
+    data=request.get_json(silent=True) or {}; c=db(); account=c.execute('''SELECT cp.*,p.nombre proveedor_nombre,r.factura,o.numero_ot,o.vehiculo_id
+        FROM cuentas_por_pagar_repuestos_ot cp JOIN proveedores p ON p.id=cp.proveedor_id
+        JOIN repuestos_ot r ON r.id=cp.repuesto_ot_id JOIN ordenes_trabajo o ON o.id=r.orden_trabajo_id WHERE cp.id=?''',(cid,)).fetchone()
+    if not account: c.close(); return jsonify(error='Cuenta por pagar de repuesto no encontrada'),404
+    values,error=validar_pago_cartera(data,account['saldo'])
+    if error: c.close(); return jsonify(error=error),400
+    monto,tipo,banco,referencia=values; fecha=data.get('fecha') or datetime.now().strftime('%Y-%m-%d'); saldo=round(float(account['saldo'])-monto,2); estado='Pagada' if saldo<=0.01 else 'Pendiente'
+    if not referencia_pago_disponible(c,referencia): c.close(); return jsonify(error='El número de referencia ya fue utilizado'),409
+    try:
+        cur=c.execute('''INSERT INTO pagos_cuentas_por_pagar_repuestos_ot(cuenta_por_pagar_repuesto_id,fecha,tipo_pago,banco,referencia,monto) VALUES(?,?,?,?,?,?)''',(cid,fecha,tipo,banco,referencia,monto))
+    except sqlite3.IntegrityError: c.close(); return jsonify(error='El número de referencia ya fue utilizado'),409
+    c.execute('UPDATE cuentas_por_pagar_repuestos_ot SET saldo=?,estado=? WHERE id=?',(max(saldo,0),estado,cid))
+    medio,banco_caja=medio_caja(tipo,banco); descripcion=f"Pago repuesto {account['factura']} · {account['proveedor_nombre']}"
+    registrar_movimiento_caja(c,fecha,'Pago de cuenta por pagar · repuesto',medio,banco_caja,0,monto,descripcion,'pago_cxp_repuesto',cur.lastrowid)
+    lineas=[{'cuenta_id':cuenta_contable_id(c,'cxp'),'debe':monto},{'cuenta_id':cuenta_contable_id(c,'caja_bancos'),'haber':monto}]
+    registrar_asiento(c,fecha,descripcion,'pago_cxp_repuesto',cur.lastrowid,lineas,account['vehiculo_id'])
     c.commit(); c.close(); return jsonify(ok=True,saldo=max(saldo,0),estado=estado),201
 
 @app.post('/api/cuentas-por-cobrar/<int:cid>/pagos')
@@ -2096,14 +2165,19 @@ def post_repuesto_ot(oid):
     c=db(); order=c.execute('SELECT * FROM ordenes_trabajo WHERE id=?',(oid,)).fetchone(); provider=c.execute('SELECT * FROM proveedores WHERE id=? AND activo=1',(proveedor_id,)).fetchone()
     if not order or not provider: c.close(); return jsonify(error='OT o proveedor no encontrado'),404
     if order['estado']!='Pendiente': c.close(); return jsonify(error='No puede registrar repuestos en una OT finalizada'),400
+    pago,error=validar_pago_repuesto(d)
+    if error: c.close(); return jsonify(error=error),400
+    metodo_pago,banco,referencia_pago=pago
     total=subtotal+isv; fecha=d.get('fecha') or datetime.now().strftime('%Y-%m-%d')
     try:
-        c.execute('INSERT INTO repuestos_ot(orden_trabajo_id,proveedor_id,factura,fecha,descripcion,subtotal,isv,total) VALUES(?,?,?,?,?,?,?,?)',(oid,proveedor_id,factura,fecha,descripcion,subtotal,isv,total))
+        cur=c.execute('''INSERT INTO repuestos_ot(orden_trabajo_id,proveedor_id,factura,fecha,descripcion,subtotal,isv,total,metodo_pago,banco_pago,referencia_pago)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?)''',(oid,proveedor_id,factura,fecha,descripcion,subtotal,isv,total,metodo_pago,banco,referencia_pago))
     except sqlite3.IntegrityError: c.close(); return jsonify(error='Esta factura ya fue registrada en la OT'),409
     c.execute('''INSERT INTO costos_vehiculo(vehiculo_id,fecha,concepto,categoria,monto,proveedor,documento,observaciones)
         VALUES(?,?,?,?,?,?,?,?)''',(order['vehiculo_id'],fecha,descripcion,'Repuestos / OT',total,provider['nombre'],factura,f'{order["numero_ot"] or "OT"}: repuesto o insumo'))
     vehicle=c.execute('SELECT estado,ubicacion FROM vehiculos WHERE id=?',(order['vehiculo_id'],)).fetchone(); total_consolidado=costo_consolidado(c,order['vehiculo_id'])
-    add_movimiento(c,order['vehiculo_id'],fecha,'Repuesto cargado a OT',vehicle['estado'],vehicle['estado'],vehicle['ubicacion'],vehicle['ubicacion'],referencia=factura,observaciones=f'{order["numero_ot"] or "OT"}: {descripcion}. Costo consolidado: {total_consolidado:.2f}')
+    contabilizar_repuesto_ot(c,cur.lastrowid,order,provider,total,metodo_pago,banco,referencia_pago,fecha,factura,descripcion)
+    add_movimiento(c,order['vehiculo_id'],fecha,'Repuesto cargado a OT',vehicle['estado'],vehicle['estado'],vehicle['ubicacion'],vehicle['ubicacion'],referencia=factura,observaciones=f'{order["numero_ot"] or "OT"}: {descripcion}. Método: {metodo_pago}. Costo consolidado: {total_consolidado:.2f}')
     c.commit(); c.close(); return jsonify(ok=True,total=total),201
 
 @app.post('/api/adquisiciones')
