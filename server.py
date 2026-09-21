@@ -1,4 +1,5 @@
-from flask import Flask, request, jsonify, send_from_directory, send_file, session, redirect, url_for, render_template_string
+from flask import Flask, request, jsonify, send_from_directory, send_file, session, redirect, url_for, render_template_string, g, has_request_context
+from werkzeug.exceptions import HTTPException
 from werkzeug.security import check_password_hash, generate_password_hash
 import sqlite3, os, shutil, uuid, hmac, io, json, tempfile, zipfile
 from datetime import datetime
@@ -128,9 +129,11 @@ def request_module(path):
 LOGIN_TEMPLATE='''<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{{ title }} · Corporación Triple AAA</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#f4f7fb;font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#182230}.card{width:min(410px,calc(100vw - 40px));background:#fff;border:1px solid #d9e0ea;border-radius:18px;padding:34px;box-shadow:0 16px 42px #18223016}h1{margin:0 0 8px;font-size:2rem}.sub{color:#667085;margin-bottom:28px}label{font-weight:700;display:block;margin:16px 0 7px}input{box-sizing:border-box;width:100%;border:1px solid #cbd5e1;border-radius:9px;padding:12px;font-size:1rem}button{width:100%;border:0;border-radius:9px;padding:13px;background:#175cd3;color:#fff;font-weight:800;font-size:1rem;margin-top:24px;cursor:pointer}.error{margin:14px 0;padding:10px;border-radius:8px;background:#fef3f2;color:#b42318}.brand{color:#175cd3;font-weight:800;margin-bottom:10px}</style></head><body><main class="card"><div class="brand">Corporación Triple AAA</div><h1>{{ title }}</h1><div class="sub">{{ subtitle }}</div>{% if error %}<div class="error">{{ error }}</div>{% endif %}<form method="post"><label>Usuario</label><input name="username" required autocomplete="username" minlength="3" autofocus><label>Contraseña</label><input name="password" type="password" required autocomplete="{{ 'new-password' if setup else 'current-password' }}" minlength="8"><button>{{ button }}</button></form></main></body></html>'''
 
 def db():
-    c=sqlite3.connect(DB); c.row_factory=sqlite3.Row; c.execute('PRAGMA foreign_keys=ON'); return c
-
-init_access_control_schema()
+    c=sqlite3.connect(DB, timeout=15); c.row_factory=sqlite3.Row
+    c.execute('PRAGMA foreign_keys=ON'); c.execute('PRAGMA busy_timeout=15000')
+    if has_request_context():
+        connections=getattr(g,'sqlite_connections',[]); connections.append(c); g.sqlite_connections=connections
+    return c
 
 def user_count():
     c=db()
@@ -140,7 +143,7 @@ def user_count():
 
 @app.before_request
 def require_authenticated_user():
-    if request.endpoint in {'login','setup','logout','static','download_system_backup'} or request.path.startswith('/static/'):
+    if request.endpoint in {'login','setup','logout','static','download_system_backup','healthcheck'} or request.path.startswith('/static/'):
         return None
     if not user_count():
         return redirect(url_for('setup'))
@@ -162,6 +165,52 @@ def require_authenticated_user():
         return jsonify(error='Sesión requerida.'),401
     return redirect(url_for('login'))
 
+@app.get('/healthz')
+def healthcheck():
+    """Verifica aplicación y acceso real a SQLite para Render."""
+    c=None
+    try:
+        c=db(); c.execute('SELECT 1').fetchone(); c.execute('SELECT COUNT(*) FROM usuarios').fetchone()
+        return jsonify(status='ok'),200
+    except sqlite3.Error:
+        app.logger.exception('Falló la verificación de salud de la base de datos.')
+        return jsonify(status='error'),503
+    finally:
+        if c: c.close()
+
+@app.errorhandler(Exception)
+def handle_unexpected_error(error):
+    """Evita respuestas HTML en las APIs y conserva el detalle en los logs."""
+    if isinstance(error,HTTPException):
+        return error
+    for connection in getattr(g,'sqlite_connections',[]):
+        try: connection.rollback()
+        except sqlite3.Error: pass
+    app.logger.exception('Error no controlado en %s %s',request.method,request.path)
+    if request.path.startswith('/api/'):
+        return jsonify(error='No se pudo completar la operación. Intente nuevamente.'),500
+    return 'Ocurrió un error inesperado. Intente nuevamente.',500
+
+@app.teardown_request
+def close_request_connections(error=None):
+    """Cierra conexiones que un flujo interrumpido no alcanzó a liberar."""
+    for connection in getattr(g,'sqlite_connections',[]):
+        try:
+            if error: connection.rollback()
+            connection.close()
+        except sqlite3.Error:
+            pass
+
+@app.after_request
+def apply_response_safety_headers(response):
+    """Protecciones compatibles con la interfaz actual y respuestas sensibles."""
+    response.headers.setdefault('X-Content-Type-Options','nosniff')
+    response.headers.setdefault('X-Frame-Options','DENY')
+    response.headers.setdefault('Referrer-Policy','strict-origin-when-cross-origin')
+    if request.path.startswith('/api/') or request.path.startswith('/respaldo/'):
+        response.headers['Cache-Control']='no-store'
+    return response
+
 def placa_disponible(c, placa, vehiculo_id=None):
     placa=(placa or '').strip().upper()
     if not placa:
@@ -172,7 +221,7 @@ def placa_disponible(c, placa, vehiculo_id=None):
         sql+=' AND id<>?'; args.append(vehiculo_id)
     return c.execute(sql,args).fetchone() is None
 
-def init_db():
+def init_db(sync_history=True):
     c=db()
     c.execute('''CREATE TABLE IF NOT EXISTS usuarios(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -442,11 +491,17 @@ def init_db():
         fecha TEXT NOT NULL,tipo_pago TEXT NOT NULL,banco TEXT,referencia TEXT,monto REAL NOT NULL,creado_en TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)''')
     c.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_pagos_cxp_referencia ON pagos_cuentas_por_pagar(referencia) WHERE referencia IS NOT NULL AND referencia<>''")
     c.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_cobros_cxc_referencia ON cobros_cuentas_por_cobrar(referencia) WHERE referencia IS NOT NULL AND referencia<>''")
+    c.execute('CREATE INDEX IF NOT EXISTS ix_vehiculos_estado ON vehiculos(estado)')
+    c.execute('CREATE INDEX IF NOT EXISTS ix_vehiculos_fecha_adquisicion ON vehiculos(fecha_adquisicion)')
+    c.execute('CREATE INDEX IF NOT EXISTS ix_ordenes_trabajo_vehiculo_estado ON ordenes_trabajo(vehiculo_id,estado)')
+    c.execute('CREATE INDEX IF NOT EXISTS ix_ventas_vehiculo_fecha ON ventas(vehiculo_id,fecha DESC)')
+    c.execute('CREATE INDEX IF NOT EXISTS ix_adquisiciones_proveedor_fecha ON adquisiciones(proveedor_id,fecha DESC)')
     c.execute('CREATE INDEX IF NOT EXISTS ix_partidas_asiento ON partidas(asiento_id)')
     c.execute('CREATE INDEX IF NOT EXISTS ix_cxp_estado ON cuentas_por_pagar(estado)')
     c.execute('CREATE INDEX IF NOT EXISTS ix_cxc_estado ON cuentas_por_cobrar(estado)')
     c.execute("UPDATE vehiculos SET estado='DPV' WHERE estado NOT IN ('En Tránsito','Nacionalizado','En Taller','DPV','Reservado','Vendido')")
-    sincronizar_contabilidad_historica(c)
+    if sync_history:
+        sincronizar_contabilidad_historica(c)
     c.commit(); c.close()
 
 def validate_vehiculo(data):
@@ -709,6 +764,12 @@ def sincronizar_contabilidad_historica(c):
         contabilizar_adquisicion(c,row['id'])
     for row in c.execute('SELECT id FROM ventas ORDER BY id').fetchall():
         contabilizar_venta(c,row['id'])
+
+# Gunicorn importa ``server:app`` y no ejecuta el bloque __main__.  Las
+# migraciones deben correr durante la importación para que un despliegue nuevo
+# use el mismo esquema que el entorno local. Todas son idempotentes.
+init_db(sync_history=False)
+init_access_control_schema()
 
 def recalcular_estado(c, vehiculo_id, motivo='Actualización automática de etapa'):
     """Calcula las únicas etapas permitidas sin aceptar cambios manuales de estado."""
@@ -1998,7 +2059,9 @@ def post_veh():
         add_movimiento(c,cur.lastrowid,datetime.now().strftime('%Y-%m-%d'),'Ingreso a inventario',estado_nuevo='En Tránsito',ubicacion_nueva=d.get('ubicacion'),observaciones='Registro inicial; pendiente de adquisición')
         c.commit(); vid=cur.lastrowid
     except sqlite3.IntegrityError:
-        c.close(); return jsonify(error='El VIN ya existe'),409
+        c.rollback(); c.close(); return jsonify(error='El VIN ya existe'),409
+    except Exception:
+        c.rollback(); c.close(); raise
     c.close(); return jsonify(id=vid),201
 
 @app.put('/api/vehiculos/<int:vid>')
@@ -2129,4 +2192,4 @@ def get_comisiones():
     c=db(); r=c.execute('''SELECT co.*,v.fecha venta_fecha,ve.vin,ve.marca,ve.modelo FROM comisiones co JOIN ventas v ON v.id=co.venta_id JOIN vehiculos ve ON ve.id=v.vehiculo_id ORDER BY co.id DESC''').fetchall(); c.close(); return jsonify([dict(x) for x in r])
 
 if __name__=='__main__':
-    init_db(); app.run(host='127.0.0.1',port=5000,debug=False)
+    app.run(host='127.0.0.1',port=5000,debug=False)
