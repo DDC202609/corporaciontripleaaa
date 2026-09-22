@@ -111,6 +111,7 @@ def request_module(path):
     if path.startswith('/api/dashboard'): return 'dashboard'
     if path.startswith('/api/contabilidad') or path.startswith('/api/cuentas-por-'): return 'contabilidad'
     if path.startswith('/api/caja'): return 'caja_bancos'
+    if path.startswith('/api/gastos-ot'): return 'taller'
     if path.startswith('/api/gastos') or path.startswith('/api/conceptos-gasto'): return 'gastos'
     if path.startswith('/api/comisiones'): return 'comisiones'
     if path.startswith('/api/vendedores'): return 'vendedores'
@@ -2162,20 +2163,23 @@ def get_gastos_ot(oid):
     c=db(); items=c.execute('''
         SELECT g.fecha,g.taller_origen,g.categoria,g.descripcion,
                p.nombre proveedor_nombre,g.factura,g.total,
-               NULL metodo_pago,'Gasto registrado' origen,g.id orden
+               NULL metodo_pago,'Gasto registrado' origen,g.id orden,
+               g.id origen_id,'gasto_ot' origen_tipo
           FROM gastos_ot g
           LEFT JOIN proveedores p ON p.id=g.proveedor_id
          WHERE g.orden_trabajo_id=?
         UNION ALL
         SELECT r.fecha,o.taller,'Repuestos / insumos',r.descripcion,
-               p.nombre,r.factura,r.total,r.metodo_pago,'Repuesto / insumo',r.id
+               p.nombre,r.factura,r.total,r.metodo_pago,'Repuesto / insumo',r.id,
+               r.id,'repuesto_ot'
           FROM repuestos_ot r
           JOIN ordenes_trabajo o ON o.id=r.orden_trabajo_id
           JOIN proveedores p ON p.id=r.proveedor_id
          WHERE r.orden_trabajo_id=?
         UNION ALL
         SELECT cv.fecha,o.taller,'Mano de obra / cierre',cv.concepto,
-               cv.proveedor,cv.documento,cv.monto,o.metodo_pago,'Cierre de OT',cv.id
+               cv.proveedor,cv.documento,cv.monto,o.metodo_pago,'Cierre de OT',cv.id,
+               cv.id,'cierre_ot'
           FROM costos_vehiculo cv
           JOIN ordenes_trabajo o ON o.vehiculo_id=cv.vehiculo_id
          WHERE o.id=? AND cv.documento=o.numero_ot
@@ -2183,6 +2187,38 @@ def get_gastos_ot(oid):
          ORDER BY fecha,orden
     ''',(oid,oid,oid)).fetchall(); c.close()
     return jsonify([dict(x) for x in items])
+
+@app.delete('/api/gastos-ot/<int:gasto_id>')
+def eliminar_gasto_ot(gasto_id):
+    """Revierte una línea histórica de OT junto con su costo y contabilidad."""
+    data=request.get_json(silent=True) or {}
+    if data.get('confirmacion')!='ELIMINAR':
+        return jsonify(error='Confirme la eliminación para continuar.'),400
+    c=db(); gasto=c.execute('''SELECT g.*,o.vehiculo_id,o.numero_ot
+        FROM gastos_ot g JOIN ordenes_trabajo o ON o.id=g.orden_trabajo_id
+        WHERE g.id=?''',(gasto_id,)).fetchone()
+    if not gasto:
+        c.close(); return jsonify(error='Concepto histórico no encontrado.'),404
+    try:
+        # Si una instalación anterior llegó a contabilizar este gasto, sus
+        # partidas y la salida de caja usan el ID del gasto como referencia.
+        for reference_type in ('gasto_ot','gasto_ot_historico'):
+            c.execute('DELETE FROM movimientos_caja WHERE referencia_tipo=? AND referencia_id=?',(reference_type,gasto_id))
+            headers=c.execute('SELECT id FROM asientos_contables WHERE referencia_tipo=? AND referencia_id=?',(reference_type,gasto_id)).fetchall()
+            for header in headers:
+                c.execute('DELETE FROM partidas WHERE asiento_id=?',(header['id'],))
+                c.execute('DELETE FROM asientos_contables WHERE id=?',(header['id'],))
+        # gasto_ot conoce exactamente el costo derivado, por lo que no se toca
+        # ningún otro concepto de la misma OT aunque comparta factura "0".
+        if gasto['costo_vehiculo_id']:
+            c.execute('DELETE FROM costos_vehiculo WHERE id=? AND vehiculo_id=?',(gasto['costo_vehiculo_id'],gasto['vehiculo_id']))
+        c.execute('DELETE FROM gastos_ot WHERE id=?',(gasto_id,))
+        c.commit()
+    except Exception:
+        c.rollback(); raise
+    finally:
+        c.close()
+    return jsonify(ok=True,numero_ot=gasto['numero_ot'])
 
 @app.get('/api/contabilidad/inventario-transito/movimientos')
 def movimientos_inventario_transito():
