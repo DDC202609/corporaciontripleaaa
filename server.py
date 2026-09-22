@@ -2135,7 +2135,13 @@ def post_orden_trabajo():
     if not vehicle: c.close(); return jsonify(error='Vehículo no encontrado'),404
     acquisition=c.execute('SELECT id,tipo_compra FROM adquisiciones WHERE vehiculo_id=?',(vid,)).fetchone()
     costing=c.execute('SELECT estatus FROM costos_adquisicion WHERE vehiculo_id=?',(vid,)).fetchone()
-    if acquisition and acquisition['tipo_compra']=='Importación' and (not costing or costing['estatus']!='Nacionalizado'):
+    # Una unidad que continúa en Tránsito no puede abrir una OT. Sin embargo,
+    # las unidades históricas que ya están en Taller conservan a veces el
+    # marcador de costeo "Pendiente"; bloquearlas contradice su etapa real y
+    # deja el taller sin poder documentar la reparación.
+    if (acquisition and acquisition['tipo_compra']=='Importación'
+            and vehicle['estado']=='En Tránsito'
+            and (not costing or costing['estatus']!='Nacionalizado')):
         c.close(); return jsonify(error='El vehículo importado debe estar nacionalizado antes de crear una OT'),400
     _,numero=crear_orden_trabajo(c,vid,acquisition['id'] if acquisition else None,d.get('fecha') or datetime.now().strftime('%Y-%m-%d'),taller,reparacion,valor,detalle)
     recalcular_estado(c,vid,'Orden de trabajo creada')
