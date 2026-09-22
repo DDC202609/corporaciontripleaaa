@@ -121,7 +121,7 @@ def request_module(path):
     if path.startswith('/api/areas') or path.startswith('/api/departamentos'): return 'centros_costo'
     if path.startswith('/api/inventario'): return 'inventario'
     if path.startswith('/api/adquisiciones'): return 'adquisiciones'
-    if path.startswith('/api/ordenes-trabajo'): return 'taller'
+    if path.startswith('/api/ordenes-trabajo') or path.startswith('/api/repuestos-ot'): return 'taller'
     if path.startswith('/api/vehiculos'):
         return 'vehiculos'
     return None
@@ -2238,6 +2238,55 @@ def regularizar_pago_repuesto(part_id):
     vehicle=c.execute('SELECT estado,ubicacion FROM vehiculos WHERE id=?',(part['vehiculo_id'],)).fetchone()
     add_movimiento(c,part['vehiculo_id'],fecha,'Regularización contable de repuesto',vehicle['estado'],vehicle['estado'],vehicle['ubicacion'],vehicle['ubicacion'],referencia=part['factura'],observaciones=f'Método de pago: {metodo_pago}. Partida de repuesto registrada.')
     c.commit(); c.close(); return jsonify(ok=True)
+
+@app.delete('/api/repuestos-ot/<int:part_id>')
+def eliminar_repuesto_ot(part_id):
+    """Elimina una compra capturada en la OT y todos sus efectos derivados.
+
+    Esta operación es deliberadamente explícita: la factura, su costo del
+    vehículo, movimiento de caja, CxP/pagos y asientos relacionados deben
+    desaparecer juntos para no dejar una contabilidad incompleta.
+    """
+    data=request.get_json(silent=True) or {}
+    if data.get('confirmacion')!='ELIMINAR':
+        return jsonify(error='Confirme la eliminación para continuar.'),400
+    c=db(); part=c.execute('''SELECT r.*,o.vehiculo_id,o.numero_ot,o.taller,v.estado,v.ubicacion
+        FROM repuestos_ot r JOIN ordenes_trabajo o ON o.id=r.orden_trabajo_id
+        JOIN vehiculos v ON v.id=o.vehiculo_id WHERE r.id=?''',(part_id,)).fetchone()
+    if not part:
+        c.close(); return jsonify(error='Repuesto o insumo no encontrado.'),404
+    try:
+        # Primero se eliminan los pagos posteriores de una CxP, incluido su
+        # caja y asiento, en caso de que la compra haya sido a crédito.
+        payable=c.execute('SELECT id FROM cuentas_por_pagar_repuestos_ot WHERE repuesto_ot_id=?',(part_id,)).fetchone()
+        if payable:
+            payment_ids=[row['id'] for row in c.execute('SELECT id FROM pagos_cuentas_por_pagar_repuestos_ot WHERE cuenta_por_pagar_repuesto_id=?',(payable['id'],))]
+            for payment_id in payment_ids:
+                c.execute("DELETE FROM movimientos_caja WHERE referencia_tipo='pago_cxp_repuesto' AND referencia_id=?",(payment_id,))
+                headers=c.execute("SELECT id FROM asientos_contables WHERE referencia_tipo='pago_cxp_repuesto' AND referencia_id=?",(payment_id,)).fetchall()
+                for header in headers:
+                    c.execute('DELETE FROM partidas WHERE asiento_id=?',(header['id'],)); c.execute('DELETE FROM asientos_contables WHERE id=?',(header['id'],))
+            c.execute('DELETE FROM pagos_cuentas_por_pagar_repuestos_ot WHERE cuenta_por_pagar_repuesto_id=?',(payable['id'],))
+            c.execute('DELETE FROM cuentas_por_pagar_repuestos_ot WHERE id=?',(payable['id'],))
+        # Pago inmediato y asiento de la compra original.
+        c.execute("DELETE FROM movimientos_caja WHERE referencia_tipo='pago_repuesto_ot' AND referencia_id=?",(part_id,))
+        headers=c.execute("SELECT id FROM asientos_contables WHERE referencia_tipo='repuesto_ot' AND referencia_id=?",(part_id,)).fetchall()
+        for header in headers:
+            c.execute('DELETE FROM partidas WHERE asiento_id=?',(header['id'],)); c.execute('DELETE FROM asientos_contables WHERE id=?',(header['id'],))
+        # La línea de costo fue creada junto con este repuesto. Se restringe
+        # por OT, vehículo, factura y descripción para no borrar otra factura.
+        c.execute('''DELETE FROM costos_vehiculo WHERE vehiculo_id=? AND documento=?
+            AND concepto=? AND categoria='Repuestos / OT' AND observaciones=?''',
+            (part['vehiculo_id'],part['factura'],part['descripcion'],f'{part["numero_ot"] or "OT"}: repuesto o insumo'))
+        c.execute('''DELETE FROM movimientos_vehiculo WHERE vehiculo_id=? AND referencia=?
+            AND tipo IN ('Repuesto cargado a OT','Regularización contable de repuesto')''',(part['vehiculo_id'],part['factura']))
+        c.execute('DELETE FROM repuestos_ot WHERE id=?',(part_id,))
+        c.commit()
+    except Exception:
+        c.rollback(); raise
+    finally:
+        c.close()
+    return jsonify(ok=True,vin=part['vin'] if 'vin' in part.keys() else None,numero_ot=part['numero_ot'])
 
 @app.post('/api/adquisiciones')
 def post_adquisicion():
