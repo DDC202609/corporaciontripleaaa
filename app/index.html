@@ -615,6 +615,24 @@ renderAccounting=function(){
   }
   return result;
 };
+/* Seguridad: una OT abierta nunca puede seguir seleccionada al buscar otro VIN. */
+const searchWorkVehicleWithPartsSafety=searchWorkVehicle;
+searchWorkVehicle=async function(){
+  let hadOpenParts=Boolean(selectedWorkOrder);
+  if(hadOpenParts)closeParts();
+  await searchWorkVehicleWithPartsSafety();
+  if(hadOpenParts)showNotice('Se cerró el panel de repuestos de la OT anterior. Abra la OT del VIN actual antes de registrar una compra.');
+};
+const savePartsWithVehicleSafety=saveParts;
+saveParts=async function(event){
+  let selectedVin=String(selectedWorkOrder?.vin||'').trim().toUpperCase(),currentVin=String(workshopVehicle?.vin||'').trim().toUpperCase();
+  if(!selectedWorkOrder||!workshopVehicle||selectedVin!==currentVin){
+    event.preventDefault();
+    closeParts();
+    return showNotice('La OT no corresponde al VIN mostrado. Vuelva a abrir los repuestos desde la OT correcta.','error');
+  }
+  return savePartsWithVehicleSafety(event);
+};
 document.head.insertAdjacentHTML('beforeend','<style>.link-btn{border:0;background:transparent;color:#2563d9;font:inherit;font-weight:700;padding:0;cursor:pointer;text-decoration:underline;text-underline-offset:3px}.link-btn:hover{color:#1747a6}</style>');
 dash();
 </script></body></html>
