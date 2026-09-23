@@ -108,7 +108,7 @@ def init_access_control_schema():
 
 def user_access(user_id):
     c=db()
-    row=c.execute('''SELECT u.id,u.username,u.nombre,u.email,u.activo,u.perfil_id,
+    row=c.execute('''SELECT u.id,u.username,u.nombre,u.email,u.activo,u.perfil_id,u.sesion_version,
         p.nombre perfil_nombre,COALESCE(p.es_administrador,0) es_administrador
         FROM usuarios u LEFT JOIN perfiles p ON p.id=u.perfil_id WHERE u.id=?''',(user_id,)).fetchone()
     if not row:
@@ -167,6 +167,23 @@ def require_authenticated_user():
     if user_id:
         user=user_access(user_id)
         if user and user.get('activo'):
+            now=datetime.now().timestamp()
+            last_activity=session.get('last_activity')
+            # La cookie por sí sola no prolonga una sesión: cualquier petición
+            # realizada después de dos minutos sin interacción la invalida.
+            if last_activity is not None and now-float(last_activity)>120:
+                session.clear()
+                if request.path.startswith('/api/'):
+                    return jsonify(error='La sesión expiró por 2 minutos de inactividad.'),401
+                return redirect(url_for('login'))
+            session_version=session.get('sesion_version')
+            if session_version is not None and int(session_version)!=int(user.get('sesion_version') or 1):
+                session.clear()
+                if request.path.startswith('/api/'):
+                    return jsonify(error='La contraseña fue restablecida. Inicie sesión nuevamente.'),401
+                return redirect(url_for('login'))
+            session['last_activity']=now
+            session['sesion_version']=int(user.get('sesion_version') or 1)
             module=request_module(request.path)
             if module=='usuarios':
                 if user.get('es_administrador'): return None
@@ -261,6 +278,8 @@ def init_db(sync_history=True):
         c.execute('ALTER TABLE usuarios ADD COLUMN creado_en TEXT')
     if 'ultimo_acceso' not in user_columns:
         c.execute('ALTER TABLE usuarios ADD COLUMN ultimo_acceso TEXT')
+    if 'sesion_version' not in user_columns:
+        c.execute('ALTER TABLE usuarios ADD COLUMN sesion_version INTEGER NOT NULL DEFAULT 1')
     c.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_usuarios_username ON usuarios(username COLLATE NOCASE) WHERE username IS NOT NULL")
     c.execute('CREATE UNIQUE INDEX IF NOT EXISTS ux_vehiculos_vin ON vehiculos(vin)')
     c.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_vehiculos_placa ON vehiculos(UPPER(TRIM(placa))) WHERE TRIM(COALESCE(placa,''))<>''")
@@ -1037,7 +1056,7 @@ def setup():
             c=db(); c.execute('INSERT INTO usuarios(username,password_hash,nombre,email,rol) VALUES(?,?,?,?,?)',
                 (username,generate_password_hash(password, method='pbkdf2:sha256'),username,f'{username}@local','Administrador'))
             user_id=c.execute('SELECT id FROM usuarios WHERE username=?',(username,)).fetchone()[0]; c.commit(); c.close()
-            session.clear(); session['user_id']=user_id; session['username']=username
+            session.clear(); session['user_id']=user_id; session['username']=username; session['sesion_version']=1; session['last_activity']=datetime.now().timestamp()
             return redirect(url_for('home'))
     return render_template_string(LOGIN_TEMPLATE,title='Crear administrador',subtitle='Configure el primer acceso seguro al sistema.',button='Crear acceso',setup=True,error=error)
 
@@ -1051,7 +1070,7 @@ def login():
         c=db(); user=c.execute('SELECT * FROM usuarios WHERE username=? AND activo=1',(username,)).fetchone()
         if user and check_password_hash(user['password_hash'],password):
             c.execute('UPDATE usuarios SET ultimo_acceso=CURRENT_TIMESTAMP WHERE id=?',(user['id'],)); c.commit(); c.close()
-            session.clear(); session['user_id']=user['id']; session['username']=user['username']
+            session.clear(); session['user_id']=user['id']; session['username']=user['username']; session['sesion_version']=int(user['sesion_version'] or 1); session['last_activity']=datetime.now().timestamp()
             return redirect(url_for('home'))
         c.close(); error='Usuario o contraseña incorrectos.'
     return render_template_string(LOGIN_TEMPLATE,title='Iniciar sesión',subtitle='Ingrese sus credenciales para acceder al sistema.',button='Ingresar',setup=False,error=error)
@@ -1100,6 +1119,30 @@ def sesion_actual():
     return jsonify(usuario=user['username'],nombre=user.get('nombre') or user['username'],
                    perfil=user.get('perfil_nombre') or 'Sin perfil',es_administrador=bool(user.get('es_administrador')),
                    permisos=user.get('permisos',{}))
+
+@app.post('/api/sesion/actividad')
+def registrar_actividad_sesion():
+    """Actualiza la sesión únicamente tras una interacción explícita de la UI."""
+    session['last_activity']=datetime.now().timestamp()
+    return jsonify(ok=True)
+
+@app.post('/api/mi-cuenta/contrasena')
+def cambiar_mi_contrasena():
+    """Permite a cada usuario reemplazar la contraseña inicial que recibió."""
+    data=request.get_json(silent=True) or {}
+    actual=data.get('contrasena_actual') or ''
+    nueva=data.get('contrasena_nueva') or ''
+    confirmacion=data.get('confirmacion') or ''
+    if len(nueva)<8: return jsonify(error='La nueva contraseña debe tener al menos 8 caracteres.'),400
+    if nueva!=confirmacion: return jsonify(error='La confirmación no coincide con la nueva contraseña.'),400
+    c=db(); user=c.execute('SELECT * FROM usuarios WHERE id=? AND activo=1',(session.get('user_id'),)).fetchone()
+    if not user or not check_password_hash(user['password_hash'],actual):
+        c.close(); return jsonify(error='La contraseña actual no es correcta.'),400
+    version=int(user['sesion_version'] or 1)+1
+    c.execute('UPDATE usuarios SET password_hash=?,sesion_version=? WHERE id=?',
+              (generate_password_hash(nueva,method='pbkdf2:sha256'),version,user['id']))
+    c.commit(); c.close(); session['sesion_version']=version; session['last_activity']=datetime.now().timestamp()
+    return jsonify(ok=True)
 
 def profile_permissions(c, profile_id):
     rows={row['modulo']:{'ver':bool(row['puede_ver']),'modificar':bool(row['puede_modificar'])}
@@ -1218,7 +1261,7 @@ def put_usuario(target_id):
         if not admins: c.close(); return jsonify(error='Debe mantenerse al menos un administrador activo.'),400
     try:
         if password:
-            c.execute('''UPDATE usuarios SET username=?,nombre=?,email=?,perfil_id=?,activo=?,password_hash=? WHERE id=?''',
+            c.execute('''UPDATE usuarios SET username=?,nombre=?,email=?,perfil_id=?,activo=?,password_hash=?,sesion_version=COALESCE(sesion_version,1)+1 WHERE id=?''',
                       (username,name,email,profile_id,active,generate_password_hash(password,method='pbkdf2:sha256'),target_id))
         else:
             c.execute('UPDATE usuarios SET username=?,nombre=?,email=?,perfil_id=?,activo=? WHERE id=?',
@@ -1227,6 +1270,17 @@ def put_usuario(target_id):
     except sqlite3.IntegrityError:
         c.rollback(); c.close(); return jsonify(error='Ese usuario ya existe.'),409
     c.close(); return jsonify(ok=True)
+
+@app.post('/api/usuarios/<int:target_id>/restablecer-contrasena')
+def restablecer_contrasena_usuario(target_id):
+    """El administrador entrega una nueva clave temporal y revoca sesiones previas."""
+    data=request.get_json(silent=True) or {}; password=data.get('password') or ''
+    if len(password)<8: return jsonify(error='La contraseña temporal debe tener al menos 8 caracteres.'),400
+    c=db(); target=c.execute('SELECT id FROM usuarios WHERE id=?',(target_id,)).fetchone()
+    if not target: c.close(); return jsonify(error='Usuario no encontrado.'),404
+    c.execute('''UPDATE usuarios SET password_hash=?,sesion_version=COALESCE(sesion_version,1)+1
+        WHERE id=?''',(generate_password_hash(password,method='pbkdf2:sha256'),target_id))
+    c.commit(); c.close(); return jsonify(ok=True)
 
 @app.get('/')
 def home(): return send_from_directory(APP,'index.html')
