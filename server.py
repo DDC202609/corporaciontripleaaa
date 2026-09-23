@@ -2,7 +2,7 @@ from flask import Flask, request, jsonify, send_from_directory, send_file, sessi
 from werkzeug.exceptions import HTTPException
 from werkzeug.security import check_password_hash, generate_password_hash
 import sqlite3, os, shutil, uuid, hmac, io, json, tempfile, zipfile, re
-from datetime import datetime
+from datetime import datetime, timedelta
 ROOT=os.path.dirname(os.path.abspath(__file__))
 BUNDLED_DATA=os.path.join(ROOT,'data')
 DATA_DIR=os.environ.get('DATA_DIR', BUNDLED_DATA)
@@ -34,6 +34,7 @@ ACCESS_MODULES=(
     ('ventas','Ventas y cobros'),('vendedores','Vendedores'),('inventario','Consulta de inventario'),
     ('catalogo','Catálogo contable'),('centros_costo','Centros de costo'),('cartera','Cuentas por cobrar y pagar'),('contabilidad','Contabilidad'),
     ('caja_bancos','Caja y bancos'),('gastos','Registro de gastos'),('comisiones','Comisiones'),
+    ('planificacion_financiera','Planificación financiera'),
 )
 
 def init_access_control_schema():
@@ -121,6 +122,7 @@ def user_access(user_id):
 def request_module(path):
     if path.startswith('/api/usuarios') or path.startswith('/api/perfiles'): return 'usuarios'
     if path.startswith('/api/dashboard'): return 'dashboard'
+    if path.startswith('/api/planificacion-financiera'): return 'planificacion_financiera'
     if path.startswith('/api/contabilidad'): return 'contabilidad'
     if path.startswith('/api/cuentas-por-'): return 'cartera'
     if path.startswith('/api/caja'): return 'caja_bancos'
@@ -343,13 +345,20 @@ def init_db(sync_history=True):
         c.execute('ALTER TABLE adquisiciones ADD COLUMN placa_cambio TEXT')
     if 'banco' not in acquisition_columns:
         c.execute('ALTER TABLE adquisiciones ADD COLUMN banco TEXT')
+    if 'fecha_llegada_estimada' not in acquisition_columns:
+        c.execute('ALTER TABLE adquisiciones ADD COLUMN fecha_llegada_estimada TEXT')
+    # La fecha es una proyección operativa: para importaciones siempre son
+    # cuarenta días desde la adquisición. También se completa el histórico
+    # para que la planificación no deje unidades antiguas fuera.
+    c.execute("""UPDATE adquisiciones SET fecha_llegada_estimada=date(fecha,'+40 days')
+        WHERE tipo_compra='Importación' AND (fecha_llegada_estimada IS NULL OR fecha_llegada_estimada='')""")
     costing_columns={row['name'] for row in c.execute('PRAGMA table_info(costos_adquisicion)')}
     if 'ajuste_compra' not in costing_columns:
         c.execute('ALTER TABLE costos_adquisicion ADD COLUMN ajuste_compra REAL NOT NULL DEFAULT 0')
     if 'placa_nacionalizacion' not in costing_columns:
         c.execute('ALTER TABLE costos_adquisicion ADD COLUMN placa_nacionalizacion TEXT')
     work_columns={row['name'] for row in c.execute('PRAGMA table_info(ordenes_trabajo)')}
-    for name, definition in [('correlativo','INTEGER'),('numero_ot','TEXT'),('taller','TEXT'),('tipo_reparacion','TEXT'),('valor_negociado','REAL NOT NULL DEFAULT 0'),('valor_final','REAL'),('descripcion','TEXT'),('costo_cargado','INTEGER NOT NULL DEFAULT 0'),('migracion_historica','INTEGER NOT NULL DEFAULT 0'),('metodo_pago','TEXT'),('banco_pago','TEXT'),('referencia_pago','TEXT')]:
+    for name, definition in [('correlativo','INTEGER'),('numero_ot','TEXT'),('taller','TEXT'),('tipo_reparacion','TEXT'),('valor_negociado','REAL NOT NULL DEFAULT 0'),('valor_final','REAL'),('descripcion','TEXT'),('costo_cargado','INTEGER NOT NULL DEFAULT 0'),('migracion_historica','INTEGER NOT NULL DEFAULT 0'),('metodo_pago','TEXT'),('banco_pago','TEXT'),('referencia_pago','TEXT'),('fecha_entrega_estimada','TEXT')]:
         if name not in work_columns:
             c.execute(f'ALTER TABLE ordenes_trabajo ADD COLUMN {name} {definition}')
     existing_orders=c.execute('SELECT id FROM ordenes_trabajo WHERE correlativo IS NULL ORDER BY id').fetchall()
@@ -358,6 +367,14 @@ def init_db(sync_history=True):
         next_number+=1
         c.execute('UPDATE ordenes_trabajo SET correlativo=?,numero_ot=?,descripcion=COALESCE(descripcion,detalle) WHERE id=?',(next_number,f'OT-{next_number:06d}',order['id']))
     c.execute('CREATE UNIQUE INDEX IF NOT EXISTS ux_ordenes_trabajo_correlativo ON ordenes_trabajo(correlativo)')
+    c.execute('''CREATE TABLE IF NOT EXISTS anticipos_ot(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        orden_trabajo_id INTEGER NOT NULL REFERENCES ordenes_trabajo(id) ON DELETE CASCADE,
+        fecha TEXT NOT NULL, monto REAL NOT NULL,
+        metodo_pago TEXT NOT NULL, banco TEXT, referencia TEXT,
+        creado_en TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )''')
+    c.execute('CREATE INDEX IF NOT EXISTS ix_anticipos_ot_orden ON anticipos_ot(orden_trabajo_id,fecha DESC,id DESC)')
     c.execute('''CREATE TABLE IF NOT EXISTS repuestos_ot(
         id INTEGER PRIMARY KEY AUTOINCREMENT,orden_trabajo_id INTEGER NOT NULL REFERENCES ordenes_trabajo(id) ON DELETE CASCADE,
         proveedor_id INTEGER NOT NULL REFERENCES proveedores(id),factura TEXT NOT NULL,fecha TEXT NOT NULL,descripcion TEXT NOT NULL,
@@ -536,6 +553,11 @@ def init_db(sync_history=True):
     c.execute('CREATE INDEX IF NOT EXISTS ix_partidas_asiento ON partidas(asiento_id)')
     c.execute('CREATE INDEX IF NOT EXISTS ix_cxp_estado ON cuentas_por_pagar(estado)')
     c.execute('CREATE INDEX IF NOT EXISTS ix_cxc_estado ON cuentas_por_cobrar(estado)')
+    # Cuenta separada para pagos adelantados de taller. No se capitaliza hasta
+    # que la OT se cierre con su factura/valor final.
+    c.execute('''INSERT OR IGNORE INTO cuentas_contables
+        (codigo,cuenta,tipo,grupo,naturaleza,acepta_movimiento,requiere_activo,requiere_centro_costo,activo)
+        VALUES('1107','Anticipos a proveedores','Activo','Activo circulante','Deudora',1,0,0,1)''')
     c.execute("UPDATE vehiculos SET estado='DPV' WHERE estado NOT IN ('En Tránsito','Nacionalizado','En Taller','DPV','Reservado','Vendido')")
     if sync_history:
         sincronizar_contabilidad_historica(c)
@@ -582,12 +604,21 @@ def add_movimiento(c, vehiculo_id, fecha, tipo, estado_anterior=None, estado_nue
         (vehiculo_id,fecha,tipo,estado_anterior,estado_nuevo,ubicacion_anterior,ubicacion_nueva,referencia,observaciones))
     return cursor.lastrowid
 
-def crear_orden_trabajo(c, vehiculo_id, adquisicion_id, fecha, taller, tipo_reparacion, valor_negociado, descripcion):
+def crear_orden_trabajo(c, vehiculo_id, adquisicion_id, fecha, taller, tipo_reparacion, valor_negociado, descripcion, fecha_entrega_estimada=None):
     correlativo=c.execute('SELECT COALESCE(MAX(correlativo),0)+1 FROM ordenes_trabajo').fetchone()[0]
     numero=f'OT-{correlativo:06d}'
-    cur=c.execute('''INSERT INTO ordenes_trabajo(vehiculo_id,adquisicion_id,fecha,estado,detalle,correlativo,numero_ot,taller,tipo_reparacion,valor_negociado,descripcion)
-        VALUES(?,?,?,'Pendiente',?,?,?,?,?,?,?)''',(vehiculo_id,adquisicion_id,fecha,descripcion,correlativo,numero,taller,tipo_reparacion,valor_negociado,descripcion))
+    cur=c.execute('''INSERT INTO ordenes_trabajo(vehiculo_id,adquisicion_id,fecha,estado,detalle,correlativo,numero_ot,taller,tipo_reparacion,valor_negociado,descripcion,fecha_entrega_estimada)
+        VALUES(?,?,?,'Pendiente',?,?,?,?,?,?,?,?)''',(vehiculo_id,adquisicion_id,fecha,descripcion,correlativo,numero,taller,tipo_reparacion,valor_negociado,descripcion,fecha_entrega_estimada))
     return cur.lastrowid, numero
+
+def fecha_llegada_importacion(fecha, tipo_compra):
+    """Calcula la llegada comprometida de una importación sin depender del cliente."""
+    if tipo_compra!='Importación' or not fecha:
+        return None
+    try:
+        return (datetime.strptime(str(fecha)[:10],'%Y-%m-%d')+timedelta(days=40)).strftime('%Y-%m-%d')
+    except ValueError:
+        raise ValueError('La fecha de adquisición debe tener el formato AAAA-MM-DD.')
 
 def siguiente_correlativo_plataforma(c, tipo):
     current=c.execute('SELECT ultimo_numero FROM correlativos_plataforma WHERE tipo=?',(tipo,)).fetchone()
@@ -655,7 +686,7 @@ def desglose_costo_consolidado(c, vehiculo_id):
 CUENTAS_AUTOMATICAS={
     'caja_bancos':'1101','cxc':'1102','inventario_dpv':'1103',
     'inventario_taller':'1104','inventario_transito':'1105',
-    'cxp':'2101','ingresos_venta':'4101','costo_ventas':'5101'
+    'cxp':'2101','anticipos_proveedores':'1107','ingresos_venta':'4101','costo_ventas':'5101'
 }
 
 def cuenta_contable_id(c, clave):
@@ -733,23 +764,67 @@ def validar_pago_cierre_ot(data):
         return None,'Ingrese el número de referencia de la transferencia.'
     return (metodo,banco or None,referencia or None),None
 
+def validar_pago_anticipo_ot(data):
+    """Un anticipo es un pago real, por eso no puede quedar como crédito."""
+    metodo=(data.get('anticipo_metodo_pago') or data.get('metodo_pago') or '').strip()
+    banco=(data.get('anticipo_banco') or data.get('banco') or '').strip()
+    referencia=(data.get('anticipo_referencia') or data.get('referencia') or '').strip()
+    if metodo not in ('Efectivo','Transferencia'):
+        return None,'Seleccione Efectivo o Transferencia para el anticipo de la OT.'
+    if metodo=='Transferencia' and not banco:
+        return None,'Seleccione el banco desde el cual se realizó el anticipo.'
+    # La referencia ayuda a auditar, pero no se fuerza: en efectivo no existe
+    # y algunos bancos no la entregan al momento del pago.
+    return (metodo,banco or None,referencia or None),None
+
+def total_anticipos_ot(c, orden_trabajo_id):
+    return round(float(c.execute('SELECT COALESCE(SUM(monto),0) FROM anticipos_ot WHERE orden_trabajo_id=?',(orden_trabajo_id,)).fetchone()[0] or 0),2)
+
+def registrar_anticipo_ot(c, order, monto, metodo_pago, banco, referencia, fecha=None):
+    """Registra el pago adelantado sin convertirlo aún en costo del vehículo."""
+    value=round(float(monto or 0),2)
+    if value<=0:
+        return None
+    fecha=fecha or datetime.now().strftime('%Y-%m-%d')
+    cur=c.execute('''INSERT INTO anticipos_ot(orden_trabajo_id,fecha,monto,metodo_pago,banco,referencia)
+        VALUES(?,?,?,?,?,?)''',(order['id'],fecha,value,metodo_pago,banco,referencia))
+    advance_id=cur.lastrowid
+    description=f"Anticipo {order['numero_ot'] or 'OT'} · {order['taller'] or 'Taller'}"
+    medio,banco_caja=medio_caja(metodo_pago,banco)
+    registrar_movimiento_caja(c,fecha,'Anticipo de OT',medio,banco_caja,0,value,description,'anticipo_ot',advance_id)
+    registrar_asiento(c,fecha,description,'anticipo_ot',advance_id,[
+        {'cuenta_id':cuenta_contable_id(c,'anticipos_proveedores'),'debe':value},
+        {'cuenta_id':cuenta_contable_id(c,'caja_bancos'),'haber':value},
+    ],order['vehiculo_id'])
+    return advance_id
+
 def contabilizar_cierre_ot(c, order, provider, valor_final, metodo_pago, banco, referencia, fecha):
-    """Capitaliza la mano de obra y registra Caja/Bancos o CxP del taller."""
+    """Capitaliza el cierre, aplica anticipos y deja solo el saldo real en CxP."""
     value=round(float(valor_final or 0),2)
     if not value:
         return
     vehicle=c.execute('SELECT estado FROM vehiculos WHERE id=?',(order['vehiculo_id'],)).fetchone()
     inventory=cuenta_inventario_por_estado(vehicle['estado'] if vehicle else 'En Taller')
     description=f"Cierre {order['numero_ot'] or 'OT'} · {provider['nombre']}"
-    lines=[{'cuenta_id':cuenta_contable_id(c,inventory),'debe':value}]
-    if metodo_pago=='Crédito':
-        lines.append({'cuenta_id':cuenta_contable_id(c,'cxp'),'haber':value})
-        c.execute('''INSERT INTO cuentas_por_pagar_ot(orden_trabajo_id,proveedor_id,fecha,monto_original,saldo,estado,metodo_pago,banco,referencia)
-            VALUES(?,?,?,?,?,'Pendiente',?,?,?)''',(order['id'],provider['id'],fecha,value,value,metodo_pago,banco,referencia))
-    else:
-        lines.append({'cuenta_id':cuenta_contable_id(c,'caja_bancos'),'haber':value})
+    advances=min(total_anticipos_ot(c,order['id']),value)
+    remaining=round(value-advances,2)
+    lines=[{'cuenta_id':cuenta_contable_id(c,inventory),'debe':value},
+           {'cuenta_id':cuenta_contable_id(c,'cxp'),'haber':value}]
+    if advances:
+        lines.extend([
+            {'cuenta_id':cuenta_contable_id(c,'cxp'),'debe':advances},
+            {'cuenta_id':cuenta_contable_id(c,'anticipos_proveedores'),'haber':advances},
+        ])
+    if metodo_pago!='Crédito' and remaining:
+        lines.extend([
+            {'cuenta_id':cuenta_contable_id(c,'cxp'),'debe':remaining},
+            {'cuenta_id':cuenta_contable_id(c,'caja_bancos'),'haber':remaining},
+        ])
         medio,banco_caja=medio_caja(metodo_pago,banco)
-        registrar_movimiento_caja(c,fecha,'Pago de OT',medio,banco_caja,0,value,description,'pago_ot',order['id'])
+        registrar_movimiento_caja(c,fecha,'Pago de saldo OT',medio,banco_caja,0,remaining,description,'pago_ot',order['id'])
+    if remaining and metodo_pago=='Crédito':
+        c.execute('''INSERT INTO cuentas_por_pagar_ot(orden_trabajo_id,proveedor_id,fecha,monto_original,saldo,estado,metodo_pago,banco,referencia)
+            VALUES(?,?,?,?,?,'Pendiente',?,?,?)''',(order['id'],provider['id'],fecha,remaining,remaining,metodo_pago,banco,referencia))
     registrar_asiento(c,fecha,description,'cierre_ot',order['id'],lines,order['vehiculo_id'])
 
 def validar_pago_repuesto(data):
@@ -2000,6 +2075,41 @@ def put_financiera(financiera_id):
 def get_adquisiciones():
     c=db(); r=c.execute('''SELECT a.*,v.vin,v.marca,v.modelo,p.nombre proveedor_nombre FROM adquisiciones a JOIN vehiculos v ON v.id=a.vehiculo_id JOIN proveedores p ON p.id=a.proveedor_id ORDER BY a.fecha DESC,a.id DESC''').fetchall(); c.close(); return jsonify([dict(x) for x in r])
 
+@app.get('/api/planificacion-financiera')
+def get_planificacion_financiera():
+    """Compromisos proyectados; es una vista y no genera CxP ni asientos."""
+    c=db()
+    transit=c.execute('''SELECT a.id,a.fecha_llegada_estimada fecha_compromiso,a.fecha fecha_origen,
+            a.saldo pendiente,a.costo_compra monto_original,a.anticipo anticipos,
+            a.metodo_pago,a.condicion_pago,v.vin,v.marca,v.modelo,p.nombre proveedor,
+            'Adquisición' origen,'En Tránsito' etapa
+        FROM adquisiciones a
+        JOIN vehiculos v ON v.id=a.vehiculo_id
+        JOIN proveedores p ON p.id=a.proveedor_id
+        WHERE v.estado='En Tránsito' AND ROUND(COALESCE(a.saldo,0),2)>0
+        ORDER BY COALESCE(a.fecha_llegada_estimada,a.fecha),a.id''').fetchall()
+    workshop=c.execute('''SELECT o.id,o.fecha_entrega_estimada fecha_compromiso,o.fecha fecha_origen,
+            o.valor_negociado monto_original,COALESCE(SUM(ao.monto),0) anticipos,
+            v.vin,v.marca,v.modelo,o.taller proveedor,o.numero_ot documento,
+            'Orden de trabajo' origen,'En Taller' etapa
+        FROM ordenes_trabajo o
+        JOIN vehiculos v ON v.id=o.vehiculo_id
+        LEFT JOIN anticipos_ot ao ON ao.orden_trabajo_id=o.id
+        WHERE o.estado='Pendiente' AND v.estado='En Taller'
+        GROUP BY o.id
+        HAVING ROUND(o.valor_negociado-COALESCE(SUM(ao.monto),0),2)>0
+        ORDER BY COALESCE(o.fecha_entrega_estimada,o.fecha),o.id''').fetchall()
+    rows=[]
+    for row in transit:
+        item=dict(row); item['documento']=f"Adquisición #{item['id']}"; item['pendiente']=round(float(item['pendiente'] or 0),2); rows.append(item)
+    for row in workshop:
+        item=dict(row); item['anticipos']=round(float(item['anticipos'] or 0),2); item['pendiente']=round(float(item['monto_original'] or 0)-item['anticipos'],2); rows.append(item)
+    rows.sort(key=lambda item:(item.get('fecha_compromiso') or '9999-12-31',item['origen'],item['id']))
+    summary={'transito':round(sum(item['pendiente'] for item in rows if item['etapa']=='En Tránsito'),2),
+             'taller':round(sum(item['pendiente'] for item in rows if item['etapa']=='En Taller'),2)}
+    summary['total']=round(summary['transito']+summary['taller'],2)
+    c.close(); return jsonify(resumen=summary,compromisos=rows)
+
 @app.get('/api/ordenes-trabajo')
 def get_ordenes_trabajo():
     c=db(); r=c.execute('''SELECT o.*,v.vin,v.marca,v.modelo FROM ordenes_trabajo o
@@ -2016,16 +2126,21 @@ def put_orden_trabajo(oid):
     if accion=='modificar':
         fecha=(d.get('fecha') or '').strip(); taller=(d.get('taller') or '').strip()
         descripcion=(d.get('descripcion') or '').strip(); nuevo_estado=d.get('estado')
+        entrega=(d.get('fecha_entrega_estimada') or order['fecha_entrega_estimada'] or '').strip()
         if not fecha or not taller or not descripcion or nuevo_estado not in ('Pendiente','Finalizada'):
             c.close(); return jsonify(error='Fecha, taller, descripción y estado válidos son obligatorios'),400
         if nuevo_estado!=order['estado']:
             c.close(); return jsonify(error='El cierre debe realizarse con el botón “Cerrar OT” para registrar el valor final.'),400
         historical=int(order['migracion_historica'] or 0)
-        c.execute('''UPDATE ordenes_trabajo SET fecha=?,taller=?,descripcion=?,detalle=?,estado=?,
+        if entrega:
+            try: datetime.strptime(entrega,'%Y-%m-%d')
+            except ValueError: c.close(); return jsonify(error='La fecha estimada de entrega no es válida.'),400
+            if entrega<fecha: c.close(); return jsonify(error='La fecha de entrega no puede ser anterior a la fecha de la OT.'),400
+        c.execute('''UPDATE ordenes_trabajo SET fecha=?,taller=?,descripcion=?,detalle=?,estado=?,fecha_entrega_estimada=?,
                      valor_final=CASE WHEN ?=1 AND ?='Finalizada' THEN 0 ELSE valor_final END,
                      costo_cargado=CASE WHEN ?=1 AND ?='Finalizada' THEN 1 ELSE costo_cargado END
                      WHERE id=?''',
-                  (fecha,taller,descripcion,descripcion,nuevo_estado,historical,nuevo_estado,historical,nuevo_estado,oid))
+                  (fecha,taller,descripcion,descripcion,nuevo_estado,entrega or None,historical,nuevo_estado,historical,nuevo_estado,oid))
         recalcular_estado(c,order['vehiculo_id'],'OT modificada')
         c.commit(); c.close(); return jsonify(ok=True,vehiculo_id=order['vehiculo_id'])
     if accion=='corregir_cierre':
@@ -2141,9 +2256,10 @@ def post_orden_trabajo():
     try: vid=int(d.get('vehiculo_id'))
     except (TypeError,ValueError): return jsonify(error='Vehículo es obligatorio'),400
     taller=(d.get('taller') or '').strip(); reparacion=(d.get('tipo_reparacion') or '').strip(); detalle=(d.get('descripcion') or d.get('detalle') or '').strip()
+    fecha_entrega=(d.get('fecha_entrega_estimada') or '').strip()
     try: valor=float(d.get('valor_negociado'))
     except (TypeError,ValueError): return jsonify(error='El valor negociado es obligatorio'),400
-    if not taller or not reparacion or not detalle: return jsonify(error='Taller, tipo de reparación y descripción son obligatorios'),400
+    if not taller or not reparacion or not detalle or not fecha_entrega: return jsonify(error='Taller, tipo de reparación, descripción y fecha estimada de entrega son obligatorios'),400
     if valor<0: return jsonify(error='El valor negociado no puede ser negativo'),400
     c=db(); vehicle=c.execute('SELECT * FROM vehiculos WHERE id=?',(vid,)).fetchone()
     if not vehicle: c.close(); return jsonify(error='Vehículo no encontrado'),404
@@ -2157,9 +2273,57 @@ def post_orden_trabajo():
             and vehicle['estado']=='En Tránsito'
             and (not costing or costing['estatus']!='Nacionalizado')):
         c.close(); return jsonify(error='El vehículo importado debe estar nacionalizado antes de crear una OT'),400
-    _,numero=crear_orden_trabajo(c,vid,acquisition['id'] if acquisition else None,d.get('fecha') or datetime.now().strftime('%Y-%m-%d'),taller,reparacion,valor,detalle)
+    fecha_ot=d.get('fecha') or datetime.now().strftime('%Y-%m-%d')
+    try:
+        datetime.strptime(fecha_entrega,'%Y-%m-%d')
+    except ValueError:
+        c.close(); return jsonify(error='La fecha estimada de entrega no es válida.'),400
+    if fecha_entrega<fecha_ot:
+        c.close(); return jsonify(error='La fecha estimada de entrega no puede ser anterior a la fecha de la OT.'),400
+    order_id,numero=crear_orden_trabajo(c,vid,acquisition['id'] if acquisition else None,fecha_ot,taller,reparacion,valor,detalle,fecha_entrega)
+    try:
+        anticipo=round(float(d.get('anticipo_ot') or 0),2)
+    except (TypeError,ValueError):
+        c.close(); return jsonify(error='El anticipo de la OT debe ser numérico.'),400
+    if anticipo<0 or anticipo>valor:
+        c.close(); return jsonify(error='El anticipo no puede ser negativo ni mayor que el valor negociado.'),400
+    if anticipo:
+        pago,error=validar_pago_anticipo_ot(d)
+        if error:
+            c.close(); return jsonify(error=error),400
+        metodo,banco,referencia=pago
+        if referencia and not referencia_pago_disponible(c,referencia):
+            c.close(); return jsonify(error='El número de referencia ya fue utilizado.'),409
+        order=c.execute('SELECT * FROM ordenes_trabajo WHERE id=?',(order_id,)).fetchone()
+        registrar_anticipo_ot(c,order,anticipo,metodo,banco,referencia,fecha_ot)
     recalcular_estado(c,vid,'Orden de trabajo creada')
-    c.commit(); c.close(); return jsonify(ok=True,numero_ot=numero),201
+    c.commit(); c.close(); return jsonify(ok=True,numero_ot=numero,anticipo=anticipo),201
+
+@app.get('/api/ordenes-trabajo/<int:oid>/anticipos')
+def get_anticipos_ot(oid):
+    c=db(); rows=c.execute('SELECT * FROM anticipos_ot WHERE orden_trabajo_id=? ORDER BY fecha DESC,id DESC',(oid,)).fetchall(); c.close()
+    return jsonify([dict(row) for row in rows])
+
+@app.post('/api/ordenes-trabajo/<int:oid>/anticipos')
+def post_anticipo_ot(oid):
+    d=request.get_json(silent=True) or {}
+    try:
+        monto=round(float(d.get('monto')),2)
+    except (TypeError,ValueError):
+        return jsonify(error='El monto del anticipo es obligatorio.'),400
+    if monto<=0: return jsonify(error='El anticipo debe ser mayor que cero.'),400
+    c=db(); order=c.execute('SELECT * FROM ordenes_trabajo WHERE id=?',(oid,)).fetchone()
+    if not order: c.close(); return jsonify(error='OT no encontrada.'),404
+    if order['estado']!='Pendiente': c.close(); return jsonify(error='Solo puede anticipar una OT pendiente.'),400
+    if monto+total_anticipos_ot(c,oid)>round(float(order['valor_negociado'] or 0),2)+0.01:
+        c.close(); return jsonify(error='Los anticipos no pueden superar el valor negociado de la OT.'),400
+    pago,error=validar_pago_anticipo_ot(d)
+    if error: c.close(); return jsonify(error=error),400
+    metodo,banco,referencia=pago
+    if referencia and not referencia_pago_disponible(c,referencia):
+        c.close(); return jsonify(error='El número de referencia ya fue utilizado.'),409
+    advance_id=registrar_anticipo_ot(c,order,monto,metodo,banco,referencia,d.get('fecha') or datetime.now().strftime('%Y-%m-%d'))
+    c.commit(); c.close(); return jsonify(ok=True,id=advance_id),201
 
 @app.get('/api/ordenes-trabajo/<int:oid>/repuestos')
 def get_repuestos_ot(oid):
@@ -2369,15 +2533,20 @@ def post_adquisicion():
     if tipo_compra=='Importación' and d.get('necesita_reparacion') in (True,1,'1'):
         c.close(); return jsonify(error='Un vehículo importado no puede generar una OT antes de nacionalizarse'),400
     saldo=costo-anticipo
+    fecha_compra=d.get('fecha') or datetime.now().strftime('%Y-%m-%d')
     try:
-        cur=c.execute('''INSERT INTO adquisiciones(vehiculo_id,proveedor_id,fecha,costo_compra,anticipo,metodo_pago,condicion_pago,dias_credito,saldo,observaciones,necesita_reparacion,tipo_compra,placa_cambio,banco) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',(vid,pid,d.get('fecha') or datetime.now().strftime('%Y-%m-%d'),costo,anticipo,metodo,condicion,p['dias_credito'],saldo,d.get('observaciones'),1 if d.get('necesita_reparacion') in (True,1,'1') else 0,tipo_compra,placa_cambio or None,banco or None))
+        fecha_llegada=fecha_llegada_importacion(fecha_compra,tipo_compra)
+    except ValueError as error:
+        c.close(); return jsonify(error=str(error)),400
+    try:
+        cur=c.execute('''INSERT INTO adquisiciones(vehiculo_id,proveedor_id,fecha,costo_compra,anticipo,metodo_pago,condicion_pago,dias_credito,saldo,observaciones,necesita_reparacion,tipo_compra,placa_cambio,banco,fecha_llegada_estimada) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',(vid,pid,fecha_compra,costo,anticipo,metodo,condicion,p['dias_credito'],saldo,d.get('observaciones'),1 if d.get('necesita_reparacion') in (True,1,'1') else 0,tipo_compra,placa_cambio or None,banco or None,fecha_llegada))
     except sqlite3.IntegrityError: c.close(); return jsonify(error='Este vehículo ya tiene una compra registrada'),409
     purchase_type=tipo_compra.lower(); repair=d.get('necesita_reparacion') in (True,1,'1')
-    c.execute('UPDATE vehiculos SET precio_compra=?,proveedor=?,fecha_adquisicion=?,tipo_compra=? WHERE id=?',(costo,p['nombre'],d.get('fecha') or datetime.now().strftime('%Y-%m-%d'),tipo_compra,vid))
+    c.execute('UPDATE vehiculos SET precio_compra=?,proveedor=?,fecha_adquisicion=?,tipo_compra=? WHERE id=?',(costo,p['nombre'],fecha_compra,tipo_compra,vid))
     if repair and ('local' in purchase_type or 'cambio' in purchase_type):
         crear_orden_trabajo(c,vid,cur.lastrowid,d.get('fecha') or datetime.now().strftime('%Y-%m-%d'),'Pendiente de asignar','Reparación general',0,d.get('detalle_reparacion') or 'Reparaciones requeridas después de la adquisición')
     new_status=recalcular_estado(c,vid,'Etapa calculada al registrar la adquisición')
-    add_movimiento(c,vid,d.get('fecha') or datetime.now().strftime('%Y-%m-%d'),'Registro de adquisición',v['estado'],new_status,v['ubicacion'],v['ubicacion'],referencia=metodo,observaciones=f'Compra {tipo_compra}: {p["nombre"]}. Anticipo {anticipo:.2f}; saldo pendiente {saldo:.2f}')
+    add_movimiento(c,vid,fecha_compra,'Registro de adquisición',v['estado'],new_status,v['ubicacion'],v['ubicacion'],referencia=metodo,observaciones=f'Compra {tipo_compra}: {p["nombre"]}. Anticipo {anticipo:.2f}; saldo pendiente {saldo:.2f}.' + (f' Llegada estimada: {fecha_llegada}.' if fecha_llegada else ''))
     contabilizar_adquisicion(c,cur.lastrowid)
     c.commit(); c.close(); return jsonify(ok=True),201
 
@@ -2415,6 +2584,10 @@ def put_compra(adquisicion_id):
     if tipo_compra=='Importación' and repair:
         c.close(); return jsonify(error='Un vehículo importado no puede generar una OT antes de nacionalizarse'),400
     fecha=d.get('fecha') or purchase['fecha']; saldo=round(costo-anticipo,2)
+    try:
+        fecha_llegada=fecha_llegada_importacion(fecha,tipo_compra)
+    except ValueError as error:
+        c.close(); return jsonify(error=str(error)),400
     historical=(purchase['observaciones'] or '').startswith('Migración histórica.')
     observaciones=d.get('observaciones')
     # Las migraciones usan este prefijo para no generar CxP auxiliares al
@@ -2424,9 +2597,9 @@ def put_compra(adquisicion_id):
     try:
         c.execute('BEGIN')
         c.execute('''UPDATE adquisiciones SET proveedor_id=?,fecha=?,costo_compra=?,anticipo=?,metodo_pago=?,
-            condicion_pago=?,dias_credito=?,saldo=?,observaciones=?,necesita_reparacion=?,tipo_compra=?,placa_cambio=?,banco=?
+            condicion_pago=?,dias_credito=?,saldo=?,observaciones=?,necesita_reparacion=?,tipo_compra=?,placa_cambio=?,banco=?,fecha_llegada_estimada=?
             WHERE id=?''',(pid,fecha,costo,anticipo,metodo,condicion,provider['dias_credito'],saldo,
-            observaciones,1 if repair else 0,tipo_compra,placa_cambio or None,banco or None,adquisicion_id))
+            observaciones,1 if repair else 0,tipo_compra,placa_cambio or None,banco or None,fecha_llegada,adquisicion_id))
         c.execute('''UPDATE vehiculos SET precio_compra=?,proveedor=?,fecha_adquisicion=?,tipo_compra=? WHERE id=?''',
             (costo,provider['nombre'],fecha,tipo_compra,vehicle['id']))
         if historical:
