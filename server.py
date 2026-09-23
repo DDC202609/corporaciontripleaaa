@@ -34,7 +34,7 @@ ACCESS_MODULES=(
     ('ventas','Ventas y cobros'),('vendedores','Vendedores'),('inventario','Consulta de inventario'),
     ('catalogo','Catálogo contable'),('centros_costo','Centros de costo'),('cartera','Cuentas por cobrar y pagar'),('contabilidad','Contabilidad'),
     ('caja_bancos','Caja y bancos'),('gastos','Registro de gastos'),('comisiones','Comisiones'),
-    ('planificacion_financiera','Planificación financiera'),
+    ('planificacion_financiera','Planificación financiera'),('auditoria','Bitácora de auditoría'),
 )
 
 def init_access_control_schema():
@@ -121,6 +121,7 @@ def user_access(user_id):
 
 def request_module(path):
     if path.startswith('/api/usuarios') or path.startswith('/api/perfiles'): return 'usuarios'
+    if path.startswith('/api/auditoria'): return 'auditoria'
     if path.startswith('/api/dashboard'): return 'dashboard'
     if path.startswith('/api/planificacion-financiera'): return 'planificacion_financiera'
     if path.startswith('/api/contabilidad'): return 'contabilidad'
@@ -157,6 +158,106 @@ def user_count():
     except sqlite3.OperationalError: return 0
     finally: c.close()
 
+# La bitácora guarda evidencia de operaciones que modifican información. Las
+# contraseñas, hashes y secretos nunca se persisten en ella.
+AUDIT_RESOURCES=(
+    (r'^/api/vehiculos/(\d+)', 'Vehículo', 'vehiculos'),
+    (r'^/api/adquisiciones/(\d+)', 'Adquisición', 'adquisiciones'),
+    (r'^/api/ordenes-trabajo/(\d+)', 'Orden de trabajo', 'ordenes_trabajo'),
+    (r'^/api/repuestos-ot/(\d+)', 'Repuesto / insumo', 'repuestos_ot'),
+    (r'^/api/gastos-ot/(\d+)', 'Gasto de OT', 'gastos_ot'),
+    (r'^/api/ventas/(\d+)', 'Venta', 'ventas'),
+    (r'^/api/proveedores/(\d+)', 'Proveedor', 'proveedores'),
+    (r'^/api/usuarios/(\d+)', 'Usuario', 'usuarios'),
+)
+AUDIT_PREFIXES=(
+    ('/api/vehiculos', 'Vehículo', 'vehiculos'), ('/api/adquisiciones', 'Adquisición', 'adquisiciones'),
+    ('/api/ordenes-trabajo', 'Orden de trabajo', 'ordenes_trabajo'), ('/api/repuestos-ot', 'Repuesto / insumo', 'repuestos_ot'),
+    ('/api/gastos-ot', 'Gasto de OT', 'gastos_ot'), ('/api/ventas', 'Venta', 'ventas'),
+    ('/api/proveedores', 'Proveedor', 'proveedores'), ('/api/usuarios', 'Usuario', 'usuarios'),
+    ('/api/perfiles', 'Perfil de acceso', 'perfiles'), ('/api/cuentas-por-', 'Cuenta por pagar/cobrar', None),
+    ('/api/caja', 'Caja y bancos', None), ('/api/gastos', 'Gasto operativo', 'gastos_operativos'),
+    ('/api/clientes', 'Cliente', 'clientes'), ('/api/vendedores', 'Vendedor', 'vendedores'),
+    ('/api/catalogo', 'Catálogo contable', None), ('/api/informacion-vehiculo', 'Información de vehículo', None),
+    ('/api/areas', 'Centro de costo', None), ('/api/departamentos', 'Centro de costo', None),
+    ('/api/comisiones', 'Comisión', None),
+)
+
+def redact_auditoria(value):
+    if isinstance(value, dict):
+        return {key: ('***' if any(word in str(key).lower() for word in ('password','contrasena','secret'))
+                      else redact_auditoria(item)) for key,item in value.items()}
+    if isinstance(value, list): return [redact_auditoria(item) for item in value]
+    return value
+
+def recurso_auditoria(path):
+    for pattern,resource,table in AUDIT_RESOURCES:
+        match=re.match(pattern,path)
+        if match: return resource,int(match.group(1)),table
+    for prefix,resource,table in AUDIT_PREFIXES:
+        if path.startswith(prefix): return resource,None,table
+    return 'Operación del sistema',None,None
+
+def instantanea_auditoria(table, resource_id):
+    if not table or resource_id is None: return None
+    # Los nombres de tabla se definen únicamente en las constantes internas.
+    c=db()
+    try:
+        row=c.execute(f'SELECT * FROM {table} WHERE id=?',(resource_id,)).fetchone()
+        return redact_auditoria(dict(row)) if row else None
+    except sqlite3.Error:
+        return None
+    finally:
+        c.close()
+
+@app.before_request
+def preparar_auditoria():
+    if not request.path.startswith('/api/') or request.method not in {'POST','PUT','PATCH','DELETE'}:
+        return None
+    if request.path in {'/api/sesion/actividad'} or request.path.startswith('/api/auditoria'):
+        return None
+    resource,resource_id,table=recurso_auditoria(request.path)
+    g.audit_event={
+        'resource':resource,'resource_id':resource_id,'table':table,
+        'before':instantanea_auditoria(table,resource_id),
+        'request':redact_auditoria(request.get_json(silent=True) or {}),
+    }
+
+@app.after_request
+def registrar_auditoria(response):
+    event=getattr(g,'audit_event',None)
+    if not event or response.status_code>=400:
+        return response
+    result=response.get_json(silent=True) or {}
+    resource_id=event['resource_id']
+    if resource_id is None and isinstance(result,dict):
+        for key in ('id','vehiculo_id','orden_trabajo_id','adquisicion_id'):
+            if result.get(key) is not None:
+                try:
+                    resource_id=int(result[key]); break
+                except (TypeError,ValueError): pass
+    after=instantanea_auditoria(event['table'],resource_id)
+    detail={'solicitud':event['request']}
+    if after is not None: detail['registro']=after
+    actions={'POST':'Crear','PUT':'Modificar','PATCH':'Modificar','DELETE':'Eliminar'}
+    action=actions.get(request.method,request.method)
+    operation=event['request'].get('accion') if isinstance(event['request'],dict) else None
+    if operation: action=f'{action}: {operation}'
+    user=user_access(session.get('user_id')) if session.get('user_id') else None
+    c=db()
+    try:
+        c.execute('''INSERT INTO bitacora_auditoria(usuario_id,usuario,accion,recurso,recurso_id,ruta,metodo,antes,despues,ip)
+            VALUES(?,?,?,?,?,?,?,?,?,?)''',(
+            user.get('id') if user else None, user.get('username') if user else 'Sistema', action,
+            event['resource'],resource_id,request.path,request.method,
+            json.dumps(event['before'],ensure_ascii=False),json.dumps(detail,ensure_ascii=False),request.remote_addr))
+        c.commit()
+    except sqlite3.Error:
+        app.logger.exception('No fue posible registrar una entrada de auditoría.')
+    finally:
+        c.close()
+    return response
+
 @app.before_request
 def require_authenticated_user():
     if request.endpoint in {'login','setup','logout','static','download_system_backup','healthcheck'} or request.path.startswith('/static/'):
@@ -188,6 +289,9 @@ def require_authenticated_user():
             if module=='usuarios':
                 if user.get('es_administrador'): return None
                 return jsonify(error='No tiene permisos para administrar accesos.'),403
+            if module=='auditoria':
+                if user.get('es_administrador'): return None
+                return jsonify(error='La bitácora de auditoría solo está disponible para administradores.'),403
             if module and not user.get('es_administrador'):
                 required='ver' if request.method in {'GET','HEAD','OPTIONS'} else 'modificar'
                 if not user.get('permisos',{}).get(module,{}).get(required,False):
@@ -564,6 +668,17 @@ def init_db(sync_history=True):
         fecha TEXT NOT NULL,tipo_pago TEXT NOT NULL,banco TEXT,referencia TEXT,monto REAL NOT NULL,creado_en TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)''')
     c.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_pagos_cxp_referencia ON pagos_cuentas_por_pagar(referencia) WHERE referencia IS NOT NULL AND referencia<>''")
     c.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_cobros_cxc_referencia ON cobros_cuentas_por_cobrar(referencia) WHERE referencia IS NOT NULL AND referencia<>''")
+    c.execute('''CREATE TABLE IF NOT EXISTS bitacora_auditoria(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        fecha TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        usuario_id INTEGER REFERENCES usuarios(id) ON DELETE SET NULL,
+        usuario TEXT NOT NULL DEFAULT 'Sistema',
+        accion TEXT NOT NULL, recurso TEXT NOT NULL, recurso_id INTEGER,
+        ruta TEXT NOT NULL, metodo TEXT NOT NULL,
+        antes TEXT, despues TEXT, ip TEXT
+    )''')
+    c.execute('CREATE INDEX IF NOT EXISTS ix_bitacora_fecha ON bitacora_auditoria(fecha DESC,id DESC)')
+    c.execute('CREATE INDEX IF NOT EXISTS ix_bitacora_recurso ON bitacora_auditoria(recurso,recurso_id)')
     c.execute('CREATE INDEX IF NOT EXISTS ix_vehiculos_estado ON vehiculos(estado)')
     c.execute('CREATE INDEX IF NOT EXISTS ix_vehiculos_fecha_adquisicion ON vehiculos(fecha_adquisicion)')
     c.execute('CREATE INDEX IF NOT EXISTS ix_ordenes_trabajo_vehiculo_estado ON ordenes_trabajo(vehiculo_id,estado)')
@@ -1125,6 +1240,34 @@ def registrar_actividad_sesion():
     """Actualiza la sesión únicamente tras una interacción explícita de la UI."""
     session['last_activity']=datetime.now().timestamp()
     return jsonify(ok=True)
+
+@app.get('/api/auditoria')
+def get_auditoria():
+    """Consulta acotada de cambios; el control de acceso es solo administrador."""
+    filters=[]; args=[]
+    for field,column in (('desde','date(b.fecha)'),('hasta','date(b.fecha)')):
+        value=(request.args.get(field) or '').strip()
+        if value:
+            filters.append(f'{column}{">=" if field=="desde" else "<="}?'); args.append(value)
+    for field,column in (('usuario','b.usuario'),('recurso','b.recurso'),('accion','b.accion')):
+        value=(request.args.get(field) or '').strip()
+        if value:
+            filters.append(f'{column} LIKE ?'); args.append(f'%{value}%')
+    try: limit=max(1,min(int(request.args.get('limite',200)),500))
+    except ValueError: limit=200
+    where=(' WHERE '+' AND '.join(filters)) if filters else ''
+    c=db()
+    rows=c.execute(f'''SELECT b.* FROM bitacora_auditoria b{where}
+        ORDER BY b.fecha DESC,b.id DESC LIMIT ?''',(*args,limit)).fetchall()
+    c.close()
+    result=[]
+    for row in rows:
+        item=dict(row)
+        for field in ('antes','despues'):
+            try: item[field]=json.loads(item[field]) if item.get(field) else None
+            except (TypeError,json.JSONDecodeError): item[field]=None
+        result.append(item)
+    return jsonify(result)
 
 @app.post('/api/mi-cuenta/contrasena')
 def cambiar_mi_contrasena():
