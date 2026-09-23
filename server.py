@@ -32,7 +32,7 @@ ACCESS_MODULES=(
     ('dashboard','Dashboard'),('vehiculos','Vehículos'),('informacion_vehiculo','Información de vehículo'),
     ('proveedores','Proveedores'),('adquisiciones','Adquisiciones'),('taller','Taller'),('costeo','Costeo'),
     ('ventas','Ventas y cobros'),('vendedores','Vendedores'),('inventario','Consulta de inventario'),
-    ('catalogo','Catálogo contable'),('centros_costo','Centros de costo'),('contabilidad','Contabilidad'),
+    ('catalogo','Catálogo contable'),('centros_costo','Centros de costo'),('cartera','Cuentas por cobrar y pagar'),('contabilidad','Contabilidad'),
     ('caja_bancos','Caja y bancos'),('gastos','Registro de gastos'),('comisiones','Comisiones'),
 )
 
@@ -66,7 +66,7 @@ def init_access_control_schema():
 
     defaults=(
         ('Administrador','Acceso completo al sistema.',1,1),
-        ('Operaciones','Inventario, adquisiciones, taller y costeo.',0,1),
+        ('Operaciones','Operaciones, datos maestros, gastos y cartera.',0,1),
         ('Ventas','Ventas, clientes, vehículos disponibles y cobros.',0,1),
         ('Consulta','Acceso de solo lectura a indicadores y consultas.',0,1),
     )
@@ -75,7 +75,7 @@ def init_access_control_schema():
                   (name,description,is_admin,is_system))
     profiles={row['nombre']:row['id'] for row in c.execute('SELECT id,nombre FROM perfiles')}
     all_modules={key for key,_ in ACCESS_MODULES}
-    operational={'dashboard','vehiculos','informacion_vehiculo','proveedores','adquisiciones','taller','costeo','inventario'}
+    operational={'dashboard','vehiculos','informacion_vehiculo','proveedores','adquisiciones','taller','costeo','ventas','inventario','catalogo','centros_costo','vendedores','gastos','cartera'}
     sales={'dashboard','vehiculos','ventas','vendedores','inventario','caja_bancos','comisiones'}
     consultation={'dashboard','vehiculos','inventario','contabilidad','caja_bancos','ventas'}
     for profile_name,allowed in (('Administrador',all_modules),('Operaciones',operational),('Ventas',sales),('Consulta',consultation)):
@@ -87,6 +87,18 @@ def init_access_control_schema():
             can_edit=1 if (is_admin or (profile_name!='Consulta' and module in allowed)) else 0
             c.execute('''INSERT OR IGNORE INTO perfil_permisos(perfil_id,modulo,puede_ver,puede_modificar)
                          VALUES(?,?,?,?)''',(profile_id,module,can_view,can_edit))
+    # Actualiza una sola vez el perfil de sistema anterior de Operaciones. Se
+    # conserva cualquier ajuste manual posterior porque ya no coincide con la
+    # descripción anterior.
+    operations_id=profiles.get('Operaciones')
+    operations_profile=c.execute('SELECT descripcion FROM perfiles WHERE id=?',(operations_id,)).fetchone() if operations_id else None
+    if operations_profile and operations_profile['descripcion']=='Inventario, adquisiciones, taller y costeo.':
+        c.execute("UPDATE perfiles SET descripcion='Operaciones, datos maestros, gastos y cartera.' WHERE id=?",(operations_id,))
+        for module,_ in ACCESS_MODULES:
+            enabled=module in operational
+            c.execute('''INSERT INTO perfil_permisos(perfil_id,modulo,puede_ver,puede_modificar) VALUES(?,?,?,?)
+                ON CONFLICT(perfil_id,modulo) DO UPDATE SET puede_ver=excluded.puede_ver,puede_modificar=excluded.puede_modificar''',
+                (operations_id,module,int(enabled),int(enabled)))
     admin_id=profiles.get('Administrador')
     if admin_id:
         # No se le quita acceso al administrador histórico durante la migración.
@@ -109,7 +121,8 @@ def user_access(user_id):
 def request_module(path):
     if path.startswith('/api/usuarios') or path.startswith('/api/perfiles'): return 'usuarios'
     if path.startswith('/api/dashboard'): return 'dashboard'
-    if path.startswith('/api/contabilidad') or path.startswith('/api/cuentas-por-'): return 'contabilidad'
+    if path.startswith('/api/contabilidad'): return 'contabilidad'
+    if path.startswith('/api/cuentas-por-'): return 'cartera'
     if path.startswith('/api/caja'): return 'caja_bancos'
     if path.startswith('/api/gastos-ot'): return 'taller'
     if path.startswith('/api/gastos') or path.startswith('/api/conceptos-gasto'): return 'gastos'
