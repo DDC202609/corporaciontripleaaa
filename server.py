@@ -543,6 +543,8 @@ def init_db(sync_history=True):
     for name, definition in [('correlativo','INTEGER'),('numero_transaccion','TEXT'),('tipo_venta','TEXT'),('forma_pago','TEXT'),('financiera_banco','TEXT'),('monto_financiado','REAL NOT NULL DEFAULT 0'),('transferencia','REAL NOT NULL DEFAULT 0'),('observaciones','TEXT')]:
         if name not in sale_columns:
             c.execute(f'ALTER TABLE ventas ADD COLUMN {name} {definition}')
+    if 'garantia_dias' not in sale_columns:
+        c.execute('ALTER TABLE ventas ADD COLUMN garantia_dias INTEGER')
     if 'vendedor_id' not in sale_columns:
         c.execute('ALTER TABLE ventas ADD COLUMN vendedor_id INTEGER REFERENCES vendedores(id)')
     c.execute('CREATE INDEX IF NOT EXISTS ix_ventas_vendedor ON ventas(vendedor_id)')
@@ -2113,6 +2115,12 @@ def post_venta():
     except (TypeError,ValueError): return jsonify(error='Vehículo, vendedor y valores de venta son obligatorios'),400
     factura=(d.get('factura') or '').strip(); nombre=(d.get('cliente_nombre') or '').strip()
     if not nombre: return jsonify(error='Nombre del cliente es obligatorio'),400
+    garantia_raw=d.get('garantia_dias')
+    try:
+        garantia_dias=int(garantia_raw) if garantia_raw not in (None,'') else None
+    except (TypeError,ValueError): return jsonify(error='Los días de garantía deben ser un número entero.'),400
+    if garantia_dias is not None and garantia_dias<=0:
+        return jsonify(error='Los días de garantía deben ser mayores que cero.'),400
     if min(descuento,prima,financiado,transferencia)<0: return jsonify(error='Revise los valores de la venta'),400
     pagos=d.get('pagos')
     if not isinstance(pagos,list) or not pagos: return jsonify(error='Registre al menos un pago'),400
@@ -2177,8 +2185,8 @@ def post_venta():
     for pago in pagos_limpios:
         if pago['tipo_pago']=='Financiado': pago['referencia']=factura
     try:
-        cur=c.execute('''INSERT INTO ventas(vehiculo_id,cliente_id,vendedor_id,fecha,precio,descuento,prima,saldo,estado,factura,correlativo,numero_transaccion,tipo_venta,forma_pago,financiera_banco,monto_financiado,transferencia,observaciones)
-            VALUES(?,?,?,?,?,?,?,?,'Facturada',?,?,?,?,?,?,?,?,?)''',(vid,client_id,vendedor_id,d.get('fecha') or datetime.now().strftime('%Y-%m-%d'),precio,descuento,prima,saldo,factura,correlativo,numero,d.get('tipo_venta'),'Registro de pagos',d.get('financiera_banco'),financiado,transferencia,d.get('observaciones')))
+        cur=c.execute('''INSERT INTO ventas(vehiculo_id,cliente_id,vendedor_id,fecha,precio,descuento,prima,saldo,estado,factura,correlativo,numero_transaccion,tipo_venta,forma_pago,financiera_banco,monto_financiado,transferencia,observaciones,garantia_dias)
+            VALUES(?,?,?,?,?,?,?,?,'Facturada',?,?,?,?,?,?,?,?,?,?)''',(vid,client_id,vendedor_id,d.get('fecha') or datetime.now().strftime('%Y-%m-%d'),precio,descuento,prima,saldo,factura,correlativo,numero,d.get('tipo_venta'),'Registro de pagos',d.get('financiera_banco'),financiado,transferencia,d.get('observaciones'),garantia_dias))
         for pago in pagos_limpios:
             financiera=c.execute("SELECT nombre FROM clientes WHERE id=? AND tipo='Financiera' AND activo=1",(pago['financiera_cliente_id'],)).fetchone() if pago['financiera_cliente_id'] else None
             if pago['tipo_pago']=='Financiado' and not financiera:
