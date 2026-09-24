@@ -2110,6 +2110,14 @@ def get_vendedores():
     rows=[dict(row) for row in c.execute(sql+' ORDER BY nombre').fetchall()]
     c.close(); return jsonify(rows)
 
+@app.get('/api/ventas/vendedores-activos')
+def vendedores_activos_para_venta():
+    """Lista mínima usada dentro de la boleta, bajo el permiso de Ventas."""
+    c=db()
+    rows=[dict(row) for row in c.execute('''SELECT id,nombre FROM vendedores
+        WHERE activo=1 ORDER BY nombre''').fetchall()]
+    c.close(); return jsonify(rows)
+
 def vendedor_values(data):
     nombre=(data.get('nombre') or '').strip()
     if not nombre:

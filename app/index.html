@@ -748,6 +748,16 @@ openTradeInRegistration=async function(){
   if(!help){help=document.createElement('div');help.className='sub';help.style.marginTop='5px';field.appendChild(help)}
   help.textContent='Sus datos de factura se registrarán también en la ficha del proveedor.';
 };
+// Esta ruta pertenece al módulo de Ventas: el usuario solo recibe los nombres
+// activos para elegir en la boleta, sin depender del permiso del maestro.
+loadSellerOptions=async function(){
+  const rows=await get('/api/ventas/vendedores-activos');
+  const select=$('saleForm')?.elements.vendedor_id;
+  if(!select)return;
+  const selected=select.value;
+  select.innerHTML='<option value="">Seleccione vendedor</option>'+rows.map(row=>`<option value="${row.id}">${esc(row.nombre)}</option>`).join('');
+  select.value=selected;
+};
 const searchSaleVehicleWithSellerRefresh=searchSaleVehicle;
 searchSaleVehicle=async function(){
   await searchSaleVehicleWithSellerRefresh();
