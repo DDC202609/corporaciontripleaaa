@@ -2118,6 +2118,14 @@ def vendedores_activos_para_venta():
         WHERE activo=1 ORDER BY nombre''').fetchall()]
     c.close(); return jsonify(rows)
 
+@app.get('/api/ventas/financieras-activas')
+def financieras_activas_para_venta():
+    """Financieras disponibles al registrar un pago financiado."""
+    c=db()
+    rows=[dict(row) for row in c.execute('''SELECT id,nombre FROM clientes
+        WHERE tipo='Financiera' AND activo=1 ORDER BY nombre''').fetchall()]
+    c.close(); return jsonify(rows)
+
 def vendedor_values(data):
     nombre=(data.get('nombre') or '').strip()
     if not nombre:

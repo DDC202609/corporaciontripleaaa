@@ -758,6 +758,26 @@ loadSellerOptions=async function(){
   select.innerHTML='<option value="">Seleccione vendedor</option>'+rows.map(row=>`<option value="${row.id}">${esc(row.nombre)}</option>`).join('');
   select.value=selected;
 };
+// El pago financiado solo puede usar clientes registrados como financieras.
+// Se recarga al abrir el modal para no reutilizar una lista de proveedores.
+const baseSalesResetForFinancials=baseLoadSalesPayments;
+loadSales=async function(){
+  baseSalesResetForFinancials();
+  salePaymentDrafts=[];
+  saleFinanceProviders=await get('/api/ventas/financieras-activas');
+  renderSalePayments();
+  await loadSellerOptions();
+};
+openSalePayment=async function(){
+  const form=$('salePaymentForm');
+  form.reset();
+  saleFinanceProviders=await get('/api/ventas/financieras-activas');
+  form.elements.financiera_cliente_id.innerHTML='<option value="">Seleccionar financiera</option>'+saleFinanceProviders.map(row=>`<option value="${row.id}">${esc(row.nombre)}</option>`).join('');
+  $('saleChangeSummary').textContent='';
+  delete $('saleChangeSummary').dataset.cambio;
+  salePaymentTypeChanged();
+  $('salePaymentModal').classList.remove('hidden');
+};
 const searchSaleVehicleWithSellerRefresh=searchSaleVehicle;
 searchSaleVehicle=async function(){
   await searchSaleVehicleWithSellerRefresh();
