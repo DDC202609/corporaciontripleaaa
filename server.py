@@ -2189,9 +2189,15 @@ def get_venta(sid):
 
 @app.get('/api/vehiculos/placa/<placa>')
 def get_vehiculo_placa(placa):
-    c=db(); v=c.execute('SELECT * FROM vehiculos WHERE UPPER(placa)=?',(placa.strip().upper(),)).fetchone(); c.close()
-    if not v: return jsonify(error='Vehículo no encontrado con esa placa'),404
-    return jsonify(dict(v))
+    c=db(); v=c.execute('SELECT * FROM vehiculos WHERE UPPER(placa)=?',(placa.strip().upper(),)).fetchone()
+    if not v:
+        c.close(); return jsonify(error='Vehículo no encontrado con esa placa'),404
+    data=dict(v)
+    # La boleta usa esta misma consulta inicial; incluir la lista evita que el
+    # selector de vendedor dependa de una segunda llamada o de otro módulo.
+    data['vendedores_activos']=[dict(row) for row in c.execute('''SELECT id,nombre
+        FROM vendedores WHERE activo=1 ORDER BY nombre''').fetchall()]
+    c.close(); return jsonify(data)
 
 @app.get('/api/ventas/siguiente-factura')
 def siguiente_factura():
