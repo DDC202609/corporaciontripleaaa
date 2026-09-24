@@ -729,6 +729,21 @@ function endInactiveSession(){fetch('/logout',{method:'POST',keepalive:true}).fi
 function registerSessionActivity(){clearTimeout(inactivityTimer);inactivityTimer=setTimeout(endInactiveSession,inactivityLimitMs);let now=Date.now();if(now-lastActivityPing>=30000){lastActivityPing=now;fetch('/api/sesion/actividad',{method:'POST',keepalive:true}).catch(()=>{})}}
 ['pointerdown','pointermove','keydown','touchstart','scroll'].forEach(eventName=>document.addEventListener(eventName,registerSessionActivity,{passive:true}));
 registerSessionActivity();
+// Buscar una placa reinicia la boleta. Se vuelve a poblar el selector después
+// de ese reinicio para que los vendedores activos nunca desaparezcan del flujo
+// de facturación.
+const searchSaleVehicleWithSellerRefresh=searchSaleVehicle;
+searchSaleVehicle=async function(){
+  await searchSaleVehicleWithSellerRefresh();
+  if(!saleVehicle)return;
+  try{
+    await loadSellerOptions();
+    const sellers=$('saleForm')?.elements.vendedor_id;
+    if(!sellers||sellers.options.length<2)showNotice('No se encontraron vendedores activos para seleccionar.','error');
+  }catch(error){
+    showNotice('No fue posible cargar la lista de vendedores. Intente nuevamente.','error');
+  }
+};
 // Un monto escrito es una instrucción financiera; nunca se debe descartar por
 // el estado visual del selector. Esto protege cuando un navegador conserva el
 // panel de anticipo visible pero deja su casilla sin marcar.
