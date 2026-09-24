@@ -729,5 +729,34 @@ function endInactiveSession(){fetch('/logout',{method:'POST',keepalive:true}).fi
 function registerSessionActivity(){clearTimeout(inactivityTimer);inactivityTimer=setTimeout(endInactiveSession,inactivityLimitMs);let now=Date.now();if(now-lastActivityPing>=30000){lastActivityPing=now;fetch('/api/sesion/actividad',{method:'POST',keepalive:true}).catch(()=>{})}}
 ['pointerdown','pointermove','keydown','touchstart','scroll'].forEach(eventName=>document.addEventListener(eventName,registerSessionActivity,{passive:true}));
 registerSessionActivity();
+// Un monto escrito es una instrucción financiera; nunca se debe descartar por
+// el estado visual del selector. Esto protege cuando un navegador conserva el
+// panel de anticipo visible pero deja su casilla sin marcar.
+saveWorkOrder=async function(event){
+  event.preventDefault();
+  if(!workshopVehicle)return showNotice('Busque primero el VIN del vehículo.','error');
+  const form=event.target,data=Object.fromEntries(new FormData(form).entries());
+  data.vehiculo_id=workshopVehicle.id;
+  data.valor_negociado=Number(data.valor_negociado);
+  const amount=Number(data.anticipo_ot||0);
+  const paymentWasEntered=Boolean(amount||data.anticipo_metodo_pago||data.anticipo_banco||data.anticipo_referencia);
+  data.anticipo_ot=paymentWasEntered?amount:0;
+  if(!data.fecha_entrega_estimada)return showNotice('Ingrese la fecha estimada de entrega.','error');
+  if(data.anticipo_ot<0||data.anticipo_ot>data.valor_negociado)return showNotice('El anticipo debe estar entre cero y el valor negociado.','error');
+  if(paymentWasEntered&&!data.anticipo_ot)return showNotice('Ingrese un monto de anticipo válido o limpie sus datos de pago.','error');
+  if(paymentWasEntered&&!data.anticipo_metodo_pago)return showNotice('Seleccione el método de pago del anticipo.','error');
+  if(data.anticipo_metodo_pago==='Transferencia'&&!data.anticipo_banco)return showNotice('Seleccione el banco desde el cual se realizó el anticipo.','error');
+  let response,result;
+  try{
+    response=await fetch('/api/ordenes-trabajo',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
+    result=await response.json();
+  }catch(error){return showNotice('No fue posible comunicarse con el servidor. La OT no fue confirmada.','error')}
+  if(!response.ok)return showNotice(result.error||'No se pudo generar la OT.','error');
+  if(paymentWasEntered&&!result.anticipo_id){
+    return showNotice(`La OT ${result.numero_ot} fue creada, pero no se confirmó el anticipo. No registre otro pago; contacte a administración.`, 'error');
+  }
+  showNotice(paymentWasEntered?`OT ${result.numero_ot} creada con anticipo de ${money(data.anticipo_ot)} contabilizado.`:`OT ${result.numero_ot} generada correctamente.`);
+  await Promise.all([loadVeh(),dash(),loadWorkshop(),loadFinancialPlanning(),loadAccounting(),loadCash()]);
+};
 dash();
 </script></body></html>

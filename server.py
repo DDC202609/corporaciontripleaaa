@@ -2513,6 +2513,7 @@ def post_orden_trabajo():
     if fecha_entrega<fecha_ot:
         c.close(); return jsonify(error='La fecha estimada de entrega no puede ser anterior a la fecha de la OT.'),400
     order_id,numero=crear_orden_trabajo(c,vid,acquisition['id'] if acquisition else None,fecha_ot,taller,reparacion,valor,detalle,fecha_entrega)
+    advance_id=None
     try:
         anticipo=round(float(d.get('anticipo_ot') or 0),2)
     except (TypeError,ValueError):
@@ -2527,9 +2528,9 @@ def post_orden_trabajo():
         if referencia and not referencia_pago_disponible(c,referencia):
             c.close(); return jsonify(error='El número de referencia ya fue utilizado.'),409
         order=c.execute('SELECT * FROM ordenes_trabajo WHERE id=?',(order_id,)).fetchone()
-        registrar_anticipo_ot(c,order,anticipo,metodo,banco,referencia,fecha_ot)
+        advance_id=registrar_anticipo_ot(c,order,anticipo,metodo,banco,referencia,fecha_ot)
     recalcular_estado(c,vid,'Orden de trabajo creada')
-    c.commit(); c.close(); return jsonify(ok=True,numero_ot=numero,anticipo=anticipo),201
+    c.commit(); c.close(); return jsonify(ok=True,numero_ot=numero,anticipo=anticipo,anticipo_id=advance_id),201
 
 @app.get('/api/ordenes-trabajo/<int:oid>/anticipos')
 def get_anticipos_ot(oid):
