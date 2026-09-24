@@ -694,6 +694,7 @@ def init_db(sync_history=True):
     c.execute('''INSERT OR IGNORE INTO cuentas_contables
         (codigo,cuenta,tipo,grupo,naturaleza,acepta_movimiento,requiere_activo,requiere_centro_costo,activo)
         VALUES('1107','Anticipos a proveedores','Activo','Activo circulante','Deudora',1,0,0,1)''')
+    sincronizar_anticipos_ot_en_kardex(c)
     c.execute("UPDATE vehiculos SET estado='DPV' WHERE estado NOT IN ('En Tránsito','Nacionalizado','En Taller','DPV','Reservado','Vendido')")
     if sync_history:
         sincronizar_contabilidad_historica(c)
@@ -916,6 +917,31 @@ def validar_pago_anticipo_ot(data):
 def total_anticipos_ot(c, orden_trabajo_id):
     return round(float(c.execute('SELECT COALESCE(SUM(monto),0) FROM anticipos_ot WHERE orden_trabajo_id=?',(orden_trabajo_id,)).fetchone()[0] or 0),2)
 
+def registrar_movimiento_kardex_anticipo_ot(c, order, advance_id, monto, metodo_pago, banco, referencia, fecha):
+    """Da trazabilidad al anticipo sin convertirlo en costo del vehículo."""
+    vehicle=c.execute('SELECT estado,ubicacion FROM vehiculos WHERE id=?',(order['vehiculo_id'],)).fetchone()
+    if not vehicle:
+        return
+    movement_reference=f"{order['numero_ot'] or 'OT'} · Anticipo #{advance_id}"
+    if c.execute('SELECT 1 FROM movimientos_vehiculo WHERE vehiculo_id=? AND referencia=?',
+                 (order['vehiculo_id'],movement_reference)).fetchone():
+        return
+    payment_detail=f'Método: {metodo_pago}.'
+    if banco: payment_detail+=f' Banco: {banco}.'
+    if referencia: payment_detail+=f' Referencia bancaria: {referencia}.'
+    add_movimiento(c,order['vehiculo_id'],fecha,'Anticipo de OT (informativo)',
+                   vehicle['estado'],vehicle['estado'],vehicle['ubicacion'],vehicle['ubicacion'],
+                   referencia=movement_reference,
+                   observaciones=f'Anticipo registrado: {float(monto):.2f}. {payment_detail} No se incorpora al costo hasta el cierre de la OT.')
+
+def sincronizar_anticipos_ot_en_kardex(c):
+    """Completa la trazabilidad de anticipos registrados antes de esta mejora."""
+    rows=c.execute('''SELECT ao.*,o.vehiculo_id,o.numero_ot FROM anticipos_ot ao
+        JOIN ordenes_trabajo o ON o.id=ao.orden_trabajo_id ORDER BY ao.id''').fetchall()
+    for row in rows:
+        registrar_movimiento_kardex_anticipo_ot(c,row,row['id'],row['monto'],row['metodo_pago'],
+                                                row['banco'],row['referencia'],row['fecha'])
+
 def registrar_anticipo_ot(c, order, monto, metodo_pago, banco, referencia, fecha=None):
     """Registra el pago adelantado sin convertirlo aún en costo del vehículo."""
     value=round(float(monto or 0),2)
@@ -932,6 +958,7 @@ def registrar_anticipo_ot(c, order, monto, metodo_pago, banco, referencia, fecha
         {'cuenta_id':cuenta_contable_id(c,'anticipos_proveedores'),'debe':value},
         {'cuenta_id':cuenta_contable_id(c,'caja_bancos'),'haber':value},
     ],order['vehiculo_id'])
+    registrar_movimiento_kardex_anticipo_ot(c,order,advance_id,value,metodo_pago,banco,referencia,fecha)
     return advance_id
 
 def contabilizar_cierre_ot(c, order, provider, valor_final, metodo_pago, banco, referencia, fecha):
