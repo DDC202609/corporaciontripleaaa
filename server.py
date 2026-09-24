@@ -695,6 +695,7 @@ def init_db(sync_history=True):
         (codigo,cuenta,tipo,grupo,naturaleza,acepta_movimiento,requiere_activo,requiere_centro_costo,activo)
         VALUES('1107','Anticipos a proveedores','Activo','Activo circulante','Deudora',1,0,0,1)''')
     sincronizar_anticipos_ot_en_kardex(c)
+    reconciliar_auxiliar_cxc(c)
     c.execute("UPDATE vehiculos SET estado='DPV' WHERE estado NOT IN ('En Tránsito','Nacionalizado','En Taller','DPV','Reservado','Vendido')")
     if sync_history:
         sincronizar_contabilidad_historica(c)
@@ -941,6 +942,25 @@ def sincronizar_anticipos_ot_en_kardex(c):
     for row in rows:
         registrar_movimiento_kardex_anticipo_ot(c,row,row['id'],row['monto'],row['metodo_pago'],
                                                 row['banco'],row['referencia'],row['fecha'])
+
+def reconciliar_auxiliar_cxc(c):
+    """Alinea la cartera con los cobros que ya poseen soporte contable.
+
+    Una versión anterior podía registrar el cobro y su asiento, pero dejar el
+    saldo del auxiliar intacto.  Aquí no se crean pólizas ni movimientos: se
+    recalcula cada saldo únicamente a partir de los cobros ya persistidos.
+    """
+    rows=c.execute('''SELECT cc.id,cc.monto_original,cc.saldo,cc.estado,
+        COALESCE(SUM(co.monto),0) cobrado
+        FROM cuentas_por_cobrar cc
+        LEFT JOIN cobros_cuentas_por_cobrar co ON co.cuenta_por_cobrar_id=cc.id
+        GROUP BY cc.id''').fetchall()
+    for row in rows:
+        expected=max(round(float(row['monto_original'] or 0)-float(row['cobrado'] or 0),2),0)
+        estado='Cobrada' if expected<=0.01 else 'Pendiente'
+        if abs(float(row['saldo'] or 0)-expected)>0.01 or row['estado']!=estado:
+            c.execute('UPDATE cuentas_por_cobrar SET saldo=?,estado=? WHERE id=?',
+                      (expected,estado,row['id']))
 
 def registrar_anticipo_ot(c, order, monto, metodo_pago, banco, referencia, fecha=None):
     """Registra el pago adelantado sin convertirlo aún en costo del vehículo."""
