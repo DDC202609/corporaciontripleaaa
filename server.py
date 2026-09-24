@@ -130,7 +130,11 @@ def request_module(path):
     if path.startswith('/api/gastos-ot'): return 'taller'
     if path.startswith('/api/gastos') or path.startswith('/api/conceptos-gasto'): return 'gastos'
     if path.startswith('/api/comisiones'): return 'comisiones'
-    if path.startswith('/api/vendedores'): return 'vendedores'
+    # Consultar el catálogo activo es parte del registro de una venta.  La
+    # administración (crear, editar o desactivar) sigue protegida por el
+    # permiso específico de Vendedores.
+    if path.startswith('/api/vendedores'):
+        return 'ventas' if request.method=='GET' else 'vendedores'
     if path.startswith('/api/ventas'): return 'ventas'
     if path.startswith('/api/proveedores') or path.startswith('/api/financieras'): return 'proveedores'
     if path.startswith('/api/informacion-vehiculo'): return 'informacion_vehiculo'
@@ -422,6 +426,8 @@ def init_db(sync_history=True):
     provider_columns={row['name'] for row in c.execute('PRAGMA table_info(proveedores)')}
     if 'tipo' not in provider_columns:
         c.execute("ALTER TABLE proveedores ADD COLUMN tipo TEXT NOT NULL DEFAULT 'Proveedor'")
+    if 'identidad' not in provider_columns:
+        c.execute('ALTER TABLE proveedores ADD COLUMN identidad TEXT')
     c.execute('''CREATE TABLE IF NOT EXISTS proveedor_especialidades(
         id INTEGER PRIMARY KEY AUTOINCREMENT, proveedor_id INTEGER NOT NULL REFERENCES proveedores(id) ON DELETE CASCADE,
         especialidad TEXT NOT NULL, UNIQUE(proveedor_id,especialidad))''')
@@ -1040,7 +1046,31 @@ def contabilizar_repuesto_ot(c, part_id, order, provider, total, metodo_pago, ba
         registrar_movimiento_caja(c,fecha,'Pago de repuesto OT',medio,banco_caja,0,value,description_text,'pago_repuesto_ot',part_id)
     registrar_asiento(c,fecha,description_text,'repuesto_ot',part_id,lines,order['vehiculo_id'])
 
-def registrar_vehiculo_recibido_cambio(c, cambio, fecha, cliente_nombre, numero_venta):
+def asegurar_proveedor_desde_cliente(c, cliente):
+    """Convierte en proveedor al cliente que entrega una unidad como cambio."""
+    nombre=(cliente.get('nombre') or '').strip()
+    if not nombre:
+        raise ValueError('El cliente que entrega el vehículo en cambio debe tener nombre')
+    existente=c.execute('SELECT id FROM proveedores WHERE nombre=? COLLATE NOCASE',(nombre,)).fetchone()
+    valores=(
+        (cliente.get('identidad') or '').strip() or None,
+        (cliente.get('rtn') or '').strip() or None,
+        (cliente.get('telefono') or '').strip() or None,
+        (cliente.get('email') or '').strip() or None,
+        (cliente.get('direccion') or '').strip() or None,
+    )
+    if existente:
+        # Se completan únicamente campos vacíos: nunca se reemplaza la ficha
+        # de un proveedor existente con datos distintos por accidente.
+        c.execute('''UPDATE proveedores SET identidad=COALESCE(NULLIF(identidad,''),?),
+            rtn=COALESCE(NULLIF(rtn,''),?),telefono=COALESCE(NULLIF(telefono,''),?),email=COALESCE(NULLIF(email,''),?),
+            direccion=COALESCE(NULLIF(direccion,''),?) WHERE id=?''',(*valores,existente['id']))
+        return existente['id']
+    cur=c.execute('''INSERT INTO proveedores(nombre,identidad,rtn,telefono,email,direccion,condicion_pago,activo,tipo)
+        VALUES(?,?,?,?,?,?,'Contado',1,'Proveedor')''',(nombre,*valores))
+    return cur.lastrowid
+
+def registrar_vehiculo_recibido_cambio(c, cambio, fecha, cliente, numero_venta):
     """Registra la unidad recibida como parte de pago, sin movimiento de caja.
 
     La contrapartida contable de esta adquisición es el ingreso de la venta
@@ -1050,12 +1080,10 @@ def registrar_vehiculo_recibido_cambio(c, cambio, fecha, cliente_nombre, numero_
         raise ValueError('Complete la información del vehículo recibido en cambio')
     vin=(cambio.get('vin') or '').strip().upper()
     placa=(cambio.get('placa') or '').strip().upper()
-    proveedor_id=cambio.get('proveedor_id')
     try:
-        proveedor_id=int(proveedor_id)
         costo=round(float(cambio.get('costo_compra')),2)
     except (TypeError, ValueError):
-        raise ValueError('El proveedor y el valor de adquisición del cambio son obligatorios')
+        raise ValueError('El valor de adquisición del cambio es obligatorio')
     if not vin:
         raise ValueError('El VIN del vehículo recibido en cambio es obligatorio')
     if not placa:
@@ -1066,9 +1094,10 @@ def registrar_vehiculo_recibido_cambio(c, cambio, fecha, cliente_nombre, numero_
         raise ValueError('El VIN del vehículo recibido en cambio ya está registrado')
     if not placa_disponible(c,placa):
         raise ValueError('La placa del vehículo recibido en cambio ya está registrada')
+    proveedor_id=asegurar_proveedor_desde_cliente(c,cliente)
     proveedor=c.execute('SELECT * FROM proveedores WHERE id=? AND activo=1',(proveedor_id,)).fetchone()
     if not proveedor:
-        raise ValueError('Seleccione un proveedor activo para el vehículo recibido')
+        raise ValueError('No fue posible preparar al cliente como proveedor del vehículo recibido')
     for key,label in [('tipo_vehiculo','Tipo de vehículo'),('marca','Marca'),('modelo','Modelo')]:
         if not (cambio.get(key) or '').strip():
             raise ValueError(f'{label} es obligatorio para el vehículo recibido en cambio')
@@ -1085,7 +1114,7 @@ def registrar_vehiculo_recibido_cambio(c, cambio, fecha, cliente_nombre, numero_
         (cambio.get('marca') or '').strip(),(cambio.get('modelo') or '').strip(),(cambio.get('version') or '').strip() or None,
         (cambio.get('color') or '').strip() or None,anio,cambio.get('kilometraje') or None,placa,'En Tránsito',
         costo,0,fecha,proveedor['nombre'],
-        f"Vehículo recibido como cambio del cliente {cliente_nombre}. Venta {numero_venta}. {(cambio.get('observaciones') or '').strip()}".strip()))
+        f"Vehículo recibido como cambio del cliente {cliente['nombre']}. Venta {numero_venta}. {(cambio.get('observaciones') or '').strip()}".strip()))
     vehiculo_id=cur.lastrowid
     asegurar_informacion_vehiculo(c,cambio)
     cur=c.execute('''INSERT INTO adquisiciones(vehiculo_id,proveedor_id,fecha,costo_compra,anticipo,metodo_pago,condicion_pago,dias_credito,saldo,observaciones,necesita_reparacion,tipo_compra)
@@ -2228,6 +2257,11 @@ def post_venta():
         c.execute('UPDATE clientes SET nombre=?,identidad=?,rtn=?,telefono=?,direccion=?,email=? WHERE id=?',(nombre,d.get('identidad'),d.get('rtn'),d.get('telefono'),d.get('direccion'),d.get('email'),cliente['id'])); client_id=cliente['id']
     else:
         cur=c.execute('INSERT INTO clientes(nombre,identidad,rtn,telefono,direccion,email) VALUES(?,?,?,?,?,?)',(nombre,d.get('identidad'),d.get('rtn'),d.get('telefono'),d.get('direccion'),d.get('email'))); client_id=cur.lastrowid
+    cliente_cambio={
+        'nombre':nombre,'identidad':identidad,'rtn':rtn,
+        'telefono':(d.get('telefono') or '').strip(),'direccion':(d.get('direccion') or '').strip(),
+        'email':(d.get('email') or '').strip(),
+    }
     correlativo=siguiente_correlativo_plataforma(c,'VENTA'); numero=f'V-{correlativo:05d}'; factura_num=siguiente_correlativo_plataforma(c,'FACTURA'); factura=f'FAC-{factura_num:06d}'
     for pago in pagos_limpios:
         if pago['tipo_pago']=='Financiado': pago['referencia']=factura
@@ -2240,7 +2274,7 @@ def post_venta():
                 raise ValueError('La financiera seleccionada no existe o no está activa')
             vehiculo_recibido_id=None
             if pago['tipo_pago']=='Cambio':
-                vehiculo_recibido_id,_,valor_cambio=registrar_vehiculo_recibido_cambio(c,pago['cambio'],d.get('fecha') or datetime.now().strftime('%Y-%m-%d'),nombre,numero)
+                vehiculo_recibido_id,_,valor_cambio=registrar_vehiculo_recibido_cambio(c,pago['cambio'],d.get('fecha') or datetime.now().strftime('%Y-%m-%d'),cliente_cambio,numero)
                 if abs(valor_cambio-pago['monto'])>0.01:
                     raise ValueError('El valor del cambio no coincide con el pago registrado')
             c.execute('''INSERT INTO pagos_venta(venta_id,tipo_pago,referencia,financiera_cliente_id,financiera_nombre,banco,monto,fecha,fecha_vencimiento,vehiculo_recibido_id)

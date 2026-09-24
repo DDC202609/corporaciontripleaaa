@@ -732,6 +732,22 @@ registerSessionActivity();
 // Buscar una placa reinicia la boleta. Se vuelve a poblar el selector después
 // de ese reinicio para que los vendedores activos nunca desaparezcan del flujo
 // de facturación.
+// En un cambio, quien compra la unidad es precisamente el cliente de la venta.
+// La ficha se crea/actualiza en el servidor al facturar, de modo que cancelar
+// el modal no deje proveedores sin una operación asociada.
+const openTradeInRegistrationWithCustomerProvider=openTradeInRegistration;
+openTradeInRegistration=async function(){
+  const customerName=$('saleForm')?.elements.cliente_nombre?.value.trim();
+  if(!customerName)return showNotice('Ingrese primero el nombre del cliente que entrega el vehículo en cambio.','error');
+  await openTradeInRegistrationWithCustomerProvider();
+  const form=$('tradeInForm'),supplier=form.elements.proveedor_id,field=supplier?.closest('.field');
+  if(!supplier||!field)return;
+  supplier.disabled=true;supplier.required=false;supplier.innerHTML=`<option selected>${esc(customerName)}</option>`;
+  field.querySelector('label').textContent='Proveedor (cliente que entrega el cambio)';
+  let help=field.querySelector('.sub');
+  if(!help){help=document.createElement('div');help.className='sub';help.style.marginTop='5px';field.appendChild(help)}
+  help.textContent='Sus datos de factura se registrarán también en la ficha del proveedor.';
+};
 const searchSaleVehicleWithSellerRefresh=searchSaleVehicle;
 searchSaleVehicle=async function(){
   await searchSaleVehicleWithSellerRefresh();
