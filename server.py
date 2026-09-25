@@ -2228,7 +2228,7 @@ def siguiente_factura():
 def post_venta():
     d=request.get_json(silent=True) or {}
     try:
-        vid=int(d.get('vehiculo_id')); vendedor_id=int(d.get('vendedor_id')); lista=float(d.get('precio_lista')); descuento=float(d.get('descuento') or 0); prima=float(d.get('prima') or 0); financiado=float(d.get('monto_financiado') or 0); transferencia=float(d.get('transferencia') or 0)
+        vid=int(d.get('vehiculo_id')); lista=float(d.get('precio_lista')); descuento=float(d.get('descuento') or 0); prima=float(d.get('prima') or 0); financiado=float(d.get('monto_financiado') or 0); transferencia=float(d.get('transferencia') or 0)
     except (TypeError,ValueError): return jsonify(error='Vehículo, vendedor y valores de venta son obligatorios'),400
     factura=(d.get('factura') or '').strip(); nombre=(d.get('cliente_nombre') or '').strip()
     if not nombre: return jsonify(error='Nombre del cliente es obligatorio'),400
@@ -2281,8 +2281,16 @@ def post_venta():
     prima=sum(x['monto'] for x in pagos_limpios if x['tipo_pago']=='Efectivo'); financiado=sum(x['monto'] for x in pagos_limpios if x['tipo_pago']=='Financiado'); transferencia=sum(x['monto'] for x in pagos_limpios if x['tipo_pago']=='Transferencia'); saldo=0
     c=db(); vehicle=c.execute('SELECT * FROM vehiculos WHERE id=?',(vid,)).fetchone()
     if not vehicle: c.close(); return jsonify(error='Vehículo no encontrado'),404
-    if not c.execute('SELECT id FROM vendedores WHERE id=? AND activo=1',(vendedor_id,)).fetchone():
-        c.close(); return jsonify(error='Seleccione un vendedor activo.'),400
+    vendedor_nombre=' '.join((d.get('vendedor_nombre') or '').split())
+    if vendedor_nombre:
+        vendedor=c.execute('''SELECT id FROM vendedores
+            WHERE activo=1 AND lower(trim(nombre))=lower(?)''',(vendedor_nombre,)).fetchone()
+    else:
+        try: vendedor=c.execute('SELECT id FROM vendedores WHERE id=? AND activo=1',(int(d.get('vendedor_id')),)).fetchone()
+        except (TypeError,ValueError): vendedor=None
+    if not vendedor:
+        c.close(); return jsonify(error='El nombre ingresado no corresponde a un vendedor activo.'),400
+    vendedor_id=vendedor['id']
     if vehicle['estado']!='DPV': c.close(); return jsonify(error='Solo puede facturar vehículos en DPV'),400
     precio_kardex=float(vehicle['precio_venta'] or 0)
     if precio_kardex > 0 and abs(lista-precio_kardex)>0.01:
