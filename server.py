@@ -2338,6 +2338,55 @@ def post_venta():
     contabilizar_venta(c,cur.lastrowid)
     c.commit(); c.close(); return jsonify(id=cur.lastrowid,numero_transaccion=numero),201
 
+@app.delete('/api/ventas/<int:sid>')
+def delete_venta_prueba(sid):
+    """Elimina una venta de prueba y todas sus huellas financieras directas.
+
+    Esta acción está restringida a administradores y exige escribir el número
+    de transacción, para impedir una eliminación accidental desde el detalle.
+    No se permite si la CxC ya recibió cobros ni si la venta incorporó un
+    vehículo en cambio: esos casos requieren una anulación contable formal.
+    """
+    user=user_access(session.get('user_id')) if session.get('user_id') else None
+    if not user or not user.get('es_administrador'):
+        return jsonify(error='Solo un administrador puede eliminar una venta de prueba.'),403
+    data=request.get_json(silent=True) or {}
+    c=db(); sale=c.execute('SELECT * FROM ventas WHERE id=?',(sid,)).fetchone()
+    if not sale:
+        c.close(); return jsonify(error='Venta no encontrada.'),404
+    number=sale['numero_transaccion'] or ''
+    if (data.get('confirmacion') or '').strip().upper()!=number.upper():
+        c.close(); return jsonify(error=f'Escriba {number} para confirmar la eliminación.'),400
+    payments=c.execute('SELECT id,tipo_pago,vehiculo_recibido_id FROM pagos_venta WHERE venta_id=?',(sid,)).fetchall()
+    if any(payment['tipo_pago']=='Cambio' or payment['vehiculo_recibido_id'] for payment in payments):
+        c.close(); return jsonify(error='Esta venta contiene un vehículo recibido en cambio y debe anularse con un proceso contable formal.'),409
+    cxc_rows=c.execute('SELECT id FROM cuentas_por_cobrar WHERE venta_id=?',(sid,)).fetchall()
+    if cxc_rows:
+        markers=','.join('?' for _ in cxc_rows)
+        if c.execute(f'SELECT 1 FROM cobros_cuentas_por_cobrar WHERE cuenta_por_cobrar_id IN ({markers}) LIMIT 1',[row['id'] for row in cxc_rows]).fetchone():
+            c.close(); return jsonify(error='La venta ya tiene cobros aplicados; debe anularse con un proceso contable formal.'),409
+    payment_ids=[row['id'] for row in payments]
+    previous=c.execute('''SELECT estado_anterior FROM movimientos_vehiculo
+        WHERE vehiculo_id=? AND tipo='Venta facturada' AND referencia=? ORDER BY id DESC LIMIT 1''',
+        (sale['vehiculo_id'],sale['factura'])).fetchone()
+    status=previous['estado_anterior'] if previous and previous['estado_anterior'] in ESTADOS_VEHICULO else 'DPV'
+    try:
+        if payment_ids:
+            markers=','.join('?' for _ in payment_ids)
+            c.execute(f"DELETE FROM movimientos_caja WHERE referencia_tipo='pago_venta' AND referencia_id IN ({markers})",payment_ids)
+        seats=c.execute("SELECT id FROM asientos_contables WHERE referencia_tipo IN ('venta_ingreso','venta_costo') AND referencia_id=?",(sid,)).fetchall()
+        if seats:
+            markers=','.join('?' for _ in seats); seat_ids=[row['id'] for row in seats]
+            c.execute(f'DELETE FROM partidas WHERE asiento_id IN ({markers})',seat_ids)
+            c.execute(f'DELETE FROM asientos_contables WHERE id IN ({markers})',seat_ids)
+        c.execute("DELETE FROM movimientos_vehiculo WHERE vehiculo_id=? AND tipo='Venta facturada' AND referencia=?",(sale['vehiculo_id'],sale['factura']))
+        c.execute('DELETE FROM ventas WHERE id=?',(sid,))
+        c.execute('UPDATE vehiculos SET estado=? WHERE id=?',(status,sale['vehiculo_id']))
+        c.commit()
+    except sqlite3.Error:
+        c.rollback(); c.close(); raise
+    c.close(); return jsonify(ok=True,numero_transaccion=number,vehiculo_id=sale['vehiculo_id'],estado_restablecido=status)
+
 @app.get('/api/proveedores')
 def get_proveedores():
     tipo=(request.args.get('tipo') or '').strip()

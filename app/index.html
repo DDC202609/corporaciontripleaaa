@@ -721,6 +721,24 @@ async function openSalePrintChoice(id){try{saleToPrint=await get('/api/ventas/'+
 function printSaleDocuments(withWarranty){if(!saleToPrint)return;let popup=window.open('','_blank');if(!popup)return showNotice('El navegador bloqueó la ventana de impresión. Permita ventanas emergentes e intente de nuevo.','error');try{popup.opener=null}catch(error){}popup.document.open();popup.document.write(saleDocumentHtml(saleToPrint,withWarranty&&Number(saleToPrint.garantia_dias||0)>0));popup.document.close();$('salePrintChoiceModal').classList.add('hidden')}
 const openSaleLedgerDetailWithDocuments=openSaleLedgerDetail;
 openSaleLedgerDetail=async function(id){await openSaleLedgerDetailWithDocuments(id);let content=$('saleDetailContent');if(content&&!$('saleDetailPrintButton'))content.insertAdjacentHTML('afterbegin',`<div class="actions" style="margin-top:0;margin-bottom:14px"><button id="saleDetailPrintButton" class="primary" type="button" onclick="openSalePrintChoice(${Number(id)})">Imprimir documentos</button></div>`)};
+async function deleteTestSale(id,number){
+  const confirmation=window.prompt(`Esta acción eliminará ${number}, sus pagos, movimientos de caja, CxC y asientos contables.\n\nEscriba ${number} para confirmar:`);
+  if(confirmation===null)return;
+  let response,result;
+  try{response=await fetch('/api/ventas/'+id,{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirmacion:confirmation})});result=await response.json()}catch(error){return showNotice('No fue posible comunicarse con el servidor.','error')}
+  if(!response.ok)return showNotice(result.error||'No se pudo eliminar la venta de prueba.','error');
+  $('saleDetailModal').classList.add('hidden');showNotice(`Venta ${result.numero_transaccion} eliminada y vehículo restablecido a ${result.estado_restablecido}.`);
+  await Promise.all([loadVeh(),dash(),loadSalesHistory(),loadAccounting(),loadCash()]);
+}
+const openSaleLedgerDetailWithTestDeletion=openSaleLedgerDetail;
+openSaleLedgerDetail=async function(id){
+  await openSaleLedgerDetailWithTestDeletion(id);
+  const content=$('saleDetailContent');
+  if(!content||$('saleDetailDeleteButton'))return;
+  const sale=await get('/api/ventas/'+id);
+  if(sale.error)return;
+  content.insertAdjacentHTML('beforeend',`<div class="actions" style="margin-top:20px"><button id="saleDetailDeleteButton" class="btn2" type="button" style="color:#b42318;border-color:#fecdca" onclick="deleteTestSale(${Number(id)},'${esc(sale.numero_transaccion||'')}')">Eliminar venta de prueba</button></div>`);
+};
 const saveSaleWithDocuments=saveSale;
 saveSale=async function(event){event.preventDefault();let form=$('saleForm'),seller=(form?.elements.vendedor_nombre?.value||'').trim();if(!seller)return showNotice('Escriba el nombre del vendedor antes de facturar.','error');if(!saleVehicle)return;let data=Object.fromEntries(new FormData(form).entries());data.vehiculo_id=saleVehicle.id;data.pagos=salePaymentDrafts;for(let field of ['precio_lista','descuento'])data[field]=Number(data[field]||0);data.garantia_dias=data.garantia_dias===''?null:Number(data.garantia_dias);data.prima=0;data.monto_financiado=0;data.transferencia=0;let final=data.precio_lista-data.descuento,total=salePaymentDrafts.reduce((sum,payment)=>sum+Number(payment.monto||0),0);if(Math.abs(total-final)>0.01)return showNotice('Los pagos deben cuadrar exactamente con el precio final.','error');let response=await fetch('/api/ventas',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)}),result=await response.json();if(!response.ok)return showNotice(result.error||'No se pudo facturar.','error');showNotice('Venta facturada. Transacción '+result.numero_transaccion+'.');await Promise.all([loadVeh(),dash(),loadSalesHistory()]);openSalePrintChoice(result.id);openDetail(saleVehicle.id)};
 /* Inactividad: la interfaz y el servidor cierran la sesión a los 2 minutos. */
