@@ -807,11 +807,15 @@ searchSaleVehicle=async function(){
   if(!select)return;
   let rows=Array.isArray(saleVehicle.vendedores_activos)?saleVehicle.vendedores_activos:[];
   if(!rows.length){
-    try{rows=await get('/api/ventas/vendedores-activos')}catch(error){return}
+    try{
+      const fetched=await get('/api/vehiculos/vendedores-activos');
+      if(Array.isArray(fetched))rows=fetched;
+    }catch(error){}
   }
   const selected=select.value;
   select.innerHTML='<option value="">Seleccione vendedor</option>'+rows.map(row=>`<option value="${row.id}">${esc(row.nombre)}</option>`).join('');
   select.value=selected;
+  if(!rows.length)showNotice('No hay vendedores activos configurados. Verifique el maestro de vendedores.','error');
 };
 // Un monto escrito es una instrucción financiera; nunca se debe descartar por
 // el estado visual del selector. Esto protege cuando un navegador conserva el

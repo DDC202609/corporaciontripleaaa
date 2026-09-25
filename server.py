@@ -2205,6 +2205,19 @@ def get_vehiculo_placa(placa):
         FROM vendedores WHERE activo=1 ORDER BY nombre''').fetchall()]
     c.close(); return jsonify(data)
 
+@app.get('/api/vehiculos/vendedores-activos')
+def vendedores_activos_para_boleta():
+    """Vendedores elegibles dentro de la boleta.
+
+    La pantalla primero valida la placa desde Vehículos; exponer esta lista
+    bajo el mismo módulo evita que un perfil operativo pueda cargar la unidad
+    pero quede bloqueado al seleccionar al vendedor.
+    """
+    c=db()
+    rows=[dict(row) for row in c.execute('''SELECT id,nombre FROM vendedores
+        WHERE COALESCE(activo,1)<>0 ORDER BY nombre''').fetchall()]
+    c.close(); return jsonify(rows)
+
 @app.get('/api/ventas/siguiente-factura')
 def siguiente_factura():
     c=db(); factura=c.execute("SELECT ultimo_numero FROM correlativos_plataforma WHERE tipo='FACTURA'").fetchone(); venta=c.execute("SELECT ultimo_numero FROM correlativos_plataforma WHERE tipo='VENTA'").fetchone(); c.close()
