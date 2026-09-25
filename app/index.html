@@ -796,6 +796,28 @@ searchSaleVehicle=async function(){
   select.value=selected;
   if(rows.length===0)showNotice('No hay vendedores activos configurados.','error');
 };
+// Flujo único de la boleta: Buscar placa obtiene el vehículo y rellena el
+// vendedor antes de mostrar el formulario. No usa cadenas de funciones ni
+// solicitudes posteriores.
+searchSaleVehicle=async function(){
+  const plate=($('salePlate').value||'').trim().toUpperCase();
+  if(!plate)return showNotice('Ingrese la placa del vehículo.','error');
+  let response,vehicle;
+  try{response=await fetch('/api/vehiculos/placa/'+encodeURIComponent(plate));vehicle=await response.json()}
+  catch(error){return showNotice('No fue posible cargar el vehículo.','error')}
+  if(!response.ok){saleVehicle=null;$('saleForm').classList.add('hidden');$('saleVehicleNotice').textContent=vehicle.error||'No se encontró el vehículo.';return}
+  if(vehicle.estado!=='DPV'){saleVehicle=null;$('saleForm').classList.add('hidden');$('saleVehicleNotice').textContent='El vehículo debe estar en DPV para facturarse. Etapa actual: '+vehicle.estado;return}
+  saleVehicle=vehicle;
+  const form=$('saleForm'),seller=form.elements.vendedor_id,rows=Array.isArray(vehicle.vendedores_activos)?vehicle.vendedores_activos:[];
+  form.reset();salePaymentDrafts=[];renderSalePayments();
+  form.elements.fecha.value=new Date().toISOString().slice(0,10);
+  form.elements.precio_lista.value=vehicle.precio_venta||0;
+  seller.innerHTML='<option value="">Seleccione vendedor</option>'+rows.map(row=>`<option value="${row.id}">${esc(row.nombre)}</option>`).join('');
+  $('saleVin').value=vehicle.vin||'';$('saleVehiclePlate').value=vehicle.placa||'';$('saleBrand').value=vehicle.marca||'';$('saleModel').value=vehicle.modelo||'';$('saleVersion').value=vehicle.version||'';$('saleColor').value=vehicle.color||'';$('saleYear').value=vehicle.anio||'';$('salePurchaseDate').value=vehicle.fecha_adquisicion||'';$('salePurchaseType').value=vehicle.tipo_compra||'';$('saleSupplier').value=vehicle.proveedor||'';
+  $('saleVehicleNotice').textContent='Vehículo cargado. Complete los campos editables de la boleta.';
+  form.classList.remove('hidden');calculateSale();
+  if(!rows.length)showNotice('No hay vendedores activos configurados.','error');
+};
 // Un monto escrito es una instrucción financiera; nunca se debe descartar por
 // el estado visual del selector. Esto protege cuando un navegador conserva el
 // panel de anticipo visible pero deja su casilla sin marcar.

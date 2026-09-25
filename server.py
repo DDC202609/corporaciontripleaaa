@@ -1504,7 +1504,13 @@ def restablecer_contrasena_usuario(target_id):
     c.commit(); c.close(); return jsonify(ok=True)
 
 @app.get('/')
-def home(): return send_from_directory(APP,'index.html')
+def home():
+    # La interfaz es un único archivo con lógica operativa. No se debe servir
+    # una copia vieja después de un despliegue, especialmente entre perfiles.
+    response=send_from_directory(APP,'index.html')
+    response.cache_control.no_store=True
+    response.cache_control.max_age=0
+    return response
 
 @app.get('/api/dashboard')
 def dashboard():
