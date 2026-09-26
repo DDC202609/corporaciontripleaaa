@@ -864,5 +864,55 @@ saveWorkOrder=async function(event){
   showNotice(paymentWasEntered?`OT ${result.numero_ot} creada con anticipo de ${money(data.anticipo_ot)} contabilizado.`:`OT ${result.numero_ot} generada correctamente.`);
   await Promise.all([loadVeh(),dash(),loadWorkshop(),loadFinancialPlanning(),loadAccounting(),loadCash()]);
 };
+/* Inventario en consignación: es operativo y visual; no integra el total contable. */
+document.head.insertAdjacentHTML('beforeend','<style>.dashboard-statuses{grid-template-columns:repeat(5,minmax(0,1fr))!important}.executive-card.card-consignment{--accent:#0f766e;background:#f0fdfa!important}.sale-consignment{border:1px solid #99f6e4;background:#f0fdfa;border-radius:10px;padding:13px 15px;margin-top:14px}.sale-consignment b{color:#115e59}@media(max-width:1180px){.dashboard-statuses{grid-template-columns:repeat(2,minmax(220px,1fr))!important}}</style>');
+if($('purchaseType')&&!Array.from($('purchaseType').options).some(option=>option.value==='Consignación'))$('purchaseType').insertAdjacentHTML('beforeend','<option>Consignación</option>');
+if(!inventoryStates.includes('Consignación'))inventoryStates.push('Consignación');
+const loadInventoryWithConsignment=loadInventoryScreen;
+loadInventoryScreen=async function(){
+  await loadInventoryWithConsignment();
+  inventoryRows=inventoryRows.map(row=>row.es_consignacion?{...row,estado:'Consignación',costo_total:Number(row.valor_consignado||0),precio_consulta:Number(row.precio_venta||0)}:row);
+  let filters=$('inventoryStatusFilters');
+  if(filters&&!filters.querySelector('[data-consignment]'))filters.insertAdjacentHTML('beforeend',`<button class="btn2 ${inventoryStatus==='Consignación'?'active':''}" data-consignment onclick="setInventoryStatus('Consignación')">Consignación</button>`);
+  renderInventoryQuery();
+};
+const dashWithConsignment=dash;
+dash=async function(){
+  await dashWithConsignment();
+  try{
+    const [data,inventory]=await Promise.all([get('/api/dashboard'),get('/api/inventario')]);
+    const accountingInventory=inventory.filter(row=>row.estado!=='Vendido'&&!row.es_consignacion);
+    const dpvRows=accountingInventory.filter(row=>row.estado==='DPV');
+    const totalCost=accountingInventory.reduce((sum,row)=>sum+Number(row.costo_total||0),0);
+    const projected=dpvRows.reduce((sum,row)=>sum+Number(row.precio_venta||0),0)+Number(data.transito?.costo||0)+Number(data.taller?.costo||0);
+    const cards=[
+      ['DPV',data.dpv,'dpv'],['En Tránsito',data.transito,'transit'],['En Taller',data.taller,'workshop'],
+      ['Consignación',data.consignacion,'consignment'],['Total inventario',{cantidad:accountingInventory.length,costo:totalCost,total_proyectado:projected},'total']
+    ];
+    $('dashboardStatuses').innerHTML=cards.map(([label,value,key])=>`<div class="card dashboard-status executive-card card-${key}"><div class="card-top"><div class="card-label">${label}</div><div class="card-count">${Number(value?.cantidad||0)}</div></div><div class="card-divider"></div><div class="dashboard-cost"><div>${key==='consignment'?'Valor consignado':'Costo acumulado'}<b>${money(value?.costo||0)}</b></div>${key==='total'?`<div>Total proyectado<b>${money(value?.total_proyectado||0)}</b></div>`:''}</div></div>`).join('');
+  }catch(error){console.error('No fue posible actualizar la consignación del dashboard',error)}
+};
+const searchSaleVehicleWithConsignment=searchSaleVehicle;
+searchSaleVehicle=async function(){
+  await searchSaleVehicleWithConsignment();
+  if(!saleVehicle)return;
+  const form=$('saleForm'),isConsignment=saleVehicle.tipo_compra==='Consignación';
+  let box=$('saleConsignmentControl');
+  if(!box){
+    form.querySelector('.form-section:nth-of-type(3)')?.insertAdjacentHTML('afterend','<div id="saleConsignmentControl" class="sale-consignment hidden"><b>Vehículo en consignación</b><div class="sub">Antes de facturar debe ingresarse al inventario y crear la CxP al proveedor por su costo consignado.</div><div class="formgrid" style="margin-top:10px"><div class="field"><label>Fee administrativo (%)</label><input name="fee_administrativo_pct" type="number" min="0" max="100" step="0.01" value="0" oninput="updateConsignmentFee()"></div><div class="field"><label>Fee administrativo</label><input id="saleConsignmentFee" readonly></div></div><button type="button" class="primary" onclick="confirmConsignmentPurchase()">Registrar compra e ingresar al inventario</button><div id="saleConsignmentReady" class="sub" style="margin-top:8px"></div></div>');
+    box=$('saleConsignmentControl');
+  }
+  box.classList.toggle('hidden',!isConsignment);
+  if(isConsignment){box.dataset.ready='';$('saleConsignmentReady').textContent='';updateConsignmentFee()}
+};
+function updateConsignmentFee(){let form=$('saleForm'),pct=Number(form?.elements.fee_administrativo_pct?.value||0),final=Math.max(Number(form?.elements.precio_lista?.value||0)-Number(form?.elements.descuento?.value||0),0);let target=$('saleConsignmentFee');if(target)target.value=money(final*pct/100)}
+function confirmConsignmentPurchase(){let box=$('saleConsignmentControl');box.dataset.ready='1';$('saleConsignmentReady').textContent='Compra preparada: al guardar la venta se ingresa a DPV, se crea la CxP y se registra la venta.'}
+const saveSaleWithConsignment=saveSale;
+saveSale=async function(event){
+  if(saleVehicle?.tipo_compra==='Consignación'&&$('saleConsignmentControl')?.dataset.ready!=='1'){event.preventDefault();return showNotice('Debe presionar “Registrar compra e ingresar al inventario” antes de facturar el vehículo en consignación.','error');}
+  return saveSaleWithConsignment(event);
+};
+const calculateSaleWithConsignment=calculateSale;
+calculateSale=function(){calculateSaleWithConsignment();if(saleVehicle?.tipo_compra==='Consignación')updateConsignmentFee()};
 dash();
 </script></body></html>

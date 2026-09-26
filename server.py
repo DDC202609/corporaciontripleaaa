@@ -476,11 +476,14 @@ def init_db(sync_history=True):
         c.execute('ALTER TABLE adquisiciones ADD COLUMN banco TEXT')
     if 'fecha_llegada_estimada' not in acquisition_columns:
         c.execute('ALTER TABLE adquisiciones ADD COLUMN fecha_llegada_estimada TEXT')
+    if 'contabilizada' not in acquisition_columns:
+        c.execute('ALTER TABLE adquisiciones ADD COLUMN contabilizada INTEGER NOT NULL DEFAULT 1')
     # La fecha es una proyección operativa: para importaciones siempre son
     # cuarenta días desde la adquisición. También se completa el histórico
     # para que la planificación no deje unidades antiguas fuera.
     c.execute("""UPDATE adquisiciones SET fecha_llegada_estimada=date(fecha,'+40 days')
         WHERE tipo_compra='Importación' AND (fecha_llegada_estimada IS NULL OR fecha_llegada_estimada='')""")
+    c.execute("UPDATE adquisiciones SET contabilizada=0 WHERE tipo_compra='Consignación' AND contabilizada IS NULL")
     costing_columns={row['name'] for row in c.execute('PRAGMA table_info(costos_adquisicion)')}
     if 'ajuste_compra' not in costing_columns:
         c.execute('ALTER TABLE costos_adquisicion ADD COLUMN ajuste_compra REAL NOT NULL DEFAULT 0')
@@ -581,6 +584,13 @@ def init_db(sync_history=True):
         c.execute('ALTER TABLE pagos_venta ADD COLUMN fecha_vencimiento TEXT')
     if 'vehiculo_recibido_id' not in payment_columns:
         c.execute('ALTER TABLE pagos_venta ADD COLUMN vehiculo_recibido_id INTEGER REFERENCES vehiculos(id)')
+    sale_columns={row['name'] for row in c.execute('PRAGMA table_info(ventas)')}
+    if 'fee_administrativo_pct' not in sale_columns:
+        c.execute('ALTER TABLE ventas ADD COLUMN fee_administrativo_pct REAL NOT NULL DEFAULT 0')
+    if 'fee_administrativo_monto' not in sale_columns:
+        c.execute('ALTER TABLE ventas ADD COLUMN fee_administrativo_monto REAL NOT NULL DEFAULT 0')
+    c.execute("""INSERT OR IGNORE INTO cuentas_contables(codigo,cuenta,tipo,grupo,naturaleza,acepta_movimiento,activo)
+        VALUES('4190','Otros ingresos','Ingreso','Otros ingresos','Acreedora',1,1)""")
     c.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_pagos_venta_referencia ON pagos_venta(referencia) WHERE referencia IS NOT NULL AND referencia<>''")
     # Contabilidad: los encabezados agrupan las líneas del Libro Diario. Las
     # migraciones son aditivas para preservar las partidas ya existentes.
@@ -830,7 +840,7 @@ def desglose_costo_consolidado(c, vehiculo_id):
 CUENTAS_AUTOMATICAS={
     'caja_bancos':'1101','cxc':'1102','inventario_dpv':'1103',
     'inventario_taller':'1104','inventario_transito':'1105',
-    'cxp':'2101','anticipos_proveedores':'1107','ingresos_venta':'4101','costo_ventas':'5101'
+    'cxp':'2101','anticipos_proveedores':'1107','ingresos_venta':'4101','otros_ingresos':'4190','costo_ventas':'5101'
 }
 
 def cuenta_contable_id(c, clave):
@@ -887,6 +897,21 @@ def cuenta_inventario_adquisicion(purchase):
     if int(purchase['necesita_reparacion'] or 0):
         return 'inventario_taller'
     return 'inventario_dpv'
+
+def convertir_consignacion_en_compra(c, vehiculo_id, fecha):
+    """Hace visible contablemente una consignación únicamente al venderla."""
+    purchase=c.execute('SELECT * FROM adquisiciones WHERE vehiculo_id=?',(vehiculo_id,)).fetchone()
+    if not purchase or purchase['tipo_compra']!='Consignación' or int(purchase['contabilizada'] or 0):
+        return purchase
+    # El valor pactado al recibirla es el importe que se debe al consignante.
+    # No hubo pago ni inventario antes de este momento.
+    c.execute('''UPDATE adquisiciones SET contabilizada=1,metodo_pago='Crédito',condicion_pago='Crédito',
+        anticipo=0,saldo=costo_compra WHERE id=?''',(purchase['id'],))
+    c.execute("UPDATE vehiculos SET estado='DPV' WHERE id=?",(vehiculo_id,))
+    contabilizar_adquisicion(c,purchase['id'])
+    add_movimiento(c,vehiculo_id,fecha,'Ingreso de consignación a inventario','DPV','DPV',
+        referencia=f"Adquisición #{purchase['id']}",observaciones='Compra contabilizada al concretar la venta de consignación.')
+    return c.execute('SELECT * FROM adquisiciones WHERE id=?',(purchase['id'],)).fetchone()
 
 def cuenta_inventario_por_estado(estado):
     return {
@@ -1129,6 +1154,8 @@ def contabilizar_adquisicion(c, adquisicion_id):
         JOIN proveedores p ON p.id=a.proveedor_id JOIN vehiculos v ON v.id=a.vehiculo_id WHERE a.id=?''',(adquisicion_id,)).fetchone()
     if not purchase:
         return
+    if purchase['tipo_compra']=='Consignación' and not int(purchase['contabilizada'] or 0):
+        return
     total=float(purchase['costo_compra'] or 0); anticipo=float(purchase['anticipo'] or 0); saldo=round(total-anticipo,2)
     inventory_key=cuenta_inventario_adquisicion(purchase)
     lineas=[{'cuenta_id':cuenta_contable_id(c,inventory_key),'debe':total}]
@@ -1179,6 +1206,20 @@ def contabilizar_venta(c, venta_id):
         inventory_key=cuenta_inventario_por_estado(sale['vehiculo_estado'])
         lines_cost=[{'cuenta_id':cuenta_contable_id(c,'costo_ventas'),'debe':cost},{'cuenta_id':cuenta_contable_id(c,inventory_key),'haber':cost}]
         registrar_asiento(c,sale['fecha'],f"Costo de venta · {sale['numero_transaccion'] or sale['factura']}",'venta_costo',sale['id'],lines_cost,sale['vehiculo_id'])
+    fee=round(float(sale['fee_administrativo_monto'] or 0),2)
+    if fee:
+        consignacion=c.execute('''SELECT a.proveedor_id,p.nombre proveedor_nombre FROM adquisiciones a
+            JOIN proveedores p ON p.id=a.proveedor_id WHERE a.vehiculo_id=? AND a.tipo_compra='Consignación' ''',(sale['vehiculo_id'],)).fetchone()
+        if not consignacion:
+            raise ValueError('No se encontró el proveedor consignante para registrar el fee administrativo')
+        label=f"Fee administrativo · {consignacion['proveedor_nombre']}"
+        c.execute('''INSERT INTO cuentas_por_cobrar(venta_id,financiera_id,financiera_nombre,fecha,monto_original,saldo,estado)
+            VALUES(?,?,?,?,?,?,?)''',(sale['id'],consignacion['proveedor_id'],label,sale['fecha'],fee,fee,'Pendiente'))
+        registrar_asiento(c,sale['fecha'],f"Fee administrativo de consignación · {sale['numero_transaccion'] or sale['factura']}",
+            'consignacion_fee',sale['id'],[
+                {'cuenta_id':cuenta_contable_id(c,'cxc'),'debe':fee},
+                {'cuenta_id':cuenta_contable_id(c,'otros_ingresos'),'haber':fee},
+            ],sale['vehiculo_id'])
 
 def sincronizar_contabilidad_historica(c):
     """Genera una vez los asientos y saldos para documentos existentes."""
@@ -1203,7 +1244,7 @@ def recalcular_estado(c, vehiculo_id, motivo='Actualización automática de etap
     vehicle=c.execute('SELECT estado,ubicacion FROM vehiculos WHERE id=?',(vehiculo_id,)).fetchone()
     if not vehicle: return None
     sale=c.execute('SELECT * FROM ventas WHERE vehiculo_id=? ORDER BY id DESC LIMIT 1',(vehiculo_id,)).fetchone()
-    purchase=c.execute('SELECT tipo_compra FROM adquisiciones WHERE vehiculo_id=?',(vehiculo_id,)).fetchone()
+    purchase=c.execute('SELECT tipo_compra,contabilizada FROM adquisiciones WHERE vehiculo_id=?',(vehiculo_id,)).fetchone()
     pending=c.execute("SELECT COUNT(*) FROM ordenes_trabajo WHERE vehiculo_id=? AND estado='Pendiente'",(vehiculo_id,)).fetchone()[0]
     costing=c.execute('SELECT estatus FROM costos_adquisicion WHERE vehiculo_id=?',(vehiculo_id,)).fetchone()
     if sale and ((sale['factura'] or '').strip() or sale['estado'] in ('Facturada','Vendido')):
@@ -1223,6 +1264,10 @@ def recalcular_estado(c, vehiculo_id, motivo='Actualización automática de etap
     if next_status != vehicle['estado']:
         c.execute('UPDATE vehiculos SET estado=? WHERE id=?',(next_status,vehiculo_id))
         move_id=add_movimiento(c,vehiculo_id,datetime.now().strftime('%Y-%m-%d'),'Cambio automático de etapa',vehicle['estado'],next_status,vehicle['ubicacion'],vehicle['ubicacion'],observaciones=motivo)
+        # La consignación solo se visualiza: aun si cambia de etapa, no debe
+        # reclasificar cuentas de inventario hasta que se convierta en compra.
+        if purchase and purchase['tipo_compra']=='Consignación' and not int(purchase['contabilizada'] or 0):
+            return next_status
         old_inventory=cuenta_inventario_por_estado(vehicle['estado'])
         new_inventory=cuenta_inventario_por_estado(next_status)
         # El traslado entre etapas no modifica el costo: solo reclasifica el
@@ -1518,7 +1563,7 @@ def dashboard():
     vehicles=[dict(row) for row in c.execute('SELECT * FROM vehiculos').fetchall()]
 
     def status_summary(status):
-        rows=[vehicle for vehicle in vehicles if vehicle.get('estado')==status]
+        rows=[vehicle for vehicle in vehicles if vehicle.get('estado')==status and vehicle.get('tipo_compra')!='Consignación']
         summary={'cantidad':len(rows),'costo':round(sum(costo_consolidado(c,row['id']) for row in rows),2)}
         if status=='DPV':
             summary['venta_proyectada']=round(sum(float(row.get('precio_venta') or 0) for row in rows),2)
@@ -1530,11 +1575,13 @@ def dashboard():
     statuses={
         'dpv':status_summary('DPV'),
         'transito':status_summary('En Tránsito'),
-        'taller':status_summary('En Taller')
+        'taller':status_summary('En Taller'),
+        'consignacion':{'cantidad':sum(1 for vehicle in vehicles if vehicle.get('tipo_compra')=='Consignación' and vehicle.get('estado')!='Vendido'),
+                        'costo':round(sum(float(vehicle.get('precio_compra') or 0) for vehicle in vehicles if vehicle.get('tipo_compra')=='Consignación' and vehicle.get('estado')!='Vendido'),2)}
     }
     inventory_by_type={}
     for vehicle in vehicles:
-        if vehicle.get('estado')=='Vendido':
+        if vehicle.get('estado')=='Vendido' or vehicle.get('tipo_compra')=='Consignación':
             continue
         key=(vehicle.get('tipo_vehiculo') or 'Sin tipo').strip() or 'Sin tipo'
         entry=inventory_by_type.setdefault(key,{'tipo_vehiculo':key,'cantidad':0,'costo':0.0})
@@ -1571,13 +1618,13 @@ def dashboard():
 
     out={
         'mes':current_month,
-        'dpv':statuses['dpv'],'transito':statuses['transito'],'taller':statuses['taller'],
+        'dpv':statuses['dpv'],'transito':statuses['transito'],'taller':statuses['taller'],'consignacion':statuses['consignacion'],
         'inventario_por_tipo':sorted(({'tipo_vehiculo':row['tipo_vehiculo'],'cantidad':row['cantidad'],'costo':round(row['costo'],2)} for row in inventory_by_type.values()),key=lambda row:row['tipo_vehiculo']),
         'top_modelos':sorted(summarize(list(models.values())),key=lambda row:row['venta'],reverse=True)[:10],
         'ventas_por_marca':sorted(summarize(list(brands.values())),key=lambda row:row['venta'],reverse=True),
         'ventas_por_vendedor':sorted(summarize(list(sellers.values())),key=lambda row:row['venta'],reverse=True),
         # Se mantienen estas claves para consumidores existentes de la API.
-        'total':len(vehicles),'disponibles':statuses['dpv']['cantidad'],'inventario':round(sum(costo_consolidado(c,row['id']) for row in vehicles if row.get('estado')!='Vendido'),2),
+        'total':len(vehicles),'disponibles':statuses['dpv']['cantidad'],'inventario':round(sum(costo_consolidado(c,row['id']) for row in vehicles if row.get('estado')!='Vendido' and row.get('tipo_compra')!='Consignación'),2),
         'comisiones_pendientes':0
     }
     c.close(); return jsonify(out)
@@ -2100,10 +2147,10 @@ def get_inventario():
     result=[]; commercial_statuses=('DPV','Reservado','Vendido')
     for row in rows:
         vehicle=dict(row); workshop=c.execute("SELECT taller FROM ordenes_trabajo WHERE vehiculo_id=? AND estado='Pendiente' ORDER BY id DESC LIMIT 1",(vehicle['id'],)).fetchone()
-        cost=costo_consolidado(c,vehicle['id'])
+        cost=0 if vehicle.get('tipo_compra')=='Consignación' else costo_consolidado(c,vehicle['id'])
         price=float(vehicle['precio_venta'] or 0) if vehicle['estado'] in commercial_statuses else 0
         margin=price-cost if price else 0
-        vehicle.update(costo_total=cost,precio_consulta=price,margen=margin,margen_pct=(margin/price*100 if price else 0),taller=workshop['taller'] if workshop and vehicle['estado']=='En Taller' else None)
+        vehicle.update(costo_total=cost,precio_consulta=price,margen=margin,margen_pct=(margin/price*100 if price else 0),taller=workshop['taller'] if workshop and vehicle['estado']=='En Taller' else None,es_consignacion=vehicle.get('tipo_compra')=='Consignación',valor_consignado=float(vehicle.get('precio_compra') or 0))
         result.append(vehicle)
     c.close(); return jsonify(result)
 
@@ -2239,6 +2286,9 @@ def post_venta():
     if garantia_dias is not None and garantia_dias<=0:
         return jsonify(error='Los días de garantía deben ser mayores que cero.'),400
     if min(descuento,prima,financiado,transferencia)<0: return jsonify(error='Revise los valores de la venta'),400
+    try: fee_pct=float(d.get('fee_administrativo_pct') or 0)
+    except (TypeError,ValueError): return jsonify(error='El fee administrativo debe ser un porcentaje válido.'),400
+    if fee_pct<0 or fee_pct>100: return jsonify(error='El fee administrativo debe estar entre 0% y 100%.'),400
     pagos=d.get('pagos')
     if not isinstance(pagos,list) or not pagos: return jsonify(error='Registre al menos un pago'),400
     pagos_limpios=[]; total_pagos=0
@@ -2292,6 +2342,9 @@ def post_venta():
         c.close(); return jsonify(error='El nombre ingresado no corresponde a un vendedor activo.'),400
     vendedor_id=vendedor['id']
     if vehicle['estado']!='DPV': c.close(); return jsonify(error='Solo puede facturar vehículos en DPV'),400
+    consignacion=c.execute("SELECT * FROM adquisiciones WHERE vehiculo_id=? AND tipo_compra='Consignación'",(vid,)).fetchone()
+    if fee_pct and not consignacion:
+        c.close(); return jsonify(error='El fee administrativo solo aplica a vehículos en consignación.'),400
     precio_kardex=float(vehicle['precio_venta'] or 0)
     if precio_kardex > 0 and abs(lista-precio_kardex)>0.01:
         c.close(); return jsonify(error='El precio lista no coincide con el valor registrado en el Kardex'),400
@@ -2300,6 +2353,7 @@ def post_venta():
     precio=lista-descuento
     if descuento>lista: c.close(); return jsonify(error='El descuento no puede exceder el precio lista'),400
     if abs(total_pagos-precio)>0.01: c.close(); return jsonify(error='El total de pagos debe cuadrar exactamente con el precio final'),400
+    fee_monto=round(precio*fee_pct/100,2) if consignacion else 0
     identidad=(d.get('identidad') or '').strip(); rtn=(d.get('rtn') or '').strip()
     cliente=c.execute('SELECT * FROM clientes WHERE identidad=? OR rtn=? ORDER BY id LIMIT 1',(identidad,rtn)).fetchone() if (identidad or rtn) else None
     if cliente:
@@ -2311,12 +2365,14 @@ def post_venta():
         'telefono':(d.get('telefono') or '').strip(),'direccion':(d.get('direccion') or '').strip(),
         'email':(d.get('email') or '').strip(),
     }
+    if consignacion:
+        convertir_consignacion_en_compra(c,vid,d.get('fecha') or datetime.now().strftime('%Y-%m-%d'))
     correlativo=siguiente_correlativo_plataforma(c,'VENTA'); numero=f'V-{correlativo:05d}'; factura_num=siguiente_correlativo_plataforma(c,'FACTURA'); factura=f'FAC-{factura_num:06d}'
     for pago in pagos_limpios:
         if pago['tipo_pago']=='Financiado': pago['referencia']=factura
     try:
-        cur=c.execute('''INSERT INTO ventas(vehiculo_id,cliente_id,vendedor_id,fecha,precio,descuento,prima,saldo,estado,factura,correlativo,numero_transaccion,tipo_venta,forma_pago,financiera_banco,monto_financiado,transferencia,observaciones,garantia_dias)
-            VALUES(?,?,?,?,?,?,?,?,'Facturada',?,?,?,?,?,?,?,?,?,?)''',(vid,client_id,vendedor_id,d.get('fecha') or datetime.now().strftime('%Y-%m-%d'),precio,descuento,prima,saldo,factura,correlativo,numero,d.get('tipo_venta'),'Registro de pagos',d.get('financiera_banco'),financiado,transferencia,d.get('observaciones'),garantia_dias))
+        cur=c.execute('''INSERT INTO ventas(vehiculo_id,cliente_id,vendedor_id,fecha,precio,descuento,prima,saldo,estado,factura,correlativo,numero_transaccion,tipo_venta,forma_pago,financiera_banco,monto_financiado,transferencia,observaciones,garantia_dias,fee_administrativo_pct,fee_administrativo_monto)
+            VALUES(?,?,?,?,?,?,?,?,'Facturada',?,?,?,?,?,?,?,?,?,?,?,?)''',(vid,client_id,vendedor_id,d.get('fecha') or datetime.now().strftime('%Y-%m-%d'),precio,descuento,prima,saldo,factura,correlativo,numero,d.get('tipo_venta'),'Registro de pagos',d.get('financiera_banco'),financiado,transferencia,d.get('observaciones'),garantia_dias,fee_pct,fee_monto))
         for pago in pagos_limpios:
             financiera=c.execute("SELECT nombre FROM clientes WHERE id=? AND tipo='Financiera' AND activo=1",(pago['financiera_cliente_id'],)).fetchone() if pago['financiera_cliente_id'] else None
             if pago['tipo_pago']=='Financiado' and not financiera:
@@ -2902,13 +2958,13 @@ def post_adquisicion():
     if anticipo<0 or anticipo>costo: return jsonify(error='Revise costo de compra y anticipo'),400
     c=db(); v=c.execute('SELECT * FROM vehiculos WHERE id=?',(vid,)).fetchone(); p=c.execute('SELECT * FROM proveedores WHERE id=? AND activo=1',(pid,)).fetchone()
     if not v or not p: c.close(); return jsonify(error='Vehículo o proveedor no encontrado'),404
+    tipo_compra=(d.get('tipo_compra') or '').strip()
     metodo=d.get('metodo_pago'); condicion=p['condicion_pago']; banco=(d.get('banco') or '').strip()
-    if (condicion=='Contado' and metodo not in ('Efectivo','Transferencia')) or (condicion=='Crédito' and metodo!='Crédito'):
+    if tipo_compra!='Consignación' and ((condicion=='Contado' and metodo not in ('Efectivo','Transferencia')) or (condicion=='Crédito' and metodo!='Crédito')):
         c.close(); return jsonify(error='El método de pago no corresponde a la condición del proveedor'),400
     if metodo=='Transferencia' and anticipo>0 and not banco:
         c.close(); return jsonify(error='Seleccione el banco desde donde se realizó el anticipo'),400
-    tipo_compra=(d.get('tipo_compra') or '').strip()
-    if tipo_compra not in ('Compra local','Importación','Cambio'):
+    if tipo_compra not in ('Compra local','Importación','Cambio','Consignación'):
         c.close(); return jsonify(error='Seleccione un tipo de compra válido'),400
     placa_cambio=(d.get('placa_cambio') or '').strip().upper()
     if tipo_compra=='Cambio' and not placa_cambio:
@@ -2917,6 +2973,8 @@ def post_adquisicion():
         c.close(); return jsonify(error='Ingrese la placa del vehículo antes de registrar una compra local o cambio'),400
     if tipo_compra=='Importación' and d.get('necesita_reparacion') in (True,1,'1'):
         c.close(); return jsonify(error='Un vehículo importado no puede generar una OT antes de nacionalizarse'),400
+    if tipo_compra=='Consignación' and anticipo:
+        c.close(); return jsonify(error='Una consignación no registra anticipos ni pagos hasta que se venda.'),400
     saldo=costo-anticipo
     fecha_compra=d.get('fecha') or datetime.now().strftime('%Y-%m-%d')
     try:
@@ -2924,7 +2982,7 @@ def post_adquisicion():
     except ValueError as error:
         c.close(); return jsonify(error=str(error)),400
     try:
-        cur=c.execute('''INSERT INTO adquisiciones(vehiculo_id,proveedor_id,fecha,costo_compra,anticipo,metodo_pago,condicion_pago,dias_credito,saldo,observaciones,necesita_reparacion,tipo_compra,placa_cambio,banco,fecha_llegada_estimada) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',(vid,pid,fecha_compra,costo,anticipo,metodo,condicion,p['dias_credito'],saldo,d.get('observaciones'),1 if d.get('necesita_reparacion') in (True,1,'1') else 0,tipo_compra,placa_cambio or None,banco or None,fecha_llegada))
+        cur=c.execute('''INSERT INTO adquisiciones(vehiculo_id,proveedor_id,fecha,costo_compra,anticipo,metodo_pago,condicion_pago,dias_credito,saldo,observaciones,necesita_reparacion,tipo_compra,placa_cambio,banco,fecha_llegada_estimada,contabilizada) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',(vid,pid,fecha_compra,costo,anticipo,metodo,condicion,p['dias_credito'],saldo,d.get('observaciones'),1 if d.get('necesita_reparacion') in (True,1,'1') else 0,tipo_compra,placa_cambio or None,banco or None,fecha_llegada,0 if tipo_compra=='Consignación' else 1))
     except sqlite3.IntegrityError: c.close(); return jsonify(error='Este vehículo ya tiene una compra registrada'),409
     purchase_type=tipo_compra.lower(); repair=d.get('necesita_reparacion') in (True,1,'1')
     c.execute('UPDATE vehiculos SET precio_compra=?,proveedor=?,fecha_adquisicion=?,tipo_compra=? WHERE id=?',(costo,p['nombre'],fecha_compra,tipo_compra,vid))
@@ -2932,7 +2990,7 @@ def post_adquisicion():
         crear_orden_trabajo(c,vid,cur.lastrowid,d.get('fecha') or datetime.now().strftime('%Y-%m-%d'),'Pendiente de asignar','Reparación general',0,d.get('detalle_reparacion') or 'Reparaciones requeridas después de la adquisición')
     new_status=recalcular_estado(c,vid,'Etapa calculada al registrar la adquisición')
     add_movimiento(c,vid,fecha_compra,'Registro de adquisición',v['estado'],new_status,v['ubicacion'],v['ubicacion'],referencia=metodo,observaciones=f'Compra {tipo_compra}: {p["nombre"]}. Anticipo {anticipo:.2f}; saldo pendiente {saldo:.2f}.' + (f' Llegada estimada: {fecha_llegada}.' if fecha_llegada else ''))
-    contabilizar_adquisicion(c,cur.lastrowid)
+    if tipo_compra!='Consignación': contabilizar_adquisicion(c,cur.lastrowid)
     c.commit(); c.close(); return jsonify(ok=True),201
 
 @app.put('/api/adquisiciones/<int:adquisicion_id>')
@@ -2947,7 +3005,7 @@ def put_compra(adquisicion_id):
     if costo<=0: return jsonify(error='El costo de compra debe ser mayor que cero.'),400
     if anticipo<0 or anticipo>costo: return jsonify(error='Revise costo de compra y anticipo'),400
     tipo_compra=(d.get('tipo_compra') or '').strip()
-    if tipo_compra not in ('Compra local','Importación','Cambio'):
+    if tipo_compra not in ('Compra local','Importación','Cambio','Consignación'):
         return jsonify(error='Seleccione un tipo de compra válido'),400
     c=db()
     purchase=c.execute('SELECT * FROM adquisiciones WHERE id=?',(adquisicion_id,)).fetchone()
