@@ -1,7 +1,7 @@
 from flask import Flask, request, jsonify, send_from_directory, send_file, session, redirect, url_for, render_template_string, g, has_request_context
 from werkzeug.exceptions import HTTPException
 from werkzeug.security import check_password_hash, generate_password_hash
-import sqlite3, os, shutil, uuid, hmac, io, json, tempfile, zipfile, re
+import sqlite3, os, shutil, uuid, hmac, io, json, tempfile, zipfile, re, csv
 from datetime import datetime, timedelta
 ROOT=os.path.dirname(os.path.abspath(__file__))
 BUNDLED_DATA=os.path.join(ROOT,'data')
@@ -1319,7 +1319,7 @@ def logout():
 
 @app.get('/respaldo/sistema.zip')
 def download_system_backup():
-    """Entrega una copia consistente del sistema para el respaldo local autorizado."""
+    """Entrega código y una copia consistente, recuperable y legible de los datos."""
     configured_token=os.environ.get('BACKUP_TOKEN','')
     header=request.headers.get('Authorization','')
     supplied_token=header[7:] if header.startswith('Bearer ') else ''
@@ -1335,15 +1335,49 @@ def download_system_backup():
         content=io.BytesIO(); files=['datos/autolote.sqlite']
         with zipfile.ZipFile(content,'w',zipfile.ZIP_DEFLATED,compresslevel=6) as archive:
             archive.write(database_copy,'datos/autolote.sqlite')
-            for relative in ('server.py','requirements.txt','render.yaml'):
+            # Además de la base SQLite (la fuente completa y recuperable), se
+            # exporta cada tabla a CSV UTF-8 para abrirla directamente en Excel.
+            data_connection=sqlite3.connect(database_copy)
+            tables=[row[0] for row in data_connection.execute("""
+                SELECT name FROM sqlite_master
+                WHERE type='table' AND name NOT LIKE 'sqlite_%'
+                ORDER BY name
+            """)]
+            table_summary=[]
+            for table in tables:
+                quoted_table='"'+table.replace('"','""')+'"'
+                cursor=data_connection.execute(f'SELECT * FROM {quoted_table}')
+                csv_content=io.StringIO(newline='')
+                writer=csv.writer(csv_content)
+                writer.writerow([column[0] for column in cursor.description])
+                rows=0
+                for row in cursor:
+                    writer.writerow(row); rows+=1
+                csv_path=f'datos/tablas/{table}.csv'
+                archive.writestr(csv_path,'\ufeff'+csv_content.getvalue())
+                files.append(csv_path)
+                table_summary.append({'tabla':table,'filas':rows,'archivo':csv_path})
+            data_connection.close()
+            archive.writestr('datos/LEEME.txt',
+                'autolote.sqlite es la copia completa para restaurar el sistema.\n'
+                'tablas/*.csv contiene cada tabla en formato legible por Excel.\n')
+            files.append('datos/LEEME.txt')
+            for relative in ('server.py','requirements.txt','render.yaml','README.md'):
                 path=os.path.join(ROOT,relative)
-                if os.path.isfile(path): archive.write(path,f'sistema/{relative}'); files.append(f'sistema/{relative}')
-            for folder,_,names in os.walk(APP):
-                for name in names:
-                    path=os.path.join(folder,name); relative=os.path.relpath(path,ROOT)
+                if os.path.isfile(path):
                     archive.write(path,f'sistema/{relative}'); files.append(f'sistema/{relative}')
+            for folder_name in ('app','scripts','tests'):
+                source_folder=os.path.join(ROOT,folder_name)
+                if not os.path.isdir(source_folder): continue
+                for folder,subfolders,names in os.walk(source_folder):
+                    subfolders[:]=[name for name in subfolders if name != '__pycache__']
+                    for name in names:
+                        if name.endswith(('.pyc','.sqlite')): continue
+                        path=os.path.join(folder,name); relative=os.path.relpath(path,ROOT)
+                        archive.write(path,f'sistema/{relative}'); files.append(f'sistema/{relative}')
             archive.writestr('manifiesto.json',json.dumps({
                 'generado_en':created,'contenido':files,
+                'tablas':table_summary,
                 'nota':'Las variables de entorno y secretos no se incluyen por seguridad.'
             },ensure_ascii=False,indent=2))
         content.seek(0)

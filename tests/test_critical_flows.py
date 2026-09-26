@@ -309,6 +309,26 @@ class CriticalFlowsTest(unittest.TestCase):
         self.assertEqual(response.status_code, 503)
         self.assertEqual(response.get_json()['error'], 'El respaldo local aún no está configurado.')
 
+    def test_backup_contains_complete_data_exports_and_operational_code(self):
+        import json
+        import zipfile
+        os.environ['BACKUP_TOKEN']='respaldo-prueba'
+        try:
+            response=self.client.get('/respaldo/sistema.zip',headers={
+                'Authorization':'Bearer respaldo-prueba'
+            })
+        finally:
+            os.environ.pop('BACKUP_TOKEN',None)
+        self.assertEqual(response.status_code,200)
+        with zipfile.ZipFile(__import__('io').BytesIO(response.data)) as archive:
+            entries=set(archive.namelist())
+            self.assertTrue({'datos/autolote.sqlite','datos/LEEME.txt','sistema/server.py',
+                             'sistema/app/index.html','sistema/scripts/respaldo_local.sh',
+                             'datos/tablas/vehiculos.csv','datos/tablas/ventas.csv',
+                             'datos/tablas/costos_vehiculo.csv','datos/tablas/asientos_contables.csv'} <= entries)
+            manifest=json.loads(archive.read('manifiesto.json'))
+            self.assertTrue(any(item['tabla']=='vehiculos' for item in manifest['tablas']))
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
