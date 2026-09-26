@@ -7,7 +7,7 @@
   <key>ProgramArguments</key>
   <array>
     <string>/bin/zsh</string>
-    <string>/Users/erickmadrid/Documents/Respaldos Triple AAA/respaldo_local.sh</string>
+    <string>/Users/erickmadrid/Library/Application Support/Corporacion Triple AAA/respaldo_local.sh</string>
   </array>
   <key>StartCalendarInterval</key>
   <dict>
