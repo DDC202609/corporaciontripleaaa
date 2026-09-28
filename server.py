@@ -2668,7 +2668,7 @@ def datos_planificacion_compra(c, semanas=12):
         if position<semanas: workshop_by_model[model][position]+=1
     rows=[]; weekly=[{'inicio':week.isoformat(),'fin':(week+timedelta(days=6)).isoformat(),
                       'transito':0,'taller':0,'demanda':0.0,'faltante_dpv':0.0} for week in weeks]
-    for model in sorted(models):
+    for model in sorted(models,key=lambda item:(-sales.get(item,0),item)):
         current=inventory.get(model,{'DPV':0,'En Taller':0,'En Tránsito':0,'anios':{}})
         param=parameters.get(model,{'dpv':0,'taller':0,'transito':0,'distribucion':{}})
         average=round(sales.get(model,0)/12,2)

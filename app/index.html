@@ -934,5 +934,17 @@ function removePurchasePlanningModel(index){purchasePlanningEditable.splice(inde
 async function savePurchasePlanningEta(id){let eta=$('purchaseEta'+id)?.value;if(!eta)return showNotice('Ingrese el ETA antes de actualizarlo.','error');let response=await fetch('/api/planificacion-compra/transitos/'+id+'/eta',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({eta})}),result=await response.json();if(!response.ok)return showNotice(result.error||'No se pudo actualizar el ETA.','error');showNotice('ETA actualizado. La proyección semanal fue recalculada.');await loadPurchasePlanning()}
 async function savePurchasePlanningParameters(){let rows=Array.from($('purchasePlanningParameters').querySelectorAll('tbody tr[data-plan-index]')),years=purchasePlanningData?.anios||[];rows.forEach(element=>{let item=purchasePlanningEditable[Number(element.dataset.planIndex)];if(!item)return;item.dpv=purchasePlanningInteger(element.querySelector('[data-plan="dpv"]')?.value);item.taller=purchasePlanningInteger(element.querySelector('[data-plan="taller"]')?.value);item.transito=purchasePlanningInteger(element.querySelector('[data-plan="transito"]')?.value);item.distribucion=Object.fromEntries(years.map(year=>[year,purchasePlanningInteger(element.querySelector(`[data-year="${year}"]`)?.value)]))});let response=await fetch('/api/planificacion-compra/parametros',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({parametros:purchasePlanningEditable})}),result=await response.json();if(!response.ok)return showNotice(result.error||'No se pudieron guardar los parámetros.','error');showNotice('Parámetros de compra guardados.');await loadPurchasePlanning()}
 document.head.insertAdjacentHTML('beforeend','<style>.purchase-plan-table input{min-width:58px;padding:6px}.purchase-plan-alerts{margin:10px 0 0;padding-left:20px}.purchase-plan-alerts li{margin:6px 0;color:#9a3412}</style>');
+const renderPurchasePlanningWithPriority=renderPurchasePlanning;
+renderPurchasePlanning=function(){
+  if(purchasePlanningData?.modelos){
+    purchasePlanningData.modelos.sort((left,right)=>Number(right.promedio_mensual||0)-Number(left.promedio_mensual||0)||String(left.modelo).localeCompare(String(right.modelo),'es'));
+    purchasePlanningEditable.sort((left,right)=>Number(right.promedio_mensual||0)-Number(left.promedio_mensual||0)||String(left.modelo).localeCompare(String(right.modelo),'es'));
+  }
+  renderPurchasePlanningWithPriority();
+  let models=purchasePlanningData?.modelos||[];
+  if(!models.length)return;
+  let weeks=purchasePlanningData?.semanas||[];
+  $('purchasePlanningWeekly').insertAdjacentHTML('beforeend',`<div class="sub" style="margin:18px 0 8px"><b>Detalle por modelo</b> · ordenado de mayor a menor por Prom. M.</div><table><thead><tr><th>Modelo</th><th>Prom. M.</th>${weeks.map(week=>`<th>${esc(week.inicio)}</th>`).join('')}</tr></thead><tbody>${models.map(model=>`<tr><td><b>${esc(model.modelo)}</b></td><td>${Number(model.promedio_mensual||0).toFixed(2)}</td>${(model.proyeccion||[]).map(week=>`<td>ETA ${Number(week.transito||0)}<br>Taller ${Number(week.taller||0)}<br><b class="${Number(week.faltante_dpv||0)>0?'warn':'good'}">Falt. ${Number(week.faltante_dpv||0).toFixed(2)}</b></td>`).join('')}</tr>`).join('')}</tbody></table>`);
+};
 dash();
 </script></body></html>
