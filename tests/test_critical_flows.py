@@ -329,6 +329,23 @@ class CriticalFlowsTest(unittest.TestCase):
             manifest=json.loads(archive.read('manifiesto.json'))
             self.assertTrue(any(item['tabla']=='vehiculos' for item in manifest['tablas']))
 
+    def test_purchase_planning_calculates_weekly_projection_and_saves_parameters(self):
+        self.login_as_admin()
+        saved=self.client.put('/api/planificacion-compra/parametros',json={'parametros':[{
+            'modelo':'Modelo prueba planificación','dpv':3,'taller':2,'transito':1,
+            'distribucion':{'2020':2,'2021':1}
+        }]})
+        self.assertEqual(saved.status_code,200)
+        response=self.client.get('/api/planificacion-compra')
+        self.assertEqual(response.status_code,200)
+        data=response.get_json()
+        row=next(item for item in data['modelos'] if item['modelo']=='MODELO PRUEBA PLANIFICACIÓN')
+        self.assertEqual({key:row['inventario_optimo'][key] for key in ('dpv','taller','transito')},
+                         {'dpv':3,'taller':2,'transito':1})
+        self.assertEqual(row['sugerido_compra'],6)
+        self.assertEqual(len(row['proyeccion']),12)
+        self.assertEqual(len(data['semanas']),12)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

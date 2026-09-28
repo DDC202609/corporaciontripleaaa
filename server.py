@@ -34,7 +34,7 @@ ACCESS_MODULES=(
     ('ventas','Ventas y cobros'),('vendedores','Vendedores'),('inventario','Consulta de inventario'),
     ('catalogo','Catálogo contable'),('centros_costo','Centros de costo'),('cartera','Cuentas por cobrar y pagar'),('contabilidad','Contabilidad'),
     ('caja_bancos','Caja y bancos'),('gastos','Registro de gastos'),('comisiones','Comisiones'),
-    ('planificacion_financiera','Planificación financiera'),('auditoria','Bitácora de auditoría'),
+    ('planificacion_financiera','Planificación financiera'),('planificacion_compra','Planificación de compra'),('auditoria','Bitácora de auditoría'),
 )
 
 def init_access_control_schema():
@@ -76,7 +76,7 @@ def init_access_control_schema():
                   (name,description,is_admin,is_system))
     profiles={row['nombre']:row['id'] for row in c.execute('SELECT id,nombre FROM perfiles')}
     all_modules={key for key,_ in ACCESS_MODULES}
-    operational={'dashboard','vehiculos','informacion_vehiculo','proveedores','adquisiciones','taller','costeo','ventas','inventario','catalogo','centros_costo','vendedores','gastos','cartera'}
+    operational={'dashboard','vehiculos','informacion_vehiculo','proveedores','adquisiciones','taller','costeo','ventas','inventario','catalogo','centros_costo','vendedores','gastos','cartera','planificacion_compra'}
     sales={'dashboard','vehiculos','ventas','vendedores','inventario','caja_bancos','comisiones'}
     consultation={'dashboard','vehiculos','inventario','contabilidad','caja_bancos','ventas'}
     for profile_name,allowed in (('Administrador',all_modules),('Operaciones',operational),('Ventas',sales),('Consulta',consultation)):
@@ -124,6 +124,7 @@ def request_module(path):
     if path.startswith('/api/auditoria'): return 'auditoria'
     if path.startswith('/api/dashboard'): return 'dashboard'
     if path.startswith('/api/planificacion-financiera'): return 'planificacion_financiera'
+    if path.startswith('/api/planificacion-compra'): return 'planificacion_compra'
     if path.startswith('/api/contabilidad'): return 'contabilidad'
     if path.startswith('/api/cuentas-por-'): return 'cartera'
     if path.startswith('/api/caja'): return 'caja_bancos'
@@ -453,6 +454,14 @@ def init_db(sync_history=True):
         id INTEGER PRIMARY KEY AUTOINCREMENT,vehiculo_id INTEGER NOT NULL UNIQUE REFERENCES vehiculos(id),proveedor_id INTEGER NOT NULL REFERENCES proveedores(id),
         fecha TEXT NOT NULL,costo_compra REAL NOT NULL,anticipo REAL NOT NULL DEFAULT 0,metodo_pago TEXT NOT NULL,condicion_pago TEXT NOT NULL,
         dias_credito INTEGER NOT NULL DEFAULT 0,saldo REAL NOT NULL DEFAULT 0,observaciones TEXT,creado_en TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS planificacion_compra_parametros(
+        modelo TEXT PRIMARY KEY COLLATE NOCASE,
+        inventario_optimo_dpv INTEGER NOT NULL DEFAULT 0,
+        inventario_optimo_taller INTEGER NOT NULL DEFAULT 0,
+        inventario_optimo_transito INTEGER NOT NULL DEFAULT 0,
+        distribucion_anios TEXT NOT NULL DEFAULT '{}',
+        actualizado_en TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )''')
     c.execute('''CREATE TABLE IF NOT EXISTS ordenes_trabajo(
         id INTEGER PRIMARY KEY AUTOINCREMENT,vehiculo_id INTEGER NOT NULL REFERENCES vehiculos(id),adquisicion_id INTEGER REFERENCES adquisiciones(id),
         fecha TEXT NOT NULL,estado TEXT NOT NULL DEFAULT 'Pendiente',detalle TEXT,creado_en TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)''')
@@ -2583,6 +2592,171 @@ def get_planificacion_financiera():
              'taller':round(sum(item['pendiente'] for item in rows if item['etapa']=='En Taller'),2)}
     summary['total']=round(summary['transito']+summary['taller'],2)
     c.close(); return jsonify(resumen=summary,compromisos=rows)
+
+def _modelo_planificacion(value):
+    return ' '.join(str(value or '').strip().split()).upper()
+
+def datos_planificacion_compra(c, semanas=12):
+    """Calcula la disponibilidad semanal sin crear compras ni asientos."""
+    today=datetime.now().date()
+    monday=today-timedelta(days=today.weekday())
+    weeks=[monday+timedelta(days=index*7) for index in range(semanas)]
+    year_values=set(range(2010,today.year+1))
+    parameters={}
+    for row in c.execute('SELECT * FROM planificacion_compra_parametros'):
+        item=dict(row)
+        try: distribution=json.loads(item.get('distribucion_anios') or '{}')
+        except (TypeError,json.JSONDecodeError): distribution={}
+        normalized={str(year):max(0,int(float(quantity or 0))) for year,quantity in distribution.items()
+                    if str(year).isdigit() and 1900<=int(year)<=2100}
+        year_values.update(int(year) for year in normalized)
+        parameters[_modelo_planificacion(item['modelo'])]={
+            'dpv':max(0,int(item['inventario_optimo_dpv'] or 0)),
+            'taller':max(0,int(item['inventario_optimo_taller'] or 0)),
+            'transito':max(0,int(item['inventario_optimo_transito'] or 0)),
+            'distribucion':normalized,
+        }
+    inventory={}
+    models=set(parameters)
+    for row in c.execute("""SELECT modelo,anio,estado,COUNT(*) cantidad FROM vehiculos
+        WHERE estado<>'Vendido' AND TRIM(COALESCE(modelo,''))<>''
+        GROUP BY modelo,anio,estado"""):
+        model=_modelo_planificacion(row['modelo']); models.add(model)
+        item=inventory.setdefault(model,{'DPV':0,'En Taller':0,'En Tránsito':0,'anios':{}})
+        state=row['estado'] or ''
+        if state in item: item[state]+=int(row['cantidad'] or 0)
+        if row['anio']:
+            year=str(int(row['anio'])); year_values.add(int(year))
+            item['anios'][year]=item['anios'].get(year,0)+int(row['cantidad'] or 0)
+    start_month=(today.replace(day=1)-timedelta(days=335)).isoformat()
+    sales={}
+    for row in c.execute("""SELECT v.modelo,COUNT(*) cantidad FROM ventas ve
+        JOIN vehiculos v ON v.id=ve.vehiculo_id
+        WHERE ve.fecha>=? AND ve.fecha<=? AND TRIM(COALESCE(v.modelo,''))<>''
+        GROUP BY v.modelo""",(start_month,today.isoformat())):
+        model=_modelo_planificacion(row['modelo']); models.add(model)
+        sales[model]=int(row['cantidad'] or 0)
+    transit_by_model={model:[0]*semanas for model in models}; workshop_by_model={model:[0]*semanas for model in models}
+    transit_records=[]
+    without_eta=[]; without_delivery=[]
+    for row in c.execute("""SELECT v.id vehiculo_id,v.vin,v.marca,v.modelo,a.id adquisicion_id,a.fecha,a.fecha_llegada_estimada
+        FROM vehiculos v JOIN adquisiciones a ON a.vehiculo_id=v.id
+        WHERE v.estado='En Tránsito' ORDER BY a.fecha_llegada_estimada,a.id"""):
+        model=_modelo_planificacion(row['modelo']); transit_by_model.setdefault(model,[0]*semanas); models.add(model)
+        transit_records.append({'adquisicion_id':row['adquisicion_id'],'vehiculo_id':row['vehiculo_id'],
+                                'vin':row['vin'],'marca':row['marca'],'modelo':model,
+                                'fecha_compra':row['fecha'],'eta':row['fecha_llegada_estimada']})
+        try: eta=datetime.strptime((row['fecha_llegada_estimada'] or '')[:10],'%Y-%m-%d').date()
+        except ValueError:
+            without_eta.append({'vin':row['vin'],'modelo':model,'motivo':'Sin ETA'}); continue
+        position=(eta-monday).days//7
+        if position<0: position=0
+        if position<semanas: transit_by_model[model][position]+=1
+    seen_workshop=set()
+    for row in c.execute("""SELECT o.vehiculo_id,o.fecha_entrega_estimada,v.vin,v.modelo
+        FROM ordenes_trabajo o JOIN vehiculos v ON v.id=o.vehiculo_id
+        WHERE o.estado='Pendiente' AND v.estado='En Taller'
+        ORDER BY o.vehiculo_id,COALESCE(o.fecha_entrega_estimada,o.fecha),o.id"""):
+        if row['vehiculo_id'] in seen_workshop: continue
+        seen_workshop.add(row['vehiculo_id'])
+        model=_modelo_planificacion(row['modelo']); workshop_by_model.setdefault(model,[0]*semanas); models.add(model)
+        try: delivery=datetime.strptime((row['fecha_entrega_estimada'] or '')[:10],'%Y-%m-%d').date()
+        except ValueError:
+            without_delivery.append({'vin':row['vin'],'modelo':model,'motivo':'Sin fecha de entrega'}); continue
+        position=(delivery-monday).days//7
+        if position<0: position=0
+        if position<semanas: workshop_by_model[model][position]+=1
+    rows=[]; weekly=[{'inicio':week.isoformat(),'fin':(week+timedelta(days=6)).isoformat(),
+                      'transito':0,'taller':0,'demanda':0.0,'faltante_dpv':0.0} for week in weeks]
+    for model in sorted(models):
+        current=inventory.get(model,{'DPV':0,'En Taller':0,'En Tránsito':0,'anios':{}})
+        param=parameters.get(model,{'dpv':0,'taller':0,'transito':0,'distribucion':{}})
+        average=round(sales.get(model,0)/12,2)
+        target_total=param['dpv']+param['taller']+param['transito']
+        current_total=current['DPV']+current['En Taller']+current['En Tránsito']
+        arrivals=0; deliveries=0; demand_total=0.0; projection=[]
+        for index,week in enumerate(weeks):
+            arrivals+=transit_by_model.get(model,[0]*semanas)[index]
+            deliveries+=workshop_by_model.get(model,[0]*semanas)[index]
+            weekly_demand=average/4.345
+            demand_total+=weekly_demand
+            available=max(0,current['DPV']+arrivals+deliveries-demand_total)
+            shortage=max(0,param['dpv']-available)
+            projection.append({'inicio':week.isoformat(),'transito':transit_by_model.get(model,[0]*semanas)[index],
+                               'taller':workshop_by_model.get(model,[0]*semanas)[index],
+                               'demanda':round(weekly_demand,2),'disponible':round(available,2),'faltante_dpv':round(shortage,2)})
+            weekly[index]['transito']+=transit_by_model.get(model,[0]*semanas)[index]
+            weekly[index]['taller']+=workshop_by_model.get(model,[0]*semanas)[index]
+            weekly[index]['demanda']+=weekly_demand
+            weekly[index]['faltante_dpv']+=shortage
+        distribution=[]
+        for year,value in sorted(param['distribucion'].items(),key=lambda pair:int(pair[0])):
+            actual=current['anios'].get(year,0)
+            distribution.append({'anio':int(year),'ideal':value,'actual':actual,'sugerido':max(0,value-actual)})
+        rows.append({'modelo':model,'promedio_mensual':average,'ventas_12_meses':sales.get(model,0),
+                     'inventario_actual':current,'inventario_optimo':param,'inventario_optimo_total':target_total,
+                     'sugerido_compra':max(0,target_total-current_total),'distribucion':distribution,'proyeccion':projection})
+    for week in weekly:
+        for key in ('demanda','faltante_dpv'): week[key]=round(week[key],2)
+    return {'anios':sorted(year_values),'modelos':rows,'semanas':weekly,'transitos':transit_records,
+            'sin_eta':without_eta,'sin_entrega':without_delivery,'periodo_ventas':{'desde':start_month,'hasta':today.isoformat()}}
+
+@app.get('/api/planificacion-compra')
+def get_planificacion_compra():
+    c=db()
+    try: data=datos_planificacion_compra(c)
+    finally: c.close()
+    return jsonify(data)
+
+@app.put('/api/planificacion-compra/parametros')
+def put_planificacion_compra_parametros():
+    data=request.get_json(silent=True) or {}; items=data.get('parametros')
+    if not isinstance(items,list): return jsonify(error='Se requiere la lista de parámetros.'),400
+    normalized=[]; seen=set()
+    try:
+        for item in items:
+            if not isinstance(item,dict): raise ValueError
+            model=_modelo_planificacion(item.get('modelo'))
+            if not model or model in seen: raise ValueError
+            seen.add(model)
+            quantities={key:max(0,int(float(item.get(key,0) or 0))) for key in ('dpv','taller','transito')}
+            distribution=item.get('distribucion') or {}
+            if not isinstance(distribution,dict): raise ValueError
+            years={str(year):max(0,int(float(quantity or 0))) for year,quantity in distribution.items()
+                   if str(year).isdigit() and 1900<=int(year)<=2100}
+            normalized.append((model,quantities,years))
+    except (TypeError,ValueError,OverflowError):
+        return jsonify(error='Revise las cantidades de los parámetros de compra.'),400
+    c=db()
+    try:
+        c.execute('DELETE FROM planificacion_compra_parametros')
+        for model,quantities,years in normalized:
+            if not (sum(quantities.values()) or sum(years.values())): continue
+            c.execute('''INSERT INTO planificacion_compra_parametros(
+                modelo,inventario_optimo_dpv,inventario_optimo_taller,inventario_optimo_transito,distribucion_anios,actualizado_en)
+                VALUES(?,?,?,?,?,CURRENT_TIMESTAMP)''',
+                (model,quantities['dpv'],quantities['taller'],quantities['transito'],json.dumps(years,ensure_ascii=False)))
+        c.commit()
+    except Exception:
+        c.rollback(); raise
+    finally: c.close()
+    return jsonify(ok=True)
+
+@app.put('/api/planificacion-compra/transitos/<int:adquisicion_id>/eta')
+def put_planificacion_compra_eta(adquisicion_id):
+    data=request.get_json(silent=True) or {}; eta=(data.get('eta') or '').strip()
+    try: datetime.strptime(eta,'%Y-%m-%d')
+    except ValueError: return jsonify(error='Ingrese una fecha ETA válida.'),400
+    c=db(); purchase=c.execute('''SELECT a.*,v.vin,v.estado,v.ubicacion FROM adquisiciones a
+        JOIN vehiculos v ON v.id=a.vehiculo_id WHERE a.id=?''',(adquisicion_id,)).fetchone()
+    if not purchase: c.close(); return jsonify(error='Adquisición no encontrada.'),404
+    if purchase['estado']!='En Tránsito': c.close(); return jsonify(error='Solo puede actualizar el ETA de un vehículo en tránsito.'),400
+    previous=purchase['fecha_llegada_estimada']
+    c.execute('UPDATE adquisiciones SET fecha_llegada_estimada=? WHERE id=?',(eta,adquisicion_id))
+    add_movimiento(c,purchase['vehiculo_id'],datetime.now().strftime('%Y-%m-%d'),'ETA actualizado',
+                   purchase['estado'],purchase['estado'],purchase['ubicacion'],purchase['ubicacion'],
+                   referencia='Planificación de compra',observaciones=f'ETA actualizado de {previous or "sin fecha"} a {eta}.')
+    c.commit(); c.close(); return jsonify(ok=True,eta=eta)
 
 @app.get('/api/ordenes-trabajo')
 def get_ordenes_trabajo():
