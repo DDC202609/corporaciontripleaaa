@@ -234,6 +234,37 @@ async function editMaster(id){let rows=currentMaster==='Financiera'?await get('/
 function cancelMasterEdit(){masterEditing=null;renderMaster()}
 saveMasterProvider=async function(event){event.preventDefault();let data=Object.fromEntries(new FormData(event.target).entries()),id=data.id;data.tipo=currentMaster;data.especialidades=(data.especialidades||'').split(',').map(value=>value.trim()).filter(Boolean);let response=await fetch(id?'/api/proveedores/'+id:'/api/proveedores',{method:id?'PUT':'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)}),result=await response.json();if(!response.ok)return showNotice(result.error||'No se pudo guardar.','error');masterEditing=null;showNotice(id?'Proveedor/taller actualizado.':'Proveedor/taller guardado.');renderMaster()};
 saveFinance=async function(event){event.preventDefault();let data=Object.fromEntries(new FormData(event.target).entries()),id=data.id;let response=await fetch(id?'/api/financieras/'+id:'/api/financieras',{method:id?'PUT':'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)}),result=await response.json();if(!response.ok)return showNotice(result.error||'No se pudo guardar.','error');masterEditing=null;showNotice(id?'Financiera actualizada.':'Financiera guardada.');renderMaster()};
+/* Datos maestros: confirmar guardado y permitir retirar registros sin borrar su historial. */
+const renderMasterWithDeleteActions=renderMaster;
+renderMaster=async function(){
+  await renderMasterWithDeleteActions();
+  let rows=currentMaster==='Financiera'?await get('/api/financieras'):await get('/api/proveedores?tipo='+encodeURIComponent(currentMaster));
+  [...$('masterContent').querySelectorAll('tbody tr')].forEach((row,index)=>{
+    let item=rows[index],cell=row.lastElementChild;
+    if(!item||!cell)return;
+    cell.insertAdjacentHTML('beforeend',` <button class="btn2 danger-btn" type="button" onclick="deleteMaster(${item.id})">Eliminar</button>`);
+  });
+};
+const saveMasterProviderWithConfirmation=saveMasterProvider;
+saveMasterProvider=async function(event){
+  if(!confirm('¿Está seguro de guardar esta información?'))return event.preventDefault();
+  return saveMasterProviderWithConfirmation(event);
+};
+const saveFinanceWithConfirmation=saveFinance;
+saveFinance=async function(event){
+  if(!confirm('¿Está seguro de guardar esta información?'))return event.preventDefault();
+  return saveFinanceWithConfirmation(event);
+};
+async function deleteMaster(id){
+  let label=currentMaster==='Financiera'?'financiera':currentMaster==='Taller'?'taller':'proveedor';
+  if(!confirm(`¿Está seguro de eliminar este ${label}? Dejará de estar disponible para nuevos registros; los documentos históricos se conservarán.`))return;
+  let url=currentMaster==='Financiera'?`/api/financieras/${id}`:`/api/proveedores/${id}`;
+  let response=await fetch(url,{method:'DELETE'}),result=await response.json();
+  if(!response.ok)return showNotice(result.error||`No se pudo eliminar el ${label}.`,'error');
+  if(masterEditing&&Number(masterEditing.id)===Number(id))masterEditing=null;
+  showNotice(`${label[0].toUpperCase()+label.slice(1)} eliminado del listado.`);
+  await renderMaster();
+}
 /* Edición de OT: incluye el detalle histórico de mano de obra, repuestos e insumos. */
 document.body.insertAdjacentHTML('beforeend',`<div id="workOrderEditModal" class="modal hidden"><div class="modalbox" style="max-width:1000px"><div class="modalhead"><div><h2 style="margin:0">Modificar OT</h2><div id="workOrderEditTitle" class="sub"></div></div><button class="close" type="button" onclick="closeWorkOrderEdit()">×</button></div><form id="workOrderEditForm" onsubmit="saveWorkOrderEdit(event)"><input name="id" type="hidden"><input name="estado_original" type="hidden"><div class="formgrid" style="margin-top:16px"><div class="field"><label>Fecha de ingreso *</label><input name="fecha" type="date" required></div><div class="field"><label>Taller asignado *</label><input name="taller" required></div><div class="field"><label>Estado</label><select name="estado" required><option value="Pendiente">En Taller</option><option value="Finalizada">Reparado</option></select><div class="sub" style="margin-top:5px">El cierre se realiza desde “Cerrar OT”.</div></div><div id="workOrderFinalValueField" class="field hidden"><label>Valor final de mano de obra *</label><input name="valor_final" type="number" min="0" step="0.01"><div class="sub" style="margin-top:5px">Puede corregir este importe sin duplicar el costo.</div></div><div class="field span4"><label>Descripción de la OT *</label><textarea name="descripcion" required></textarea></div></div><div style="margin-top:18px"><b>Conceptos registrados</b><div id="workOrderEditCosts" class="wide-table" style="margin-top:8px"></div></div><div class="actions"><button class="btn2" type="button" onclick="closeWorkOrderEdit()">Cancelar</button><button id="workOrderEditSave" class="primary">Guardar cambios</button></div></form></div></div>`);
 let workshopOrderRows=[];

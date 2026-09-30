@@ -2529,6 +2529,17 @@ def put_proveedor(proveedor_id):
     for especialidad in especialidades: c.execute('INSERT OR IGNORE INTO proveedor_especialidades(proveedor_id,especialidad) VALUES(?,?)',(proveedor_id,especialidad))
     c.commit(); c.close(); return jsonify(ok=True)
 
+@app.delete('/api/proveedores/<int:proveedor_id>')
+def delete_proveedor(proveedor_id):
+    """Desactiva un proveedor para conservar la trazabilidad de sus documentos."""
+    c=db(); provider=c.execute('SELECT id,nombre,activo FROM proveedores WHERE id=?',(proveedor_id,)).fetchone()
+    if not provider:
+        c.close(); return jsonify(error='Proveedor o taller no encontrado.'),404
+    if not provider['activo']:
+        c.close(); return jsonify(error='El proveedor o taller ya fue eliminado.'),409
+    c.execute('UPDATE proveedores SET activo=0 WHERE id=?',(proveedor_id,))
+    c.commit(); c.close(); return jsonify(ok=True,eliminado=provider['nombre'])
+
 @app.get('/api/financieras')
 def get_financieras():
     c=db(); rows=c.execute("SELECT * FROM clientes WHERE tipo='Financiera' AND activo=1 ORDER BY nombre").fetchall(); c.close(); return jsonify([dict(row) for row in rows])
@@ -2553,6 +2564,17 @@ def put_financiera(financiera_id):
     if duplicate: c.close(); return jsonify(error='Ya existe otra financiera con ese nombre.'),409
     c.execute("UPDATE clientes SET nombre=?,rtn=?,direccion=?,condicion_pago=? WHERE id=? AND tipo='Financiera'",(nombre,(data.get('rtn') or '').strip(),(data.get('direccion') or '').strip(),condicion,financiera_id))
     c.commit(); c.close(); return jsonify(ok=True)
+
+@app.delete('/api/financieras/<int:financiera_id>')
+def delete_financiera(financiera_id):
+    """Desactiva la financiera, sin borrar su participación en ventas anteriores."""
+    c=db(); finance=c.execute("SELECT id,nombre,activo FROM clientes WHERE id=? AND tipo='Financiera'",(financiera_id,)).fetchone()
+    if not finance:
+        c.close(); return jsonify(error='Financiera no encontrada.'),404
+    if not finance['activo']:
+        c.close(); return jsonify(error='La financiera ya fue eliminada.'),409
+    c.execute("UPDATE clientes SET activo=0 WHERE id=? AND tipo='Financiera'",(financiera_id,))
+    c.commit(); c.close(); return jsonify(ok=True,eliminado=finance['nombre'])
 
 @app.get('/api/adquisiciones')
 def get_adquisiciones():
