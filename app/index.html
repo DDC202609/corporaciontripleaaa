@@ -622,6 +622,11 @@ loadCosting=async function(){
   await loadCostingWithVinSearch();
   let select=$('costVehicle'),field=select?.closest('.field');
   if(!select||!field)return;
+  let transitVehicles=(await get('/api/vehiculos')).filter(vehicle=>String(vehicle.estado||'').trim()==='En Tránsito');
+  select.innerHTML='<option value="">Seleccionar vehículo en tránsito</option>'+transitVehicles.map(vehicle=>`<option value="${vehicle.id}">${esc(vehicle.vin)} · ${esc((vehicle.marca||'')+' '+(vehicle.modelo||''))}</option>`).join('');
+  currentCostVehicle=null;
+  $('costBasic').textContent=transitVehicles.length?'Digite o seleccione un vehículo en tránsito para ver sus datos básicos.':'No hay vehículos en tránsito disponibles para costeo.';
+  $('costForm').classList.add('hidden');
   field.querySelector('.cost-vin-search')?.remove();
   let choices=[...select.options].filter(option=>option.value).map(option=>{
     let [vin]=String(option.textContent||'').split(' · ');
