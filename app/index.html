@@ -616,6 +616,29 @@ renderAccounting=function(){
   }
   return result;
 };
+/* Costeo: permitir buscar por VIN escrito sin perder el selector de vehículos. */
+const loadCostingWithVinSearch=loadCosting;
+loadCosting=async function(){
+  await loadCostingWithVinSearch();
+  let select=$('costVehicle'),field=select?.closest('.field');
+  if(!select||!field)return;
+  field.querySelector('.cost-vin-search')?.remove();
+  let choices=[...select.options].filter(option=>option.value).map(option=>{
+    let [vin]=String(option.textContent||'').split(' · ');
+    return {id:String(option.value),vin:vin.trim(),label:String(option.textContent||'').trim()};
+  });
+  window.costVehicleChoices=choices;
+  select.insertAdjacentHTML('beforebegin',`<div class="toolbar cost-vin-search" style="gap:8px;margin-bottom:8px"><input id="costVinSearch" list="costVinOptions" autocomplete="off" placeholder="Digite el VIN" aria-label="Digite el VIN"><button class="primary" type="button" onclick="searchCostVin()">Buscar VIN</button><datalist id="costVinOptions">${choices.map(choice=>`<option value="${esc(choice.vin)}">${esc(choice.label)}</option>`).join('')}</datalist></div>`);
+  $('costVinSearch').addEventListener('keydown',event=>{if(event.key==='Enter'){event.preventDefault();searchCostVin()}});
+};
+function searchCostVin(){
+  let vin=String($('costVinSearch')?.value||'').trim().toUpperCase(),choices=window.costVehicleChoices||[];
+  let choice=choices.find(item=>item.vin.toUpperCase()===vin);
+  if(!choice)return showNotice('No se encontró un vehículo con ese VIN. Puede escogerlo en la lista.','error');
+  $('costVehicle').value=choice.id;
+  $('costVinSearch').value=choice.vin;
+  loadCostVehicle();
+}
 /* Seguridad: una OT abierta nunca puede seguir seleccionada al buscar otro VIN. */
 const searchWorkVehicleWithPartsSafety=searchWorkVehicle;
 searchWorkVehicle=async function(){
