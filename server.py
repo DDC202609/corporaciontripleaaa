@@ -2328,6 +2328,10 @@ def post_venta():
     try:
         vid=int(d.get('vehiculo_id')); lista=float(d.get('precio_lista')); descuento=float(d.get('descuento') or 0); prima=float(d.get('prima') or 0); financiado=float(d.get('monto_financiado') or 0); transferencia=float(d.get('transferencia') or 0)
     except (TypeError,ValueError): return jsonify(error='Vehículo, vendedor y valores de venta son obligatorios'),400
+    precio_final_raw=d.get('precio_final')
+    try:
+        precio_final=float(precio_final_raw) if precio_final_raw not in (None,'') else None
+    except (TypeError,ValueError): return jsonify(error='El precio final debe ser un valor numérico.'),400
     factura=(d.get('factura') or '').strip(); nombre=(d.get('cliente_nombre') or '').strip()
     if not nombre: return jsonify(error='Nombre del cliente es obligatorio'),400
     garantia_raw=d.get('garantia_dias')
@@ -2401,8 +2405,17 @@ def post_venta():
         c.close(); return jsonify(error='El precio lista no coincide con el valor registrado en el Kardex'),400
     if lista <= 0:
         c.close(); return jsonify(error='El precio lista debe ser mayor que cero'),400
-    precio=lista-descuento
     if descuento>lista: c.close(); return jsonify(error='El descuento no puede exceder el precio lista'),400
+    precio=lista-descuento if precio_final is None else precio_final
+    if precio<=0:
+        c.close(); return jsonify(error='El precio final debe ser mayor que cero.'),400
+    # Se permite vender por encima del precio lista. Si se vende por debajo,
+    # el descuento debe explicar exactamente la diferencia; no se acepta una
+    # rebaja directa que deje la boleta y la contabilidad sin respaldo.
+    if precio<lista and (descuento<=0 or abs((lista-descuento)-precio)>0.01):
+        c.close(); return jsonify(error='Un precio final menor al precio lista requiere un descuento que cubra la diferencia.'),400
+    if precio>=lista and descuento>0:
+        c.close(); return jsonify(error='El descuento solo aplica cuando el precio final es menor al precio lista.'),400
     if abs(total_pagos-precio)>0.01: c.close(); return jsonify(error='El total de pagos debe cuadrar exactamente con el precio final'),400
     fee_monto=round(precio*fee_pct/100,2) if consignacion else 0
     identidad=(d.get('identidad') or '').strip(); rtn=(d.get('rtn') or '').strip()

@@ -1005,5 +1005,72 @@ renderPurchasePlanning=function(){
   let weeks=purchasePlanningData?.semanas||[];
   $('purchasePlanningWeekly').insertAdjacentHTML('beforeend',`<div class="sub" style="margin:18px 0 8px"><b>Detalle por modelo</b> · ordenado de mayor a menor por Prom. M.</div><table><thead><tr><th>Modelo</th><th>Prom. M.</th>${weeks.map(week=>`<th>${esc(week.inicio)}</th>`).join('')}</tr></thead><tbody>${models.map(model=>`<tr><td><b>${esc(model.modelo)}</b></td><td>${Number(model.promedio_mensual||0).toFixed(2)}</td>${(model.proyeccion||[]).map(week=>`<td>ETA ${Number(week.transito||0)}<br>Taller ${Number(week.taller||0)}<br><b class="${Number(week.faltante_dpv||0)>0?'warn':'good'}">Falt. ${Number(week.faltante_dpv||0).toFixed(2)}</b></td>`).join('')}</tr>`).join('')}</tbody></table>`);
 };
+/* Boleta: el precio final puede aumentar; una rebaja exige descuento explícito. */
+const saleFinalPriceInput=$('saleFinalPrice');
+let saleFinalPriceWasEdited=false;
+if(saleFinalPriceInput){
+  saleFinalPriceInput.readOnly=false;
+  saleFinalPriceInput.name='precio_final';
+  saleFinalPriceInput.type='number';
+  saleFinalPriceInput.min='0.01';
+  saleFinalPriceInput.step='0.01';
+  saleFinalPriceInput.inputMode='decimal';
+  saleFinalPriceInput.closest('.field')?.querySelector('label')?.append(' *');
+  saleFinalPriceInput.addEventListener('input',()=>{
+    let form=$('saleForm'),list=Number(form.elements.precio_lista.value||0),final=Number(saleFinalPriceInput.value||0);
+    if(!Number.isFinite(final)||final<=0)return;
+    form.elements.descuento.value=final<list?(list-final).toFixed(2):'0';
+    saleFinalPriceWasEdited=true;
+    calculateSale();
+  });
+  let listInput=$('saleForm').elements.precio_lista,discountInput=$('saleForm').elements.descuento;
+  listInput.oninput=()=>{saleFinalPriceWasEdited=false;calculateSale()};
+  discountInput.oninput=()=>{saleFinalPriceWasEdited=false;calculateSale()};
+}
+function precioFinalBoleta(){
+  let form=$('saleForm'),list=Number(form.elements.precio_lista.value||0),discount=Number(form.elements.descuento.value||0);
+  return saleFinalPriceWasEdited?Number(saleFinalPriceInput.value||0):Math.max(list-discount,0);
+}
+calculateSale=function(){
+  let form=$('saleForm'),list=Number(form.elements.precio_lista.value||0),discount=Number(form.elements.descuento.value||0),final=precioFinalBoleta(),paid=salePaymentDrafts.reduce((total,payment)=>total+Number(payment.monto||0),0),difference=final-paid;
+  if(!saleFinalPriceWasEdited&&saleFinalPriceInput)saleFinalPriceInput.value=Number.isFinite(final)&&final>0?final.toFixed(2):'';
+  if(form.elements.tipo_venta)form.elements.tipo_venta.value=salePaymentDrafts.some(payment=>payment.tipo_pago==='Financiado')?'Financiada':'Contado';
+  $('saleBalance').value=money(difference);
+  let summary=$('salePaymentDifference');
+  if(!summary){summary=document.createElement('div');summary.id='salePaymentDifference';summary.className='sub';summary.style.cssText='font-weight:700;margin:10px 0 2px';$('salePaymentTotal').insertAdjacentElement('afterend',summary)}
+  let invalidDiscount=final<list&&(discount<=0||Math.abs((list-discount)-final)>0.01),invalidMarkup=final>=list&&discount>0;
+  if(!Number.isFinite(final)||final<=0){summary.textContent='Ingrese un precio final válido.';summary.style.color='#b42318'}
+  else if(invalidDiscount){summary.textContent='Un precio final menor al precio lista requiere un descuento por la misma diferencia.';summary.style.color='#b42318'}
+  else if(invalidMarkup){summary.textContent='El descuento solo aplica cuando el precio final es menor al precio lista.';summary.style.color='#b42318'}
+  else if(Math.abs(difference)<0.01){summary.textContent='Pagos cuadrados con el precio final.';summary.style.color='#087443'}
+  else if(difference>0){summary.textContent='Pendiente por registrar: '+money(difference);summary.style.color='#9a6700'}
+  else{summary.textContent='Los pagos exceden el precio final por '+money(Math.abs(difference))+'. Ajuste o quite un pago.';summary.style.color='#b42318'}
+  if(saleVehicle?.tipo_compra==='Consignación')updateConsignmentFee();
+};
+updateConsignmentFee=function(){let form=$('saleForm'),pct=Number(form?.elements.fee_administrativo_pct?.value||0),target=$('saleConsignmentFee');if(target)target.value=money(Math.max(precioFinalBoleta(),0)*pct/100)};
+const searchSaleVehicleWithEditableFinal=searchSaleVehicle;
+searchSaleVehicle=async function(){saleFinalPriceWasEdited=false;return searchSaleVehicleWithEditableFinal()};
+const loadSalesWithEditableFinal=loadSales;
+loadSales=async function(){saleFinalPriceWasEdited=false;return loadSalesWithEditableFinal()};
+saveSale=async function(event){
+  event.preventDefault();
+  let form=$('saleForm'),seller=(form?.elements.vendedor_nombre?.value||'').trim();
+  if(!seller)return showNotice('Escriba el nombre del vendedor antes de facturar.','error');
+  if(!saleVehicle)return;
+  if(saleVehicle.tipo_compra==='Consignación'&&$('saleConsignmentControl')?.dataset.ready!=='1')return showNotice('Debe presionar “Registrar compra e ingresar al inventario” antes de facturar el vehículo en consignación.','error');
+  let data=Object.fromEntries(new FormData(form).entries());
+  data.vehiculo_id=saleVehicle.id;data.pagos=salePaymentDrafts;
+  for(let field of ['precio_lista','descuento','precio_final'])data[field]=Number(data[field]||0);
+  data.garantia_dias=data.garantia_dias===''?null:Number(data.garantia_dias);data.prima=0;data.monto_financiado=0;data.transferencia=0;
+  let list=data.precio_lista,discount=data.descuento,final=data.precio_final,total=salePaymentDrafts.reduce((sum,payment)=>sum+Number(payment.monto||0),0);
+  if(!Number.isFinite(final)||final<=0)return showNotice('Ingrese un precio final válido.','error');
+  if(final<list&&(discount<=0||Math.abs((list-discount)-final)>0.01))return showNotice('Para vender por debajo del precio lista, registre un descuento por la diferencia exacta.','error');
+  if(final>=list&&discount>0)return showNotice('El descuento solo aplica cuando el precio final es menor al precio lista.','error');
+  if(Math.abs(total-final)>0.01)return showNotice('Los pagos deben cuadrar exactamente con el precio final.','error');
+  let response=await fetch('/api/ventas',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)}),result=await response.json();
+  if(!response.ok)return showNotice(result.error||'No se pudo facturar.','error');
+  showNotice('Venta facturada. Transacción '+result.numero_transaccion+'.');
+  await Promise.all([loadVeh(),dash(),loadSalesHistory()]);openSalePrintChoice(result.id);openDetail(saleVehicle.id);
+};
 dash();
 </script></body></html>
