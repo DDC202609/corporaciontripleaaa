@@ -502,6 +502,10 @@ def init_db(sync_history=True):
     costing_columns={row['name'] for row in c.execute('PRAGMA table_info(costos_adquisicion)')}
     if 'ajuste_compra' not in costing_columns:
         c.execute('ALTER TABLE costos_adquisicion ADD COLUMN ajuste_compra REAL NOT NULL DEFAULT 0')
+    if 'ajuste_cxp_contabilizado' not in costing_columns:
+        # Conserva el importe del ajuste que ya fue llevado a CxP. Así, al
+        # guardar de nuevo el costeo solo se contabiliza la diferencia.
+        c.execute('ALTER TABLE costos_adquisicion ADD COLUMN ajuste_cxp_contabilizado REAL NOT NULL DEFAULT 0')
     if 'placa_nacionalizacion' not in costing_columns:
         c.execute('ALTER TABLE costos_adquisicion ADD COLUMN placa_nacionalizacion TEXT')
     work_columns={row['name'] for row in c.execute('PRAGMA table_info(ordenes_trabajo)')}
@@ -621,6 +625,12 @@ def init_db(sync_history=True):
         id INTEGER PRIMARY KEY AUTOINCREMENT,adquisicion_id INTEGER NOT NULL UNIQUE REFERENCES adquisiciones(id) ON DELETE CASCADE,
         proveedor_id INTEGER NOT NULL REFERENCES proveedores(id),fecha TEXT NOT NULL,monto_original REAL NOT NULL,
         saldo REAL NOT NULL,estado TEXT NOT NULL DEFAULT 'Pendiente',creado_en TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS ajustes_compra_cxp(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        vehiculo_id INTEGER NOT NULL REFERENCES vehiculos(id) ON DELETE CASCADE,
+        adquisicion_id INTEGER NOT NULL REFERENCES adquisiciones(id) ON DELETE CASCADE,
+        fecha TEXT NOT NULL,monto REAL NOT NULL,creado_en TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )''')
     # Las CxP de taller se conservan separadas de las adquisiciones para no
     # alterar la relación histórica obligatoria adquisicion_id de la tabla
     # original. Ambas aparecen unificadas en la cartera.
@@ -1184,6 +1194,50 @@ def contabilizar_adquisicion(c, adquisicion_id):
             VALUES(?,?,?,?,?,?) ON CONFLICT(adquisicion_id) DO UPDATE SET monto_original=excluded.monto_original,saldo=excluded.saldo,estado=excluded.estado''',
             (purchase['id'],purchase['proveedor_id'],purchase['fecha'],saldo,saldo,'Pendiente'))
     registrar_asiento(c,purchase['fecha'],f"Adquisición de vehículo · {purchase['proveedor_nombre']}",'adquisicion',purchase['id'],lineas,purchase['vehiculo_id'])
+
+def contabilizar_ajuste_compra(c, acquisition, vehicle, ajuste_actual, ajuste_contabilizado, fecha):
+    """Capitaliza solo la diferencia del ajuste y la deja en la CxP original.
+
+    El campo de costeo conserva el ajuste total; esta función compara contra el
+    importe ya contabilizado para evitar que cada guardado duplique la deuda.
+    """
+    diferencia=round(float(ajuste_actual or 0)-float(ajuste_contabilizado or 0),2)
+    if abs(diferencia)<0.005:
+        return
+    if acquisition['tipo_compra']=='Consignación' and not int(acquisition['contabilizada'] or 0):
+        raise ValueError('La consignación no puede generar CxP hasta que se convierta en compra.')
+    if vehicle['estado']=='Vendido':
+        raise ValueError('No se puede ajustar una compra de un vehículo vendido.')
+
+    cuenta=c.execute('SELECT * FROM cuentas_por_pagar WHERE adquisicion_id=?',(acquisition['id'],)).fetchone()
+    if cuenta:
+        monto_original=round(float(cuenta['monto_original'] or 0)+diferencia,2)
+        saldo=round(float(cuenta['saldo'] or 0)+diferencia,2)
+        if monto_original<-0.01 or saldo<-0.01:
+            raise ValueError('No puede reducir el ajuste por debajo del saldo ya pagado de la CxP.')
+        estado='Pagada' if saldo<=0.01 else 'Pendiente'
+        c.execute('UPDATE cuentas_por_pagar SET monto_original=?,saldo=?,estado=? WHERE id=?',
+            (max(monto_original,0),max(saldo,0),estado,cuenta['id']))
+    elif diferencia>0:
+        c.execute('''INSERT INTO cuentas_por_pagar(adquisicion_id,proveedor_id,fecha,monto_original,saldo,estado)
+            VALUES(?,?,?,?,?,'Pendiente')''',(acquisition['id'],acquisition['proveedor_id'],fecha,diferencia,diferencia))
+    else:
+        raise ValueError('No existe una CxP para disminuir el ajuste de compra.')
+
+    cur=c.execute('INSERT INTO ajustes_compra_cxp(vehiculo_id,adquisicion_id,fecha,monto) VALUES(?,?,?,?)',
+        (vehicle['id'],acquisition['id'],fecha,diferencia))
+    inventory=cuenta_inventario_por_estado(vehicle['estado'])
+    provider=c.execute('SELECT nombre FROM proveedores WHERE id=?',(acquisition['proveedor_id'],)).fetchone()
+    provider_name=(provider['nombre'] if provider else 'Proveedor')
+    description=f'Ajuste de compra · {provider_name}'
+    if diferencia>0:
+        lineas=[{'cuenta_id':cuenta_contable_id(c,inventory),'debe':diferencia},
+                {'cuenta_id':cuenta_contable_id(c,'cxp'),'haber':diferencia}]
+    else:
+        importe=abs(diferencia)
+        lineas=[{'cuenta_id':cuenta_contable_id(c,'cxp'),'debe':importe},
+                {'cuenta_id':cuenta_contable_id(c,inventory),'haber':importe}]
+    registrar_asiento(c,fecha,description,'ajuste_compra_cxp',cur.lastrowid,lineas,vehicle['id'])
 
 def contabilizar_venta(c, venta_id):
     sale=c.execute('''SELECT ve.*,cl.nombre cliente_nombre,v.estado vehiculo_estado FROM ventas ve
@@ -3492,7 +3546,7 @@ def delete_costo(vid,cid):
 @app.put('/api/vehiculos/<int:vid>/adquisicion')
 def put_adquisicion(vid):
     d=request.get_json(force=True); c=db()
-    vehicle=c.execute('SELECT estado,ubicacion,precio_compra FROM vehiculos WHERE id=?',(vid,)).fetchone()
+    vehicle=c.execute('SELECT id,estado,ubicacion,precio_compra FROM vehiculos WHERE id=?',(vid,)).fetchone()
     if not vehicle:
         c.close(); return jsonify(error='Vehículo no encontrado'),404
     previous=c.execute('SELECT * FROM costos_adquisicion WHERE vehiculo_id=?',(vid,)).fetchone()
@@ -3508,16 +3562,23 @@ def put_adquisicion(vid):
     if estatus not in ('Pendiente','Nacionalizado'):
         c.close(); return jsonify(error='Estatus de nacionalización inválido'),400
     placa=(d.get('placa_nacionalizacion',previous.get('placa_nacionalizacion')) or '').strip().upper()
-    acquisition=c.execute('SELECT tipo_compra FROM adquisiciones WHERE vehiculo_id=?',(vid,)).fetchone()
+    acquisition=c.execute('SELECT * FROM adquisiciones WHERE vehiculo_id=?',(vid,)).fetchone()
     is_import=acquisition and acquisition['tipo_compra']=='Importación'
     if is_import and estatus=='Nacionalizado' and not placa:
         c.close(); return jsonify(error='Ingrese la placa del vehículo al nacionalizar la importación'),400
     if estatus=='Nacionalizado' and placa and not placa_disponible(c,placa,vid):
         c.close(); return jsonify(error='La placa ya está registrada en otro vehículo'),409
     fob=float(vehicle['precio_compra'] or 0)+ajuste; cif=fob+grua+flete; total=cif+isv+std+almacenaje+gastos
+    try:
+        if acquisition:
+            contabilizar_ajuste_compra(c,acquisition,vehicle,ajuste,previous.get('ajuste_cxp_contabilizado') or 0,
+                datetime.now().strftime('%Y-%m-%d'))
+    except ValueError as error:
+        c.rollback(); c.close(); return jsonify(error=str(error)),400
     c.execute('''INSERT INTO costos_adquisicion(vehiculo_id,costo_exw,grua,flete,costo_estimado,ajuste_cif,isv_pagado,cl_std,almacenaje,gastos_aduaneros,estatus,ajuste_compra,placa_nacionalizacion,fecha_actualizacion)
                  VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)
                  ON CONFLICT(vehiculo_id) DO UPDATE SET costo_exw=excluded.costo_exw,grua=excluded.grua,flete=excluded.flete,costo_estimado=excluded.costo_estimado,ajuste_cif=excluded.ajuste_cif,isv_pagado=excluded.isv_pagado,cl_std=excluded.cl_std,almacenaje=excluded.almacenaje,gastos_aduaneros=excluded.gastos_aduaneros,estatus=excluded.estatus,ajuste_compra=excluded.ajuste_compra,placa_nacionalizacion=excluded.placa_nacionalizacion,fecha_actualizacion=CURRENT_TIMESTAMP''',(vid,fob,grua,flete,cif,0,isv,std,almacenaje,gastos,estatus,ajuste,placa or None))
+    c.execute('UPDATE costos_adquisicion SET ajuste_cxp_contabilizado=? WHERE vehiculo_id=?',(ajuste,vid))
     if estatus=='Nacionalizado' and placa:
         c.execute('UPDATE vehiculos SET placa=? WHERE id=?',(placa,vid))
     movimiento='Nacionalización actualizada' if estatus=='Nacionalizado' else 'Costeo actualizado'

@@ -346,6 +346,54 @@ class CriticalFlowsTest(unittest.TestCase):
         self.assertEqual(len(row['proyeccion']),12)
         self.assertEqual(len(data['semanas']),12)
 
+    def test_purchase_adjustment_increases_original_payable_and_posts_once(self):
+        self.login_as_admin()
+        connection = self.server.db()
+        purchase = connection.execute('''SELECT a.*,v.estado,COALESCE(c.ajuste_compra,0) ajuste_compra,
+                COALESCE(c.ajuste_cxp_contabilizado,0) ajuste_cxp_contabilizado,
+                cp.monto_original cxp_monto_original,cp.saldo cxp_saldo
+            FROM adquisiciones a
+            JOIN vehiculos v ON v.id=a.vehiculo_id
+            JOIN cuentas_por_pagar cp ON cp.adquisicion_id=a.id
+            LEFT JOIN costos_adquisicion c ON c.vehiculo_id=a.vehiculo_id
+            WHERE a.tipo_compra<>'Consignación' AND v.estado<>'Vendido'
+            ORDER BY a.id LIMIT 1''').fetchone()
+        self.assertIsNotNone(purchase)
+        target = round(float(purchase['ajuste_compra']) + 1234.5, 2)
+        expected_difference = round(target - float(purchase['ajuste_cxp_contabilizado']), 2)
+        before_original = float(purchase['cxp_monto_original'])
+        before_balance = float(purchase['cxp_saldo'])
+        vehicle_id = purchase['vehiculo_id']
+        response = self.client.put(
+            f'/api/vehiculos/{vehicle_id}/adquisicion', json={'ajuste_compra': target}
+        )
+        self.assertEqual(response.status_code, 200)
+        connection = self.server.db()
+        payable = connection.execute(
+            'SELECT monto_original,saldo FROM cuentas_por_pagar WHERE adquisicion_id=?', (purchase['id'],)
+        ).fetchone()
+        journal = connection.execute('''SELECT a.id FROM asientos_contables a
+            JOIN ajustes_compra_cxp ac ON ac.id=a.referencia_id
+            WHERE a.referencia_tipo='ajuste_compra_cxp' AND ac.adquisicion_id=?
+            ORDER BY a.id DESC LIMIT 1''', (purchase['id'],)).fetchone()
+        lines = connection.execute('''SELECT cc.codigo,p.debe,p.haber FROM partidas p
+            JOIN cuentas_contables cc ON cc.id=p.cuenta_id WHERE p.asiento_id=?''', (journal['id'],)).fetchall()
+        connection.close()
+        self.assertAlmostEqual(payable['monto_original'], before_original + expected_difference, places=2)
+        self.assertAlmostEqual(payable['saldo'], before_balance + expected_difference, places=2)
+        self.assertTrue(any(line['codigo'] == '2101' and line['haber'] == expected_difference for line in lines))
+
+        repeated = self.client.put(
+            f'/api/vehiculos/{vehicle_id}/adquisicion', json={'ajuste_compra': target}
+        )
+        self.assertEqual(repeated.status_code, 200)
+        connection = self.server.db()
+        count = connection.execute(
+            "SELECT COUNT(*) FROM ajustes_compra_cxp WHERE adquisicion_id=?", (purchase['id'],)
+        ).fetchone()[0]
+        connection.close()
+        self.assertEqual(count, 1)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
