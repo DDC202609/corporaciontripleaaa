@@ -382,6 +382,8 @@ class CriticalFlowsTest(unittest.TestCase):
         self.assertAlmostEqual(payable['monto_original'], before_original + expected_difference, places=2)
         self.assertAlmostEqual(payable['saldo'], before_balance + expected_difference, places=2)
         self.assertTrue(any(line['codigo'] == '2101' and line['haber'] == expected_difference for line in lines))
+        vehicle_detail = self.client.get(f'/api/vehiculos/{vehicle_id}').get_json()
+        self.assertAlmostEqual(vehicle_detail['compra']['saldo_cxp'], payable['saldo'], places=2)
 
         repeated = self.client.put(
             f'/api/vehiculos/{vehicle_id}/adquisicion', json={'ajuste_compra': target}

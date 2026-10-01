@@ -3410,6 +3410,8 @@ def get_vehicle(vid):
     movements=c.execute('SELECT * FROM movimientos_vehiculo WHERE vehiculo_id=? ORDER BY fecha DESC,id DESC',(vid,)).fetchall()
     purchase_record=c.execute('''SELECT a.*,p.nombre proveedor_nombre FROM adquisiciones a
         JOIN proveedores p ON p.id=a.proveedor_id WHERE a.vehiculo_id=?''',(vid,)).fetchone()
+    payable_record=c.execute('SELECT monto_original,saldo,estado FROM cuentas_por_pagar WHERE adquisicion_id=?',
+        (purchase_record['id'],)).fetchone() if purchase_record else None
     work_orders=c.execute('SELECT * FROM ordenes_trabajo WHERE vehiculo_id=? ORDER BY fecha DESC,id DESC',(vid,)).fetchall()
     acq=c.execute('SELECT * FROM costos_adquisicion WHERE vehiculo_id=?',(vid,)).fetchone()
     cost_total=c.execute('SELECT COALESCE(SUM(monto),0) FROM costos_vehiculo WHERE vehiculo_id=?',(vid,)).fetchone()[0]
@@ -3428,7 +3430,14 @@ def get_vehicle(vid):
     sale_price=float((sale['precio'] if sale else v['precio_venta']) or 0)
     commission_total=sum(float(x['monto'] or 0) for x in comm)
     base_cost=purchase+acq_total; real_cost=base_cost+float(cost_total or 0); gross=sale_price-real_cost; net=gross-commission_total
-    out=dict(v); out['costos']= [dict(x) for x in costs]; out['movimientos']=[dict(x) for x in movements]; out['compra']=dict(purchase_record) if purchase_record else None; out['ordenes_trabajo']=[dict(x) for x in work_orders]; out['adquisicion']=dict(acq) if acq else None; out['costeo']=costeo; out['costo_adquisicion']=base_cost; out['costo_adicional']=cost_total; out['costo_real']=real_cost; out['desglose_costos']=desglose_costo_consolidado(c,vid)
+    compra=dict(purchase_record) if purchase_record else None
+    if compra and payable_record:
+        # El saldo de adquisición es el original; Kardex debe exponer el saldo
+        # vivo de cartera, que puede cambiar por pagos y ajustes de compra.
+        compra['saldo_cxp']=float(payable_record['saldo'] or 0)
+        compra['monto_cxp']=float(payable_record['monto_original'] or 0)
+        compra['estado_cxp']=payable_record['estado']
+    out=dict(v); out['costos']= [dict(x) for x in costs]; out['movimientos']=[dict(x) for x in movements]; out['compra']=compra; out['ordenes_trabajo']=[dict(x) for x in work_orders]; out['adquisicion']=dict(acq) if acq else None; out['costeo']=costeo; out['costo_adquisicion']=base_cost; out['costo_adicional']=cost_total; out['costo_real']=real_cost; out['desglose_costos']=desglose_costo_consolidado(c,vid)
     out['venta']=dict(sale) if sale else None; out['comisiones']=[dict(x) for x in comm]
     out['precio_venta_calculado']=sale_price; out['comision_total']=commission_total; out['utilidad_bruta']=gross; out['utilidad_real']=net
     out['margen_real']= (net/sale_price*100) if sale_price else 0

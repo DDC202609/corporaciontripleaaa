@@ -1119,5 +1119,15 @@ openSaleLedgerDetail=async function(id){
   let content=$('saleDetailContent');
   if(content&&!$('saleDetailSellerEditButton'))content.insertAdjacentHTML('afterbegin',`<div class="actions" style="margin-top:0;margin-bottom:14px"><button id="saleDetailSellerEditButton" class="btn2" type="button" onclick="openSaleSellerEdit(${Number(id)})">Modificar vendedor</button></div>`);
 };
+/* Kardex muestra el saldo vigente de CxP, no el saldo inicial de la compra. */
+const loadKardexWithLivePayable=loadKardexVehicle;
+loadKardexVehicle=async function(){
+  await loadKardexWithLivePayable();
+  let id=$('kardexVehicleId')?.value||$('kardexVehicle')?.value;
+  if(!id)return;
+  let vehicle=await get('/api/vehiculos/'+id),summary=$('kardexSummary');
+  let card=[...summary.querySelectorAll('.kpi')].find(item=>item.querySelector('.label')?.textContent.trim()==='Pendiente de pago');
+  if(card)card.querySelector('b').textContent=money(vehicle.compra?.saldo_cxp??vehicle.compra?.saldo??0);
+};
 dash();
 </script></body></html>
