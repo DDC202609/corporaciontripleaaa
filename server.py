@@ -1679,7 +1679,9 @@ def dashboard():
         'mes':current_month,
         'dpv':statuses['dpv'],'transito':statuses['transito'],'taller':statuses['taller'],'consignacion':statuses['consignacion'],
         'inventario_por_tipo':sorted(({'tipo_vehiculo':row['tipo_vehiculo'],'cantidad':row['cantidad'],'costo':round(row['costo'],2)} for row in inventory_by_type.values()),key=lambda row:row['tipo_vehiculo']),
-        'top_modelos':sorted(summarize(list(models.values())),key=lambda row:row['venta'],reverse=True)[:10],
+        # El resumen por marca considera todas las ventas; el de modelos debe
+        # usar la misma base para que ambos totales mensuales concilien.
+        'top_modelos':sorted(summarize(list(models.values())),key=lambda row:row['venta'],reverse=True),
         'ventas_por_marca':sorted(summarize(list(brands.values())),key=lambda row:row['venta'],reverse=True),
         'ventas_por_vendedor':sorted(summarize(list(sellers.values())),key=lambda row:row['venta'],reverse=True),
         # Se mantienen estas claves para consumidores existentes de la API.
