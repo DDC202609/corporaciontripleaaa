@@ -3,6 +3,7 @@ from werkzeug.exceptions import HTTPException
 from werkzeug.security import check_password_hash, generate_password_hash
 import sqlite3, os, shutil, uuid, hmac, io, json, tempfile, zipfile, re, csv
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 ROOT=os.path.dirname(os.path.abspath(__file__))
 BUNDLED_DATA=os.path.join(ROOT,'data')
 DATA_DIR=os.environ.get('DATA_DIR', BUNDLED_DATA)
@@ -25,6 +26,11 @@ else:
 app=Flask(__name__)
 app.config.update(SECRET_KEY=SECRET_KEY,SESSION_COOKIE_HTTPONLY=True,SESSION_COOKIE_SAMESITE='Lax',SESSION_COOKIE_SECURE=os.environ.get('SESSION_COOKIE_SECURE','').lower() in {'1','true','yes'})
 ESTADOS_VEHICULO=('En Tránsito','Nacionalizado','En Taller','DPV','Reservado','Vendido')
+ZONA_HORARIA_OPERACION=ZoneInfo('America/Tegucigalpa')
+
+def ahora_operacion():
+    """Fecha y hora que rigen los períodos operativos de Corporación Triple AAA."""
+    return datetime.now(ZONA_HORARIA_OPERACION)
 
 # Módulos que se pueden asignar a un perfil.  Los permisos se validan tanto en
 # la interfaz como en cada solicitud al servidor.
@@ -1631,7 +1637,9 @@ def dashboard():
         entry['cantidad']+=1
         entry['costo']+=costo_consolidado(c,vehicle['id'])
 
-    current_month=datetime.now().strftime('%Y-%m')
+    # Render ejecuta en UTC; el período comercial debe cambiar con la hora de
+    # Honduras, no al iniciar el siguiente día UTC.
+    current_month=ahora_operacion().strftime('%Y-%m')
     sales=[dict(row) for row in c.execute('''SELECT v.*,ve.vin,ve.marca,ve.modelo,ve.version,ve.anio,ven.nombre vendedor_nombre
         FROM ventas v JOIN vehiculos ve ON ve.id=v.vehiculo_id LEFT JOIN vendedores ven ON ven.id=v.vendedor_id
         WHERE substr(v.fecha,1,7)=? AND (v.factura IS NOT NULL OR v.estado IN ('Facturada','Vendido'))''',(current_month,)).fetchall()]
