@@ -1093,5 +1093,31 @@ dash=async function(){
     $('dashboardReports').innerHTML=[executiveDashboardTable('Modelos con mayor venta',[{label:'Modelo',value:row=>esc(row.modelo)},{label:'Unidades',value:row=>row.cantidad},{label:'Costo',value:row=>money(row.costo)},{label:'Venta',value:row=>money(row.venta)},{label:'Margen',value:row=>executiveMargin(row.margen_pct)}],data.top_modelos||[]),executiveDashboardTable(`Ventas por marca · ${esc(data.mes||'período actual')}`,[{label:'Marca',value:row=>esc(row.marca)},{label:'Costo',value:row=>money(row.costo)},{label:'Venta',value:row=>money(row.venta)},{label:'Margen',value:row=>executiveMargin(row.margen_pct)}],data.ventas_por_marca||[]),executiveDashboardTable('Desempeño comercial por vendedor',[{label:'Vendedor',value:row=>esc(row.vendedor)},{label:'Costo',value:row=>money(row.costo)},{label:'Venta',value:row=>money(row.venta)},{label:'Margen',value:row=>executiveMargin(row.margen_pct)}],data.ventas_por_vendedor||[],true)].join('');
   }catch(error){console.error('No fue posible actualizar el período del Dashboard',error);showNotice('No se pudo cargar el período seleccionado.','error')}
 };
+/* Boleta facturada: solo se permite corregir el vendedor asignado. */
+if(!$('saleSellerEditModal'))document.body.insertAdjacentHTML('beforeend',`<div id="saleSellerEditModal" class="modal hidden"><div class="modalbox" style="max-width:520px"><div class="modalhead"><div><h2 style="margin:0">Modificar vendedor</h2><div id="saleSellerEditInfo" class="sub"></div></div><button class="close" type="button" onclick="closeSaleSellerEdit()">×</button></div><form id="saleSellerEditForm" onsubmit="saveSaleSellerEdit(event)"><div class="field"><label>Vendedor activo *</label><input name="vendedor_nombre" list="saleSellerEditOptions" autocomplete="off" required placeholder="Digite o seleccione el vendedor"><datalist id="saleSellerEditOptions"></datalist><div class="sub" style="margin-top:6px">Esta es la única modificación disponible para una boleta facturada.</div></div><div class="actions"><button class="btn2" type="button" onclick="closeSaleSellerEdit()">Cancelar</button><button class="primary">Guardar vendedor</button></div></form></div></div>`);
+let saleSellerEditId=null;
+async function openSaleSellerEdit(id){
+  let [sale,sellers]=await Promise.all([get('/api/ventas/'+id),get('/api/ventas/vendedores-activos')]);
+  if(sale.error)return showNotice(sale.error,'error');
+  saleSellerEditId=Number(id);let form=$('saleSellerEditForm');form.reset();
+  form.elements.vendedor_nombre.value=sale.vendedor_nombre||'';
+  $('saleSellerEditOptions').innerHTML=sellers.map(seller=>`<option value="${esc(seller.nombre)}"></option>`).join('');
+  $('saleSellerEditInfo').textContent=`${sale.numero_transaccion||'Venta'} · ${sale.vin||''} · vendedor actual: ${sale.vendedor_nombre||'Sin asignar'}`;
+  $('saleSellerEditModal').classList.remove('hidden');
+}
+function closeSaleSellerEdit(){$('saleSellerEditModal').classList.add('hidden');saleSellerEditId=null}
+async function saveSaleSellerEdit(event){
+  event.preventDefault();if(!saleSellerEditId)return;
+  let vendedor_nombre=event.target.elements.vendedor_nombre.value.trim(),response=await fetch('/api/ventas/'+saleSellerEditId+'/vendedor',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({vendedor_nombre})}),result=await response.json();
+  if(!response.ok)return showNotice(result.error||'No se pudo actualizar el vendedor.','error');
+  let saleId=saleSellerEditId;closeSaleSellerEdit();showNotice('Vendedor de la boleta actualizado.');
+  await Promise.all([loadSalesHistory(),dash()]);await openSaleLedgerDetail(saleId);
+}
+const openSaleLedgerDetailWithSellerEdit=openSaleLedgerDetail;
+openSaleLedgerDetail=async function(id){
+  await openSaleLedgerDetailWithSellerEdit(id);
+  let content=$('saleDetailContent');
+  if(content&&!$('saleDetailSellerEditButton'))content.insertAdjacentHTML('afterbegin',`<div class="actions" style="margin-top:0;margin-bottom:14px"><button id="saleDetailSellerEditButton" class="btn2" type="button" onclick="openSaleSellerEdit(${Number(id)})">Modificar vendedor</button></div>`);
+};
 dash();
 </script></body></html>

@@ -2301,6 +2301,23 @@ def get_venta(sid):
     data['pagos']=[dict(row) for row in c.execute('SELECT * FROM pagos_venta WHERE venta_id=? ORDER BY id',(sid,)).fetchall()]
     c.close(); return jsonify(data)
 
+@app.put('/api/ventas/<int:sid>/vendedor')
+def actualizar_vendedor_venta(sid):
+    """La única corrección permitida sobre una boleta ya facturada es su vendedor."""
+    data=request.get_json(silent=True) or {}
+    nombre=' '.join(str(data.get('vendedor_nombre') or '').split())
+    if not nombre:
+        return jsonify(error='Ingrese el nombre del vendedor.'),400
+    c=db(); sale=c.execute('SELECT id FROM ventas WHERE id=?',(sid,)).fetchone()
+    if not sale:
+        c.close(); return jsonify(error='Venta no encontrada.'),404
+    seller=c.execute('''SELECT id,nombre FROM vendedores
+        WHERE activo=1 AND lower(trim(nombre))=lower(?)''',(nombre,)).fetchone()
+    if not seller:
+        c.close(); return jsonify(error='El nombre ingresado no corresponde a un vendedor activo.'),400
+    c.execute('UPDATE ventas SET vendedor_id=? WHERE id=?',(seller['id'],sid))
+    c.commit(); c.close(); return jsonify(ok=True,vendedor_id=seller['id'],vendedor_nombre=seller['nombre'])
+
 @app.get('/api/vehiculos/placa/<placa>')
 def get_vehiculo_placa(placa):
     c=db(); v=c.execute('SELECT * FROM vehiculos WHERE UPPER(placa)=?',(placa.strip().upper(),)).fetchone()
