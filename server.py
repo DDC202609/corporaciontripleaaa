@@ -1638,8 +1638,13 @@ def dashboard():
         entry['costo']+=costo_consolidado(c,vehicle['id'])
 
     # Render ejecuta en UTC; el período comercial debe cambiar con la hora de
-    # Honduras, no al iniciar el siguiente día UTC.
-    current_month=ahora_operacion().strftime('%Y-%m')
+    # Honduras, no al iniciar el siguiente día UTC. El usuario puede consultar
+    # cualquier mes desde el Dashboard sin modificar datos operativos.
+    default_month=ahora_operacion().strftime('%Y-%m')
+    requested_month=(request.args.get('mes') or '').strip()
+    if requested_month and not re.fullmatch(r'\d{4}-(0[1-9]|1[0-2])',requested_month):
+        c.close(); return jsonify(error='El período debe tener el formato AAAA-MM.'),400
+    current_month=requested_month or default_month
     sales=[dict(row) for row in c.execute('''SELECT v.*,ve.vin,ve.marca,ve.modelo,ve.version,ve.anio,ven.nombre vendedor_nombre
         FROM ventas v JOIN vehiculos ve ON ve.id=v.vehiculo_id LEFT JOIN vendedores ven ON ven.id=v.vendedor_id
         WHERE substr(v.fecha,1,7)=? AND (v.factura IS NOT NULL OR v.estado IN ('Facturada','Vendido'))''',(current_month,)).fetchall()]

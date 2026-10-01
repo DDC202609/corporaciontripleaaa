@@ -1072,5 +1072,26 @@ saveSale=async function(event){
   showNotice('Venta facturada. Transacción '+result.numero_transaccion+'.');
   await Promise.all([loadVeh(),dash(),loadSalesHistory()]);openSalePrintChoice(result.id);openDetail(saleVehicle.id);
 };
+/* Dashboard: consulta mensual, iniciando por defecto en el período actual. */
+let dashboardSelectedMonth='';
+function dashboardPeriodControl(month){
+  let period=$('dashboardPeriod'),box=period?.closest('.executive-period');
+  if(!box)return;
+  box.innerHTML=`<label for="dashboardPeriod" style="display:block">Período de análisis</label><input id="dashboardPeriod" type="month" value="${esc(month||'')}" aria-label="Período de análisis" onchange="changeDashboardPeriod(this.value)">`;
+}
+function changeDashboardPeriod(month){dashboardSelectedMonth=String(month||'').trim();dash()}
+const dashWithSelectedPeriod=dash;
+dash=async function(){
+  await dashWithSelectedPeriod();
+  try{
+    let query=dashboardSelectedMonth?`?mes=${encodeURIComponent(dashboardSelectedMonth)}`:'';
+    let [data,inventory]=await Promise.all([get('/api/dashboard'+query),get('/api/inventario')]);
+    if(!dashboardSelectedMonth)dashboardSelectedMonth=data.mes||'';
+    dashboardPeriodControl(data.mes||dashboardSelectedMonth);
+    let accountingInventory=inventory.filter(row=>row.estado!=='Vendido'&&!row.es_consignacion),dpvRows=accountingInventory.filter(row=>row.estado==='DPV'),totalCost=accountingInventory.reduce((sum,row)=>sum+Number(row.costo_total||0),0),projected=dpvRows.reduce((sum,row)=>sum+Number(row.precio_venta||0),0)+Number(data.transito?.costo||0)+Number(data.taller?.costo||0),cards=[['DPV',data.dpv,'dpv'],['En Tránsito',data.transito,'transit'],['En Taller',data.taller,'workshop'],['Consignación',data.consignacion,'consignment'],['Total inventario',{cantidad:accountingInventory.length,costo:totalCost,total_proyectado:projected},'total']];
+    $('dashboardStatuses').innerHTML=cards.map(([label,value,key])=>`<div class="card dashboard-status executive-card card-${key}"><div class="card-top"><div class="card-label">${label}</div><div class="card-count">${Number(value?.cantidad||0)}</div></div><div class="card-divider"></div><div class="dashboard-cost"><div>${key==='consignment'?'Valor consignado':'Costo acumulado'}<b>${money(value?.costo||0)}</b></div>${key==='total'?`<div>Total proyectado<b>${money(value?.total_proyectado||0)}</b></div>`:''}</div></div>`).join('');
+    $('dashboardReports').innerHTML=[executiveDashboardTable('Modelos con mayor venta',[{label:'Modelo',value:row=>esc(row.modelo)},{label:'Unidades',value:row=>row.cantidad},{label:'Costo',value:row=>money(row.costo)},{label:'Venta',value:row=>money(row.venta)},{label:'Margen',value:row=>executiveMargin(row.margen_pct)}],data.top_modelos||[]),executiveDashboardTable(`Ventas por marca · ${esc(data.mes||'período actual')}`,[{label:'Marca',value:row=>esc(row.marca)},{label:'Costo',value:row=>money(row.costo)},{label:'Venta',value:row=>money(row.venta)},{label:'Margen',value:row=>executiveMargin(row.margen_pct)}],data.ventas_por_marca||[]),executiveDashboardTable('Desempeño comercial por vendedor',[{label:'Vendedor',value:row=>esc(row.vendedor)},{label:'Costo',value:row=>money(row.costo)},{label:'Venta',value:row=>money(row.venta)},{label:'Margen',value:row=>executiveMargin(row.margen_pct)}],data.ventas_por_vendedor||[],true)].join('');
+  }catch(error){console.error('No fue posible actualizar el período del Dashboard',error);showNotice('No se pudo cargar el período seleccionado.','error')}
+};
 dash();
 </script></body></html>
