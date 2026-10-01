@@ -1655,7 +1655,10 @@ def dashboard():
         model=(sale.get('modelo') or 'Sin modelo').strip() or 'Sin modelo'
         model_entry=models.setdefault(model,{'modelo':model,'cantidad':0,'costo':0.0,'venta':0.0})
         brand=(sale.get('marca') or 'Sin marca').strip() or 'Sin marca'
-        brand_entry=brands.setdefault(brand,{'marca':brand,'cantidad':0,'costo':0.0,'venta':0.0})
+        # Las marcas históricas pueden estar cargadas como Toyota, TOYOTA o
+        # toyota. La agrupación comercial debe tratarlas como una sola marca.
+        brand_key=brand.casefold()
+        brand_entry=brands.setdefault(brand_key,{'marca':brand.upper(),'cantidad':0,'costo':0.0,'venta':0.0})
         # Las ventas históricas no tenían vendedor; se mantienen claramente
         # separadas de las nuevas ventas que sí lo requieren.
         seller=sale.get('vendedor_nombre') or 'Sin vendedor asignado'
