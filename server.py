@@ -2887,13 +2887,14 @@ def get_planificacion_financiera():
     """Compromisos proyectados; es una vista y no genera CxP ni asientos."""
     c=db()
     transit=c.execute('''SELECT a.id,a.fecha_llegada_estimada fecha_compromiso,a.fecha fecha_origen,
-            a.saldo pendiente,a.costo_compra monto_original,a.anticipo anticipos,
+            COALESCE(cp.saldo,a.saldo) pendiente,COALESCE(cp.monto_original,a.costo_compra) monto_original,a.anticipo anticipos,
             a.metodo_pago,a.condicion_pago,v.vin,v.marca,v.modelo,p.nombre proveedor,
             'Adquisición' origen,'En Tránsito' etapa
         FROM adquisiciones a
         JOIN vehiculos v ON v.id=a.vehiculo_id
         JOIN proveedores p ON p.id=a.proveedor_id
-        WHERE v.estado='En Tránsito' AND ROUND(COALESCE(a.saldo,0),2)>0
+        LEFT JOIN cuentas_por_pagar cp ON cp.adquisicion_id=a.id
+        WHERE v.estado='En Tránsito' AND ROUND(COALESCE(cp.saldo,a.saldo,0),2)>0
         ORDER BY COALESCE(a.fecha_llegada_estimada,a.fecha),a.id''').fetchall()
     workshop=c.execute('''SELECT o.id,o.fecha_entrega_estimada fecha_compromiso,o.fecha fecha_origen,
             o.valor_negociado monto_original,COALESCE(SUM(ao.monto),0) anticipos,

@@ -511,6 +511,31 @@ class CriticalFlowsTest(unittest.TestCase):
             self.assertTrue(row['vin'])
             self.assertIn(row['cuenta_esperada'], ('DPV', 'En Taller', 'En Tránsito'))
 
+    def test_financial_planning_uses_the_current_purchase_payable_balance(self):
+        self.login_as_admin()
+        connection = self.server.db()
+        purchase = connection.execute('''SELECT a.id,a.vehiculo_id,a.proveedor_id,a.fecha
+            FROM adquisiciones a
+            JOIN vehiculos v ON v.id=a.vehiculo_id
+            WHERE a.tipo_compra<>'Consignación'
+            ORDER BY a.id LIMIT 1''').fetchone()
+        self.assertIsNotNone(purchase)
+        expected = 4321.45
+        connection.execute("UPDATE vehiculos SET estado='En Tránsito' WHERE id=?", (purchase['vehiculo_id'],))
+        connection.execute('''INSERT INTO cuentas_por_pagar(adquisicion_id,proveedor_id,fecha,monto_original,saldo,estado)
+            VALUES(?,?,?,?,?,'Pendiente')
+            ON CONFLICT(adquisicion_id) DO UPDATE SET monto_original=excluded.monto_original,
+                saldo=excluded.saldo,estado='Pendiente' ''',
+            (purchase['id'], purchase['proveedor_id'], purchase['fecha'], expected, expected))
+        connection.commit()
+        connection.close()
+
+        response = self.client.get('/api/planificacion-financiera')
+        self.assertEqual(response.status_code, 200)
+        commitment = next(row for row in response.get_json()['compromisos']
+                          if row['origen'] == 'Adquisición' and row['id'] == purchase['id'])
+        self.assertAlmostEqual(commitment['pendiente'], expected, places=2)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
