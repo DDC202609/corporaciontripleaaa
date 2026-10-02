@@ -1239,7 +1239,7 @@ def contabilizar_ajuste_compra(c, acquisition, vehicle, ajuste_actual, ajuste_co
                 {'cuenta_id':cuenta_contable_id(c,inventory),'haber':importe}]
     registrar_asiento(c,fecha,description,'ajuste_compra_cxp',cur.lastrowid,lineas,vehicle['id'])
 
-def contabilizar_venta(c, venta_id):
+def contabilizar_venta(c, venta_id, inventario_origen=None):
     sale=c.execute('''SELECT ve.*,cl.nombre cliente_nombre,v.estado vehiculo_estado FROM ventas ve
         JOIN vehiculos v ON v.id=ve.vehiculo_id
         LEFT JOIN clientes cl ON cl.id=ve.cliente_id WHERE ve.id=?''',(venta_id,)).fetchone()
@@ -1272,7 +1272,9 @@ def contabilizar_venta(c, venta_id):
         # El costo debe salir de la cuenta donde la unidad estaba al facturarse,
         # no de su tipo de compra original. Una importación ya nacionalizada y
         # DPV, por ejemplo, se mantiene en Inventario DPV hasta su venta.
-        inventory_key=cuenta_inventario_por_estado(sale['vehiculo_estado'])
+        # Al facturar, la etapa del vehículo ya cambió a "Vendido". Por eso
+        # el origen se recibe desde el flujo de venta, antes de ese cambio.
+        inventory_key=cuenta_inventario_por_estado(inventario_origen or sale['vehiculo_estado'])
         lines_cost=[{'cuenta_id':cuenta_contable_id(c,'costo_ventas'),'debe':cost},{'cuenta_id':cuenta_contable_id(c,inventory_key),'haber':cost}]
         registrar_asiento(c,sale['fecha'],f"Costo de venta · {sale['numero_transaccion'] or sale['factura']}",'venta_costo',sale['id'],lines_cost,sale['vehiculo_id'])
     fee=round(float(sale['fee_administrativo_monto'] or 0),2)
@@ -1290,6 +1292,29 @@ def contabilizar_venta(c, venta_id):
                 {'cuenta_id':cuenta_contable_id(c,'otros_ingresos'),'haber':fee},
             ],sale['vehiculo_id'])
 
+def corregir_costo_ventas_desde_transito(c):
+    """Reclasifica ventas históricas que usaron Tránsito por una etapa vendida.
+
+    Antes se determinaba la cuenta después de marcar la unidad como Vendida y
+    el valor por defecto terminaba siendo 1105. Se corrigen solo pólizas de
+    costo de venta cuyo movimiento de venta conserva una etapa anterior válida.
+    """
+    transito_id=cuenta_contable_id(c,'inventario_transito')
+    rows=c.execute('''SELECT p.id partida_id,ve.vehiculo_id,ve.factura
+        FROM partidas p
+        JOIN asientos_contables a ON a.id=p.asiento_id
+        JOIN ventas ve ON ve.id=a.referencia_id
+        WHERE a.referencia_tipo='venta_costo' AND p.cuenta_id=? AND p.haber>0''',(transito_id,)).fetchall()
+    for row in rows:
+        movement=c.execute('''SELECT estado_anterior FROM movimientos_vehiculo
+            WHERE vehiculo_id=? AND tipo='Venta facturada' AND referencia=?
+            ORDER BY id DESC LIMIT 1''',(row['vehiculo_id'],row['factura'])).fetchone()
+        origin=movement['estado_anterior'] if movement else None
+        if origin not in ('DPV','En Taller'):
+            continue
+        target=cuenta_contable_id(c,cuenta_inventario_por_estado(origin))
+        c.execute('UPDATE partidas SET cuenta_id=? WHERE id=?',(target,row['partida_id']))
+
 def sincronizar_contabilidad_historica(c):
     """Genera una vez los asientos y saldos para documentos existentes."""
     # Las adquisiciones históricas migradas ya tienen una póliza propia contra
@@ -1299,13 +1324,21 @@ def sincronizar_contabilidad_historica(c):
           AND COALESCE(metodo_pago,'')<>'Cambio'
         ORDER BY id""").fetchall():
         contabilizar_adquisicion(c,row['id'])
-    for row in c.execute('SELECT id FROM ventas ORDER BY id').fetchall():
-        contabilizar_venta(c,row['id'])
+    for row in c.execute('SELECT id,vehiculo_id,factura FROM ventas ORDER BY id').fetchall():
+        movimiento=c.execute('''SELECT estado_anterior FROM movimientos_vehiculo
+            WHERE vehiculo_id=? AND tipo='Venta facturada' AND referencia=?
+            ORDER BY id DESC LIMIT 1''',(row['vehiculo_id'],row['factura'])).fetchone()
+        origen=movimiento['estado_anterior'] if movimiento else None
+        contabilizar_venta(c,row['id'],origen)
 
 # Gunicorn importa ``server:app`` y no ejecuta el bloque __main__.  Las
 # migraciones deben correr durante la importación para que un despliegue nuevo
 # use el mismo esquema que el entorno local. Todas son idempotentes.
 init_db(sync_history=False)
+correction_connection=db()
+corregir_costo_ventas_desde_transito(correction_connection)
+correction_connection.commit()
+correction_connection.close()
 init_access_control_schema()
 
 def recalcular_estado(c, vehiculo_id, motivo='Actualización automática de etapa'):
@@ -2570,7 +2603,7 @@ def post_venta():
     c.execute('UPDATE vehiculos SET precio_venta=? WHERE id=?',(precio,vid))
     recalcular_estado(c,vid,'Venta facturada')
     add_movimiento(c,vid,d.get('fecha') or datetime.now().strftime('%Y-%m-%d'),'Venta facturada',vehicle['estado'],'Vendido',vehicle['ubicacion'],vehicle['ubicacion'],referencia=factura,observaciones=f'Factura {factura}. Precio final: {precio:.2f}; pagos registrados: {total_pagos:.2f}')
-    contabilizar_venta(c,cur.lastrowid)
+    contabilizar_venta(c,cur.lastrowid,vehicle['estado'])
     c.commit(); c.close(); return jsonify(id=cur.lastrowid,numero_transaccion=numero),201
 
 @app.delete('/api/ventas/<int:sid>')

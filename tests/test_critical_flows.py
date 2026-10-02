@@ -441,6 +441,55 @@ class CriticalFlowsTest(unittest.TestCase):
         connection.close()
         self.assertEqual(count, 1)
 
+    def test_sale_cost_credits_the_vehicle_inventory_stage_not_transit(self):
+        self.login_as_admin()
+        connection = self.server.db()
+        vehicle = connection.execute('''SELECT v.id,v.precio_venta FROM vehiculos v
+            WHERE v.estado='DPV' AND NOT EXISTS(
+                SELECT 1 FROM ventas ve WHERE ve.vehiculo_id=v.id
+            ) ORDER BY v.id LIMIT 1''').fetchone()
+        seller = connection.execute(
+            'SELECT nombre FROM vendedores WHERE activo=1 ORDER BY id LIMIT 1'
+        ).fetchone()
+        connection.close()
+        self.assertIsNotNone(vehicle)
+        self.assertIsNotNone(seller)
+        price = float(vehicle['precio_venta'] or 300000)
+
+        response = self.client.post('/api/ventas', json={
+            'vehiculo_id': vehicle['id'],
+            'precio_lista': price,
+            'precio_final': price,
+            'descuento': 0,
+            'prima': price,
+            'monto_financiado': 0,
+            'transferencia': 0,
+            'cliente_nombre': 'Cliente QA costo de venta',
+            'vendedor_nombre': seller['nombre'],
+            'fecha': '2026-10-01',
+            'pagos': [{'tipo_pago': 'Efectivo', 'monto': price, 'referencia': ''}],
+        })
+        self.assertEqual(response.status_code, 201, response.get_json())
+        sale_id = response.get_json()['id']
+        connection = self.server.db()
+        cost_line = connection.execute('''SELECT p.id,cc.codigo FROM partidas p
+            JOIN asientos_contables a ON a.id=p.asiento_id
+            JOIN cuentas_contables cc ON cc.id=p.cuenta_id
+            WHERE a.referencia_tipo='venta_costo' AND a.referencia_id=? AND p.haber>0''',
+            (sale_id,)).fetchone()
+        self.assertEqual(cost_line['codigo'], '1103')
+
+        # La reparación histórica solo reclasifica la línea errónea; no crea
+        # una póliza adicional ni modifica los débitos de la venta.
+        transit_id = self.server.cuenta_contable_id(connection, 'inventario_transito')
+        connection.execute('UPDATE partidas SET cuenta_id=? WHERE id=?', (transit_id, cost_line['id']))
+        self.server.corregir_costo_ventas_desde_transito(connection)
+        repaired = connection.execute('''SELECT cc.codigo FROM partidas p
+            JOIN cuentas_contables cc ON cc.id=p.cuenta_id WHERE p.id=?''',
+            (cost_line['id'],)).fetchone()
+        connection.close()
+        self.assertEqual(repaired['codigo'], '1103')
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
