@@ -1129,5 +1129,18 @@ loadKardexVehicle=async function(){
   let card=[...summary.querySelectorAll('.kpi')].find(item=>item.querySelector('.label')?.textContent.trim()==='Pendiente de pago');
   if(card)card.querySelector('b').textContent=money(vehicle.compra?.saldo_cxp??vehicle.compra?.saldo??0);
 };
+/* Una CxP de repuesto puede corregirse sin borrar su factura ni su costo. */
+const renderPortfolioWithPaymentReversal=renderPortfolio;
+renderPortfolio=function(){
+  if(portfolioTab!=='cxp')return renderPortfolioWithPaymentReversal();
+  let rows=portfolioData.cxp||[],pending=rows.reduce((sum,row)=>sum+Number(row.saldo||0),0);
+  $('portfolioContent').innerHTML=`<div class="kpis"><div class="kpi"><div class="label">Saldo pendiente de pago</div><b>${money(pending)}</b></div></div>${reportTable(rows,[{label:'Fecha',value:row=>esc(row.fecha)},{label:'Origen',value:row=>esc(row.origen)},{label:'Documento',value:row=>esc(row.documento||'—')},{label:'Proveedor',value:row=>esc(row.proveedor_nombre||'—')},{label:'Vehículo',value:row=>esc(`${row.vin||'—'} · ${row.marca||''} ${row.modelo||''}`)},{label:'Saldo',value:row=>money(row.saldo)},{label:'Estado',value:row=>`<span class="pill">${esc(row.estado)}</span>`},{label:'',value:row=>{let actions=[];if(Number(row.saldo)>0)actions.push(`<button class="primary" type="button" onclick="openPortfolioPayment('${row.pago_tipo}','${row.pago_id}',${Number(row.saldo)})">Registrar pago</button>`);if(row.origen==='Repuesto / OT'&&row.ultimo_pago_id)actions.push(`<button class="btn2" type="button" onclick="reversePartsPayablePayment(${Number(row.id)},${Number(row.ultimo_pago_id)},'${esc(row.documento||'')}', '${esc(row.vin||'')}')">Reversar último pago</button>`);return actions.join(' ')||'—'}}])}`;
+};
+async function reversePartsPayablePayment(cxpId,paymentId,documento,vin){
+  if(!confirm(`¿Reversar el último pago de la factura ${documento} · ${vin}? Se eliminará únicamente su movimiento de caja y asiento.`))return;
+  let response=await fetch(`/api/cuentas-por-pagar-repuestos/${cxpId}/pagos/${paymentId}`,{method:'DELETE'}),result=await response.json();
+  if(!response.ok)return showNotice(result.error||'No se pudo reversar el pago.','error');
+  showNotice(`Pago reversado. ${result.documento} volvió a CxP pendiente.`);await Promise.all([loadPortfolio(),dash()]);
+}
 dash();
 </script></body></html>

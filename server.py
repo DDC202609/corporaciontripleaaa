@@ -2043,7 +2043,9 @@ def cuentas_por_pagar_taller():
 
 @app.get('/api/cuentas-por-pagar-repuestos')
 def cuentas_por_pagar_repuestos():
-    c=db(); rows=c.execute('''SELECT cp.*,p.nombre proveedor_nombre,r.factura,o.numero_ot,v.vin,v.marca,v.modelo
+    c=db(); rows=c.execute('''SELECT cp.*,p.nombre proveedor_nombre,r.factura,o.numero_ot,v.vin,v.marca,v.modelo,
+            (SELECT pp.id FROM pagos_cuentas_por_pagar_repuestos_ot pp
+             WHERE pp.cuenta_por_pagar_repuesto_id=cp.id ORDER BY pp.id DESC LIMIT 1) ultimo_pago_id
         FROM cuentas_por_pagar_repuestos_ot cp JOIN proveedores p ON p.id=cp.proveedor_id
         JOIN repuestos_ot r ON r.id=cp.repuesto_ot_id JOIN ordenes_trabajo o ON o.id=r.orden_trabajo_id
         JOIN vehiculos v ON v.id=o.vehiculo_id ORDER BY cp.fecha DESC,cp.id DESC''').fetchall(); c.close(); return jsonify([dict(row) for row in rows])
@@ -2139,6 +2141,38 @@ def registrar_pago_cxp_repuesto(cid):
     lineas=[{'cuenta_id':cuenta_contable_id(c,'cxp'),'debe':monto},{'cuenta_id':cuenta_contable_id(c,'caja_bancos'),'haber':monto}]
     registrar_asiento(c,fecha,descripcion,'pago_cxp_repuesto',cur.lastrowid,lineas,account['vehiculo_id'])
     c.commit(); c.close(); return jsonify(ok=True,saldo=max(saldo,0),estado=estado),201
+
+@app.delete('/api/cuentas-por-pagar-repuestos/<int:cid>/pagos/<int:payment_id>')
+def reversar_pago_cxp_repuesto(cid,payment_id):
+    """Deshace un pago registrado por error sin borrar la factura de repuesto.
+
+    Se elimina exclusivamente el pago, su salida de caja y su asiento; la CxP
+    vuelve a quedar pendiente por el importe reversado.
+    """
+    c=db(); account=c.execute('''SELECT cp.*,r.factura,o.numero_ot,o.vehiculo_id,p.nombre proveedor_nombre
+        FROM cuentas_por_pagar_repuestos_ot cp
+        JOIN repuestos_ot r ON r.id=cp.repuesto_ot_id
+        JOIN ordenes_trabajo o ON o.id=r.orden_trabajo_id
+        JOIN proveedores p ON p.id=cp.proveedor_id WHERE cp.id=?''',(cid,)).fetchone()
+    payment=c.execute('''SELECT * FROM pagos_cuentas_por_pagar_repuestos_ot
+        WHERE id=? AND cuenta_por_pagar_repuesto_id=?''',(payment_id,cid)).fetchone()
+    if not account or not payment:
+        c.close(); return jsonify(error='No se encontró el pago de CxP de repuesto.'),404
+    try:
+        c.execute('BEGIN')
+        c.execute("DELETE FROM movimientos_caja WHERE referencia_tipo='pago_cxp_repuesto' AND referencia_id=?",(payment_id,))
+        headers=c.execute("SELECT id FROM asientos_contables WHERE referencia_tipo='pago_cxp_repuesto' AND referencia_id=?",(payment_id,)).fetchall()
+        for header in headers:
+            c.execute('DELETE FROM partidas WHERE asiento_id=?',(header['id'],))
+            c.execute('DELETE FROM asientos_contables WHERE id=?',(header['id'],))
+        c.execute('DELETE FROM pagos_cuentas_por_pagar_repuestos_ot WHERE id=?',(payment_id,))
+        saldo=min(float(account['monto_original'] or 0),round(float(account['saldo'] or 0)+float(payment['monto'] or 0),2))
+        estado='Pagada' if saldo<=0.01 else 'Pendiente'
+        c.execute('UPDATE cuentas_por_pagar_repuestos_ot SET saldo=?,estado=? WHERE id=?',(saldo,estado,cid))
+        c.commit()
+    except Exception:
+        c.rollback(); c.close(); raise
+    c.close(); return jsonify(ok=True,saldo=saldo,estado=estado,documento=account['factura'])
 
 @app.post('/api/cuentas-por-cobrar/<int:cid>/pagos')
 def registrar_cobro_cxc(cid):

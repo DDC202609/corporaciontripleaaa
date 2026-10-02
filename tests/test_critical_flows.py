@@ -259,6 +259,51 @@ class CriticalFlowsTest(unittest.TestCase):
         self.assertAlmostEqual(move['salida'], 115, places=2)
         self.assertIsNotNone(journal)
 
+    def test_reversing_parts_payable_payment_restores_payable_and_removes_its_entry(self):
+        self.login_as_admin()
+        connection = self.server.db()
+        vehicle = connection.execute('SELECT id FROM vehiculos ORDER BY id LIMIT 1').fetchone()
+        provider = connection.execute('SELECT id,nombre FROM proveedores WHERE activo=1 ORDER BY id LIMIT 1').fetchone()
+        order_id, _ = self.server.crear_orden_trabajo(
+            connection, vehicle['id'], None, '2026-09-20', provider['nombre'], 'Prueba reversión', 0, 'Prueba pago CxP repuesto'
+        )
+        connection.commit()
+        connection.close()
+        part = self.client.post(
+            f'/api/ordenes-trabajo/{order_id}/repuestos',
+            json={'factura': 'QA-REVERSE-PART-0001', 'fecha': '2026-09-20', 'proveedor_id': provider['id'],
+                  'subtotal': 200, 'isv': 0, 'descripcion': 'Repuesto para reversión', 'metodo_pago': 'Crédito'},
+        )
+        self.assertEqual(part.status_code, 201)
+        connection = self.server.db()
+        payable = connection.execute('''SELECT cp.id FROM cuentas_por_pagar_repuestos_ot cp
+            JOIN repuestos_ot r ON r.id=cp.repuesto_ot_id WHERE r.factura='QA-REVERSE-PART-0001' ''').fetchone()
+        connection.close()
+        payment = self.client.post(
+            f"/api/cuentas-por-pagar-repuestos/{payable['id']}/pagos",
+            json={'fecha': '2026-09-21', 'tipo_pago': 'Efectivo', 'monto': 200},
+        )
+        self.assertEqual(payment.status_code, 201)
+        connection = self.server.db()
+        payment_id = connection.execute('''SELECT id FROM pagos_cuentas_por_pagar_repuestos_ot
+            WHERE cuenta_por_pagar_repuesto_id=?''', (payable['id'],)).fetchone()['id']
+        connection.close()
+        reversal = self.client.delete(
+            f"/api/cuentas-por-pagar-repuestos/{payable['id']}/pagos/{payment_id}"
+        )
+        self.assertEqual(reversal.status_code, 200)
+        connection = self.server.db()
+        restored = connection.execute('SELECT saldo,estado FROM cuentas_por_pagar_repuestos_ot WHERE id=?', (payable['id'],)).fetchone()
+        payment_row = connection.execute('SELECT 1 FROM pagos_cuentas_por_pagar_repuestos_ot WHERE id=?', (payment_id,)).fetchone()
+        journal = connection.execute("SELECT 1 FROM asientos_contables WHERE referencia_tipo='pago_cxp_repuesto' AND referencia_id=?", (payment_id,)).fetchone()
+        cash = connection.execute("SELECT 1 FROM movimientos_caja WHERE referencia_tipo='pago_cxp_repuesto' AND referencia_id=?", (payment_id,)).fetchone()
+        connection.close()
+        self.assertAlmostEqual(restored['saldo'], 200, places=2)
+        self.assertEqual(restored['estado'], 'Pendiente')
+        self.assertIsNone(payment_row)
+        self.assertIsNone(journal)
+        self.assertIsNone(cash)
+
     def test_legacy_parts_can_be_regularized_against_bac(self):
         self.login_as_admin()
         connection = self.server.db()
