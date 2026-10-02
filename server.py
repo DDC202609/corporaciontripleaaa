@@ -2079,17 +2079,49 @@ def conciliacion_inventario():
     }
     cuenta_ids={key:cuenta_contable_id(c,key) for key in cuentas}
     por_id={account_id:key for key,account_id in cuenta_ids.items()}
-    vehicles=[dict(row) for row in c.execute('''SELECT id,vin,marca,modelo,estado,tipo_compra
+    vehicles=[dict(row) for row in c.execute('''SELECT *
         FROM vehiculos WHERE estado<>'Vendido' AND COALESCE(tipo_compra,'')<>'Consignación' ''').fetchall()]
     operativo={key:0.0 for key in cuentas}
     esperado={}
+    detalle_dashboard=[]
+    alertas_dashboard=[]
     for vehicle in vehicles:
         key=cuenta_inventario_por_estado(vehicle['estado'])
         if key not in cuentas:
             continue
-        cost=round(costo_consolidado(c,vehicle['id']),2)
+        costeo=c.execute('''SELECT ajuste_compra,grua,flete,isv_pagado,cl_std,almacenaje,gastos_aduaneros
+            FROM costos_adquisicion WHERE vehiculo_id=?''',(vehicle['id'],)).fetchone()
+        compra=round(float(vehicle['precio_compra'] or 0),2)
+        nacionalizacion=round(sum(float(costeo[field] or 0) for field in
+            ('ajuste_compra','grua','flete','isv_pagado','cl_std','almacenaje','gastos_aduaneros')) if costeo else 0,2)
+        extras=round(c.execute('SELECT COALESCE(SUM(monto),0) FROM costos_vehiculo WHERE vehiculo_id=?',
+            (vehicle['id'],)).fetchone()[0],2)
+        # Esta suma reproduce exactamente costo_consolidado(), dejando visibles
+        # sus tres componentes para descartar una duplicación en el Dashboard.
+        cost=round(compra+nacionalizacion+extras,2)
         operativo[key]+=cost
         esperado[vehicle['id']]={'vehiculo':vehicle,'cuenta':key,'costo':cost}
+        acquisition_count=c.execute('SELECT COUNT(*) FROM adquisiciones WHERE vehiculo_id=?',(vehicle['id'],)).fetchone()[0]
+        detail={
+            'vehiculo_id':vehicle['id'],'vin':vehicle['vin'],
+            'vehiculo':f"{vehicle['marca'] or ''} {vehicle['modelo'] or ''}".strip(),
+            'etapa':vehicle['estado'],'compra':compra,'nacionalizacion':nacionalizacion,
+            'costos_adicionales':extras,'total_dashboard':cost,
+            'adquisiciones':acquisition_count,
+        }
+        detalle_dashboard.append(detail)
+        if acquisition_count!=1:
+            alertas_dashboard.append({**detail,'motivo':'El vehículo tiene más de una adquisición o no tiene adquisición.'})
+    for duplicate in c.execute('''SELECT cv.vehiculo_id,cv.documento,cv.monto,COUNT(*) cantidad
+        FROM costos_vehiculo cv WHERE COALESCE(TRIM(cv.documento),'')<>''
+        GROUP BY cv.vehiculo_id,cv.documento,cv.monto HAVING COUNT(*)>1''').fetchall():
+        owner=esperado.get(duplicate['vehiculo_id'])
+        if owner:
+            vehicle=owner['vehiculo']
+            alertas_dashboard.append({'vehiculo_id':vehicle['id'],'vin':vehicle['vin'],
+                'vehiculo':f"{vehicle['marca'] or ''} {vehicle['modelo'] or ''}".strip(),
+                'etapa':vehicle['estado'],'documento':duplicate['documento'],'monto':round(float(duplicate['monto'] or 0),2),
+                'cantidad':duplicate['cantidad'],'motivo':'Documento de costo repetido con el mismo importe.'})
 
     # Saldo contable neto por unidad y cuenta. Las líneas de costo de ventas de
     # unidades ya vendidas no aparecen en el detalle porque no forman parte del
@@ -2146,8 +2178,21 @@ def conciliacion_inventario():
             })
     inconsistencias.sort(key=lambda row:(abs(row['diferencia']),row['vin']),reverse=True)
     c.close()
-    return jsonify(resumen=resumen,inconsistencias=inconsistencias,
-                   diferencia_total=round(sum(item['diferencia'] for item in resumen),2))
+    detalle_dashboard.sort(key=lambda row:(row['etapa'],row['vin']))
+    return jsonify(
+        resumen=resumen,
+        validacion_dashboard={
+            'vehiculos_incluidos':len(detalle_dashboard),
+            'vins_unicos':len({row['vin'] for row in detalle_dashboard}),
+            'total_recalculado':round(sum(row['total_dashboard'] for row in detalle_dashboard),2),
+            'total_por_etapa':round(sum(operativo.values()),2),
+            'sin_duplicar_vehiculos':len(detalle_dashboard)==len({row['vehiculo_id'] for row in detalle_dashboard}),
+        },
+        detalle_dashboard=detalle_dashboard,
+        alertas_dashboard=alertas_dashboard,
+        inconsistencias=inconsistencias,
+        diferencia_total=round(sum(item['diferencia'] for item in resumen),2),
+    )
 
 @app.get('/api/cuentas-por-pagar')
 def cuentas_por_pagar():

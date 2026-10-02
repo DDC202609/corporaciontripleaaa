@@ -501,6 +501,12 @@ class CriticalFlowsTest(unittest.TestCase):
         self.assertAlmostEqual(
             data['diferencia_total'], sum(row['diferencia'] for row in data['resumen']), places=2
         )
+        validation = data['validacion_dashboard']
+        self.assertEqual(validation['vehiculos_incluidos'], validation['vins_unicos'])
+        self.assertTrue(validation['sin_duplicar_vehiculos'])
+        self.assertAlmostEqual(
+            validation['total_recalculado'], sum(row['total_dashboard'] for row in data['detalle_dashboard']), places=2
+        )
         for row in data['inconsistencias']:
             self.assertTrue(row['vin'])
             self.assertIn(row['cuenta_esperada'], ('DPV', 'En Taller', 'En Tránsito'))
