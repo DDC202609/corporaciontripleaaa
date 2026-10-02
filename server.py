@@ -2177,6 +2177,38 @@ def conciliacion_inventario():
                 'transito_contable':por_cuenta['inventario_transito'],
             })
     inconsistencias.sort(key=lambda row:(abs(row['diferencia']),row['vin']),reverse=True)
+    # Partidas que sí están vinculadas a los VIN activos con diferencia. Esto
+    # permite distinguir entre un costo que falta (no habrá partida) y una
+    # partida que está aplicada a una cuenta/vehículo incorrecto.
+    trazabilidad=[]
+    ids_inconsistentes=[row['vehiculo_id'] for row in inconsistencias]
+    if ids_inconsistentes:
+        placeholders=','.join('?' for _ in ids_inconsistentes)
+        trace_rows=c.execute('''SELECT p.vehiculo_id,p.fecha,cc.codigo,cc.cuenta,p.debe,p.haber,
+                p.referencia_tipo,p.referencia_id,COALESCE(a.descripcion,p.descripcion) documento,
+                v.vin,v.marca,v.modelo
+            FROM partidas p
+            JOIN cuentas_contables cc ON cc.id=p.cuenta_id
+            LEFT JOIN asientos_contables a ON a.id=p.asiento_id
+            LEFT JOIN vehiculos v ON v.id=p.vehiculo_id
+            WHERE p.vehiculo_id IN ('''+placeholders+''')
+              AND p.cuenta_id IN (?,?,?)
+            ORDER BY v.vin,p.fecha,p.id''',
+            (*ids_inconsistentes,*cuenta_ids.values())).fetchall()
+        trazabilidad=[{
+            'vin':row['vin'],'vehiculo':f"{row['marca'] or ''} {row['modelo'] or ''}".strip(),
+            'fecha':row['fecha'],'cuenta':f"{row['codigo']} · {row['cuenta']}",
+            'documento':row['documento'],'origen':row['referencia_tipo'],
+            'debe':round(float(row['debe'] or 0),2),'haber':round(float(row['haber'] or 0),2),
+        } for row in trace_rows]
+    contable_vinculado=round(sum(sum(values.values()) for values in registrado.values()),2)
+    contable_total=round(sum(contable.values()),2)
+    trazabilidad_resumen={
+        'dashboard':round(sum(operativo.values()),2),
+        'contable_vinculado_a_vin_activo':contable_vinculado,
+        'saldo_sin_vinculo_a_vin_activo':round(contable_total-contable_vinculado,2),
+        'balance_inventario':contable_total,
+    }
     c.close()
     detalle_dashboard.sort(key=lambda row:(row['etapa'],row['vin']))
     return jsonify(
@@ -2191,6 +2223,8 @@ def conciliacion_inventario():
         detalle_dashboard=detalle_dashboard,
         alertas_dashboard=alertas_dashboard,
         inconsistencias=inconsistencias,
+        trazabilidad=trazabilidad,
+        trazabilidad_resumen=trazabilidad_resumen,
         diferencia_total=round(sum(item['diferencia'] for item in resumen),2),
     )
 
