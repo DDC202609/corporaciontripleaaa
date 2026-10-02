@@ -2061,6 +2061,94 @@ def balance_general():
     total_activo=sum(x['saldo'] for x in activo); total_pasivo=sum(x['saldo'] for x in pasivo); total_patrimonio=sum(x['saldo'] for x in patrimonio)
     c.close(); return jsonify(activo=activo,pasivo=pasivo,patrimonio=patrimonio,total_activo=total_activo,total_pasivo=total_pasivo,total_patrimonio=total_patrimonio,diferencia=round(total_activo-total_pasivo-total_patrimonio,2))
 
+@app.get('/api/contabilidad/conciliacion-inventario')
+def conciliacion_inventario():
+    """Compara el inventario operativo actual contra sus cuentas contables.
+
+    No registra ni altera información. Sirve para identificar, por VIN, las
+    unidades cuyos costos o reclasificaciones no llegaron a la misma cuenta que
+    su etapa actual. La venta con pago ``Cambio`` es la única excepción de
+    trazabilidad: su débito se asigna al vehículo recibido, aunque el asiento
+    original pertenezca a la venta que lo recibió.
+    """
+    c=db()
+    cuentas={
+        'inventario_dpv':'DPV',
+        'inventario_taller':'En Taller',
+        'inventario_transito':'En Tránsito',
+    }
+    cuenta_ids={key:cuenta_contable_id(c,key) for key in cuentas}
+    por_id={account_id:key for key,account_id in cuenta_ids.items()}
+    vehicles=[dict(row) for row in c.execute('''SELECT id,vin,marca,modelo,estado,tipo_compra
+        FROM vehiculos WHERE estado<>'Vendido' AND COALESCE(tipo_compra,'')<>'Consignación' ''').fetchall()]
+    operativo={key:0.0 for key in cuentas}
+    esperado={}
+    for vehicle in vehicles:
+        key=cuenta_inventario_por_estado(vehicle['estado'])
+        if key not in cuentas:
+            continue
+        cost=round(costo_consolidado(c,vehicle['id']),2)
+        operativo[key]+=cost
+        esperado[vehicle['id']]={'vehiculo':vehicle,'cuenta':key,'costo':cost}
+
+    # Saldo contable neto por unidad y cuenta. Las líneas de costo de ventas de
+    # unidades ya vendidas no aparecen en el detalle porque no forman parte del
+    # inventario operativo vigente.
+    registrado={vehicle_id:{key:0.0 for key in cuentas} for vehicle_id in esperado}
+    for line in c.execute('''SELECT p.vehiculo_id,p.cuenta_id,p.debe,p.haber,p.referencia_tipo,p.referencia_id
+        FROM partidas p WHERE p.cuenta_id IN (?,?,?)''',tuple(cuenta_ids.values())).fetchall():
+        key=por_id[line['cuenta_id']]
+        value=round(float(line['debe'] or 0)-float(line['haber'] or 0),2)
+        if line['vehiculo_id'] in registrado:
+            registrado[line['vehiculo_id']][key]+=value
+
+    # El ingreso de una venta con cambio debita inventario pero, por diseño del
+    # asiento de venta, lleva inicialmente el ID de la unidad vendida. Para la
+    # conciliación se atribuye al VIN realmente recibido como parte de pago.
+    cambios=c.execute('''SELECT pv.venta_id,pv.vehiculo_recibido_id,pv.monto
+        FROM pagos_venta pv WHERE pv.tipo_pago='Cambio' AND pv.vehiculo_recibido_id IS NOT NULL''').fetchall()
+    for cambio in cambios:
+        vehicle_id=cambio['vehiculo_recibido_id']
+        if vehicle_id not in registrado:
+            continue
+        amount=round(float(cambio['monto'] or 0),2)
+        line=c.execute('''SELECT p.cuenta_id FROM partidas p
+            JOIN asientos_contables a ON a.id=p.asiento_id
+            WHERE a.referencia_tipo='venta_ingreso' AND a.referencia_id=?
+              AND p.cuenta_id IN (?,?,?) AND ROUND(p.debe,2)=?
+            ORDER BY p.id LIMIT 1''',(cambio['venta_id'],*cuenta_ids.values(),amount)).fetchone()
+        if line:
+            registrado[vehicle_id][por_id[line['cuenta_id']]]+=amount
+
+    contable={key:round(c.execute('''SELECT COALESCE(SUM(p.debe-p.haber),0)
+        FROM partidas p WHERE p.cuenta_id=?''',(account_id,)).fetchone()[0],2)
+               for key,account_id in cuenta_ids.items()}
+    resumen=[]
+    for key,label in cuentas.items():
+        resumen.append({'cuenta':key,'etapa':label,'operativo':round(operativo[key],2),
+                        'contable':contable[key],
+                        'diferencia':round(operativo[key]-contable[key],2)})
+    inconsistencias=[]
+    for vehicle_id,data in esperado.items():
+        por_cuenta={key:round(value,2) for key,value in registrado[vehicle_id].items()}
+        contable_total=round(sum(por_cuenta.values()),2)
+        expected_by_account={key:(data['costo'] if key==data['cuenta'] else 0.0) for key in cuentas}
+        if any(abs(expected_by_account[key]-por_cuenta[key])>0.01 for key in cuentas):
+            vehicle=data['vehiculo']
+            inconsistencias.append({
+                'vehiculo_id':vehicle_id,'vin':vehicle['vin'],'vehiculo':f"{vehicle['marca'] or ''} {vehicle['modelo'] or ''}".strip(),
+                'etapa':vehicle['estado'],'costo_operativo':data['costo'],'saldo_contable':contable_total,
+                'diferencia':round(data['costo']-contable_total,2),
+                'cuenta_esperada':cuentas[data['cuenta']],
+                'dpv_contable':por_cuenta['inventario_dpv'],
+                'taller_contable':por_cuenta['inventario_taller'],
+                'transito_contable':por_cuenta['inventario_transito'],
+            })
+    inconsistencias.sort(key=lambda row:(abs(row['diferencia']),row['vin']),reverse=True)
+    c.close()
+    return jsonify(resumen=resumen,inconsistencias=inconsistencias,
+                   diferencia_total=round(sum(item['diferencia'] for item in resumen),2))
+
 @app.get('/api/cuentas-por-pagar')
 def cuentas_por_pagar():
     c=db(); rows=c.execute('''SELECT cp.*,p.nombre proveedor_nombre,a.costo_compra,a.anticipo,a.metodo_pago,v.vin,v.marca,v.modelo

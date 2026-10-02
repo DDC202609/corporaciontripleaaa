@@ -490,6 +490,21 @@ class CriticalFlowsTest(unittest.TestCase):
         connection.close()
         self.assertEqual(repaired['codigo'], '1103')
 
+    def test_inventory_reconciliation_is_read_only_and_exposes_differences_by_vin(self):
+        self.login_as_admin()
+        response = self.client.get('/api/contabilidad/conciliacion-inventario')
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertEqual({row['cuenta'] for row in data['resumen']}, {
+            'inventario_dpv', 'inventario_taller', 'inventario_transito'
+        })
+        self.assertAlmostEqual(
+            data['diferencia_total'], sum(row['diferencia'] for row in data['resumen']), places=2
+        )
+        for row in data['inconsistencias']:
+            self.assertTrue(row['vin'])
+            self.assertIn(row['cuenta_esperada'], ('DPV', 'En Taller', 'En Tránsito'))
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
