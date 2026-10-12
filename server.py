@@ -39,7 +39,7 @@ ACCESS_MODULES=(
     ('proveedores','Proveedores'),('adquisiciones','Adquisiciones'),('taller','Taller'),('costeo','Costeo'),
     ('ventas','Ventas y cobros'),('vendedores','Vendedores'),('inventario','Consulta de inventario'),
     ('catalogo','Catálogo contable'),('centros_costo','Centros de costo'),('cartera','Cuentas por cobrar y pagar'),('contabilidad','Contabilidad'),
-    ('caja_bancos','Caja y bancos'),('gastos','Registro de gastos'),('comisiones','Comisiones'),
+    ('caja_bancos','Caja y bancos'),('gastos','Registro de gastos'),('comisiones','Comisiones'),('planillas','Planillas'),
     ('planificacion_financiera','Planificación financiera'),('planificacion_compra','Planificación de compra'),('auditoria','Bitácora de auditoría'),
 )
 
@@ -82,7 +82,7 @@ def init_access_control_schema():
                   (name,description,is_admin,is_system))
     profiles={row['nombre']:row['id'] for row in c.execute('SELECT id,nombre FROM perfiles')}
     all_modules={key for key,_ in ACCESS_MODULES}
-    operational={'dashboard','vehiculos','informacion_vehiculo','proveedores','adquisiciones','taller','costeo','ventas','inventario','catalogo','centros_costo','vendedores','gastos','cartera','planificacion_compra'}
+    operational={'dashboard','vehiculos','informacion_vehiculo','proveedores','adquisiciones','taller','costeo','ventas','inventario','catalogo','centros_costo','vendedores','gastos','cartera','planificacion_compra','planillas'}
     sales={'dashboard','vehiculos','ventas','vendedores','inventario','caja_bancos','comisiones'}
     consultation={'dashboard','vehiculos','inventario','contabilidad','caja_bancos','ventas'}
     for profile_name,allowed in (('Administrador',all_modules),('Operaciones',operational),('Ventas',sales),('Consulta',consultation)):
@@ -137,6 +137,7 @@ def request_module(path):
     if path.startswith('/api/gastos-ot'): return 'taller'
     if path.startswith('/api/gastos') or path.startswith('/api/conceptos-gasto'): return 'gastos'
     if path.startswith('/api/comisiones'): return 'comisiones'
+    if path.startswith('/api/planillas'): return 'planillas'
     # Consultar el catálogo activo es parte del registro de una venta.  La
     # administración (crear, editar o desactivar) sigue protegida por el
     # permiso específico de Vendedores.
@@ -178,6 +179,7 @@ AUDIT_RESOURCES=(
     (r'^/api/repuestos-ot/(\d+)', 'Repuesto / insumo', 'repuestos_ot'),
     (r'^/api/gastos-ot/(\d+)', 'Gasto de OT', 'gastos_ot'),
     (r'^/api/ventas/(\d+)', 'Venta', 'ventas'),
+    (r'^/api/planillas/(\d+)', 'Empleado de planilla', 'empleados_planilla'),
     (r'^/api/proveedores/(\d+)', 'Proveedor', 'proveedores'),
     (r'^/api/usuarios/(\d+)', 'Usuario', 'usuarios'),
 )
@@ -192,6 +194,7 @@ AUDIT_PREFIXES=(
     ('/api/catalogo', 'Catálogo contable', None), ('/api/informacion-vehiculo', 'Información de vehículo', None),
     ('/api/areas', 'Centro de costo', None), ('/api/departamentos', 'Centro de costo', None),
     ('/api/comisiones', 'Comisión', None),
+    ('/api/planillas', 'Empleado de planilla', 'empleados_planilla'),
 )
 
 def redact_auditoria(value):
@@ -709,6 +712,26 @@ def init_db(sync_history=True):
     c.execute('''CREATE TABLE IF NOT EXISTS cobros_cuentas_por_cobrar(
         id INTEGER PRIMARY KEY AUTOINCREMENT,cuenta_por_cobrar_id INTEGER NOT NULL REFERENCES cuentas_por_cobrar(id) ON DELETE CASCADE,
         fecha TEXT NOT NULL,tipo_pago TEXT NOT NULL,banco TEXT,referencia TEXT,monto REAL NOT NULL,creado_en TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)''')
+    # Maestro de planillas. Este registro define la composición mensual de
+    # cada empleado; no genera por sí mismo pago, movimiento de caja ni asiento.
+    c.execute('''CREATE TABLE IF NOT EXISTS empleados_planilla(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        nombre TEXT NOT NULL,
+        numero_identidad TEXT NOT NULL UNIQUE COLLATE NOCASE,
+        salario REAL NOT NULL DEFAULT 0,
+        comisiones REAL NOT NULL DEFAULT 0,
+        bonos REAL NOT NULL DEFAULT 0,
+        ihss REAL NOT NULL DEFAULT 0,
+        rap REAL NOT NULL DEFAULT 0,
+        otras_deducciones REAL NOT NULL DEFAULT 0,
+        departamento_id INTEGER NOT NULL REFERENCES departamentos(id),
+        cuenta_contable_id INTEGER NOT NULL REFERENCES cuentas_contables(id),
+        activo INTEGER NOT NULL DEFAULT 1,
+        creado_en TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        actualizado_en TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )''')
+    c.execute('CREATE INDEX IF NOT EXISTS ix_empleados_planilla_departamento ON empleados_planilla(departamento_id)')
+    c.execute('CREATE INDEX IF NOT EXISTS ix_empleados_planilla_cuenta ON empleados_planilla(cuenta_contable_id)')
     c.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_pagos_cxp_referencia ON pagos_cuentas_por_pagar(referencia) WHERE referencia IS NOT NULL AND referencia<>''")
     c.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_cobros_cxc_referencia ON cobros_cuentas_por_cobrar(referencia) WHERE referencia IS NOT NULL AND referencia<>''")
     c.execute('''CREATE TABLE IF NOT EXISTS bitacora_auditoria(
@@ -2423,6 +2446,89 @@ def get_deps():
     area=request.args.get('area_id'); c=db(); sql='SELECT * FROM departamentos WHERE activo=1'; args=[]
     if area: sql+=' AND area_id=?'; args.append(area)
     r=c.execute(sql+' ORDER BY area_id,codigo',args).fetchall(); c.close(); return jsonify([dict(x) for x in r])
+
+def datos_empleado_planilla(data):
+    """Valida el maestro de planillas sin crear movimientos contables."""
+    nombre=(data.get('nombre') or '').strip()
+    identidad=(data.get('numero_identidad') or '').strip()
+    if not nombre or not identidad:
+        return None, 'Nombre del empleado y número de identidad son obligatorios.'
+    try:
+        values={key:round(float(data.get(key) or 0),2) for key in
+                ('salario','comisiones','bonos','ihss','rap','otras_deducciones')}
+        departamento_id=int(data.get('departamento_id') or 0)
+        cuenta_contable_id=int(data.get('cuenta_contable_id') or 0)
+    except (TypeError,ValueError):
+        return None, 'Los importes, el departamento y la cuenta contable deben ser válidos.'
+    if any(value<0 for value in values.values()):
+        return None, 'Los importes de planilla no pueden ser negativos.'
+    if not departamento_id or not cuenta_contable_id:
+        return None, 'Seleccione un departamento y una cuenta contable.'
+    values.update(nombre=nombre,numero_identidad=identidad,departamento_id=departamento_id,cuenta_contable_id=cuenta_contable_id)
+    return values, None
+
+def empleado_planilla_detalle(c, employee_id):
+    row=c.execute('''SELECT ep.*,d.codigo departamento_codigo,d.nombre departamento_nombre,
+        cc.codigo cuenta_codigo,cc.cuenta cuenta_nombre
+        FROM empleados_planilla ep
+        JOIN departamentos d ON d.id=ep.departamento_id
+        JOIN cuentas_contables cc ON cc.id=ep.cuenta_contable_id
+        WHERE ep.id=?''',(employee_id,)).fetchone()
+    return dict(row) if row else None
+
+@app.get('/api/planillas')
+def get_planillas():
+    c=db()
+    rows=c.execute('''SELECT ep.*,d.codigo departamento_codigo,d.nombre departamento_nombre,
+        cc.codigo cuenta_codigo,cc.cuenta cuenta_nombre
+        FROM empleados_planilla ep
+        JOIN departamentos d ON d.id=ep.departamento_id
+        JOIN cuentas_contables cc ON cc.id=ep.cuenta_contable_id
+        WHERE ep.activo=1
+        ORDER BY ep.nombre COLLATE NOCASE,ep.id''').fetchall()
+    c.close(); return jsonify([dict(row) for row in rows])
+
+@app.post('/api/planillas')
+def crear_empleado_planilla():
+    data, error=datos_empleado_planilla(request.get_json(silent=True) or {})
+    if error: return jsonify(error=error),400
+    c=db()
+    try:
+        if not c.execute('SELECT 1 FROM departamentos WHERE id=? AND activo=1',(data['departamento_id'],)).fetchone():
+            return jsonify(error='El departamento seleccionado no está activo.'),400
+        if not c.execute('SELECT 1 FROM cuentas_contables WHERE id=? AND activo=1',(data['cuenta_contable_id'],)).fetchone():
+            return jsonify(error='La cuenta contable seleccionada no está activa.'),400
+        cur=c.execute('''INSERT INTO empleados_planilla(nombre,numero_identidad,salario,comisiones,bonos,ihss,rap,otras_deducciones,departamento_id,cuenta_contable_id)
+            VALUES(:nombre,:numero_identidad,:salario,:comisiones,:bonos,:ihss,:rap,:otras_deducciones,:departamento_id,:cuenta_contable_id)''',data)
+        c.commit(); employee=empleado_planilla_detalle(c,cur.lastrowid)
+    except sqlite3.IntegrityError:
+        c.rollback(); return jsonify(error='Ya existe un empleado de planilla con ese número de identidad.'),409
+    finally:
+        c.close()
+    return jsonify(employee),201
+
+@app.put('/api/planillas/<int:employee_id>')
+def actualizar_empleado_planilla(employee_id):
+    data, error=datos_empleado_planilla(request.get_json(silent=True) or {})
+    if error: return jsonify(error=error),400
+    c=db()
+    try:
+        if not c.execute('SELECT 1 FROM empleados_planilla WHERE id=?',(employee_id,)).fetchone():
+            return jsonify(error='Empleado de planilla no encontrado.'),404
+        if not c.execute('SELECT 1 FROM departamentos WHERE id=? AND activo=1',(data['departamento_id'],)).fetchone():
+            return jsonify(error='El departamento seleccionado no está activo.'),400
+        if not c.execute('SELECT 1 FROM cuentas_contables WHERE id=? AND activo=1',(data['cuenta_contable_id'],)).fetchone():
+            return jsonify(error='La cuenta contable seleccionada no está activa.'),400
+        c.execute('''UPDATE empleados_planilla SET nombre=:nombre,numero_identidad=:numero_identidad,salario=:salario,
+            comisiones=:comisiones,bonos=:bonos,ihss=:ihss,rap=:rap,otras_deducciones=:otras_deducciones,
+            departamento_id=:departamento_id,cuenta_contable_id=:cuenta_contable_id,actualizado_en=CURRENT_TIMESTAMP WHERE id=:id''',
+            dict(data,id=employee_id))
+        c.commit(); employee=empleado_planilla_detalle(c,employee_id)
+    except sqlite3.IntegrityError:
+        c.rollback(); return jsonify(error='Ya existe un empleado de planilla con ese número de identidad.'),409
+    finally:
+        c.close()
+    return jsonify(employee)
 
 @app.get('/api/vehiculos')
 def get_veh():
