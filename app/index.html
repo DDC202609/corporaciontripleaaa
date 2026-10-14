@@ -128,6 +128,7 @@ async function loadInventoryScreen(){
     fillInventorySelect('inventoryModel','modelo','Todos los modelos');
     fillInventorySelect('inventoryType','tipo_vehiculo','Todos los tipos');
     fillInventorySelect('inventoryPredio','ubicacion','Todos los predios');
+    fillInventorySelect('inventoryWorkshop','taller','Todos los talleres');
     $('inventoryStatusFilters').innerHTML=`<button class="btn2 ${!inventoryStatus?'active':''}" onclick="setInventoryStatus('')">Todos</button>`+inventoryStates.map(state=>`<button class="btn2 ${inventoryStatus===state?'active':''}" onclick="setInventoryStatus('${state}')">${esc(state)}</button>`).join('');
     renderInventoryQuery();
   } catch (error) {
