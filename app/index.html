@@ -1213,5 +1213,17 @@ searchSaleVehicle=async function(){
   }
 };
 ensureVisibleConsignmentControl();
+/* Un solo filtro para las unidades de taller que aún no tienen taller asignado. */
+function isPendingWorkshopAssignment(row){
+  const workshop=String(row.taller||'').trim().toLocaleLowerCase('es-HN');
+  return row.estado==='En Taller'&&(!workshop||workshop==='pendiente de asignar'||workshop==='pendiente de asignación');
+}
+const loadInventoryScreenWithPendingWorkshop=loadInventoryScreen;
+loadInventoryScreen=async function(){
+  await loadInventoryScreenWithPendingWorkshop();
+  inventoryRows=inventoryRows.map(row=>isPendingWorkshopAssignment(row)?{...row,taller:'Pendiente de asignar'}:row);
+  fillInventorySelect('inventoryWorkshop','taller','Todos los talleres');
+  renderInventoryQuery();
+};
 dash();
 </script></body></html>
