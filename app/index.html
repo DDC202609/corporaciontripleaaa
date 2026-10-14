@@ -984,7 +984,6 @@ function updateConsignmentFee(){let form=$('saleForm'),pct=Number(form?.elements
 function confirmConsignmentPurchase(){let box=$('saleConsignmentControl');box.dataset.ready='1';$('saleConsignmentReady').textContent='Compra preparada: al guardar la venta se ingresa a DPV, se crea la CxP y se registra la venta.'}
 const saveSaleWithConsignment=saveSale;
 saveSale=async function(event){
-  if(saleIsConsignment()&&$('saleConsignmentControl')?.dataset.ready!=='1'){event.preventDefault();return showNotice('Debe presionar “Registrar compra e ingresar al inventario” antes de facturar el vehículo en consignación.','error');}
   return saveSaleWithConsignment(event);
 };
 const calculateSaleWithConsignment=calculateSale;
@@ -1073,8 +1072,16 @@ saveSale=async function(event){
   let form=$('saleForm'),seller=(form?.elements.vendedor_nombre?.value||'').trim();
   if(!seller)return showNotice('Escriba el nombre del vendedor antes de facturar.','error');
   if(!saleVehicle)return;
-  if(saleIsConsignment()&&$('saleConsignmentControl')?.dataset.ready!=='1')return showNotice('Debe presionar “Registrar compra e ingresar al inventario” antes de facturar el vehículo en consignación.','error');
+  let feeAdministrativo=0;
+  if(saleIsConsignment()){
+    let entered=window.prompt('Fee administrativo de esta consignación (%). Ingrese 0 si no aplica.','0');
+    if(entered===null)return;
+    feeAdministrativo=Number(String(entered).replace(',','.'));
+    if(!Number.isFinite(feeAdministrativo)||feeAdministrativo<0||feeAdministrativo>100)return showNotice('Ingrese un fee administrativo válido entre 0 y 100.','error');
+    if(!window.confirm('Al facturar se ingresará el vehículo a inventario DPV, se creará la cuenta por pagar al proveedor consignante y se registrará el fee administrativo. ¿Desea continuar?'))return;
+  }
   let data=Object.fromEntries(new FormData(form).entries());
+  data.fee_administrativo_pct=feeAdministrativo;
   data.vehiculo_id=saleVehicle.id;data.pagos=salePaymentDrafts;
   for(let field of ['precio_lista','descuento','precio_final'])data[field]=Number(data[field]||0);
   data.garantia_dias=data.garantia_dias===''?null:Number(data.garantia_dias);data.prima=0;data.monto_financiado=0;data.transferencia=0;
