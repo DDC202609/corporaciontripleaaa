@@ -964,15 +964,19 @@ dash=async function(){
   }catch(error){console.error('No fue posible actualizar la consignación del dashboard',error)}
 };
 const searchSaleVehicleWithConsignment=searchSaleVehicle;
+function saleIsConsignment(){return Boolean(saleVehicle?.es_consignacion)||String(saleVehicle?.tipo_compra||'').trim().toLocaleLowerCase('es-HN')==='consignación'}
 searchSaleVehicle=async function(){
   await searchSaleVehicleWithConsignment();
   if(!saleVehicle)return;
-  const form=$('saleForm'),isConsignment=saleVehicle.tipo_compra==='Consignación';
+  const form=$('saleForm'),isConsignment=saleIsConsignment();
   let box=$('saleConsignmentControl');
   if(!box){
-    form.querySelector('.form-section:nth-of-type(3)')?.insertAdjacentHTML('afterend','<div id="saleConsignmentControl" class="sale-consignment hidden"><b>Vehículo en consignación</b><div class="sub">Antes de facturar debe ingresarse al inventario y crear la CxP al proveedor por su costo consignado.</div><div class="formgrid" style="margin-top:10px"><div class="field"><label>Fee administrativo (%)</label><input name="fee_administrativo_pct" type="number" min="0" max="100" step="0.01" value="0" oninput="updateConsignmentFee()"></div><div class="field"><label>Fee administrativo</label><input id="saleConsignmentFee" readonly></div></div><button type="button" class="primary" onclick="confirmConsignmentPurchase()">Registrar compra e ingresar al inventario</button><div id="saleConsignmentReady" class="sub" style="margin-top:8px"></div></div>');
+    const actions=form.querySelector('.actions'),panel=form.querySelector('.panel');
+    const control='<div id="saleConsignmentControl" class="sale-consignment hidden"><b>Vehículo en consignación</b><div class="sub">Antes de facturar debe ingresarse al inventario y crear la CxP al proveedor por su costo consignado.</div><div class="formgrid" style="margin-top:10px"><div class="field"><label>Fee administrativo (%)</label><input name="fee_administrativo_pct" type="number" min="0" max="100" step="0.01" value="0" oninput="updateConsignmentFee()"></div><div class="field"><label>Fee administrativo</label><input id="saleConsignmentFee" readonly></div></div><button type="button" class="primary" onclick="confirmConsignmentPurchase()">Registrar compra e ingresar al inventario</button><div id="saleConsignmentReady" class="sub" style="margin-top:8px"></div></div>';
+    if(actions)actions.insertAdjacentHTML('beforebegin',control);else if(panel)panel.insertAdjacentHTML('beforeend',control);else form.insertAdjacentHTML('beforeend',control);
     box=$('saleConsignmentControl');
   }
+  if(!box)return showNotice('No se pudo preparar el control de consignación. Recargue la boleta e intente nuevamente.','error');
   box.classList.toggle('hidden',!isConsignment);
   if(isConsignment){box.dataset.ready='';$('saleConsignmentReady').textContent='';updateConsignmentFee()}
 };
@@ -980,11 +984,11 @@ function updateConsignmentFee(){let form=$('saleForm'),pct=Number(form?.elements
 function confirmConsignmentPurchase(){let box=$('saleConsignmentControl');box.dataset.ready='1';$('saleConsignmentReady').textContent='Compra preparada: al guardar la venta se ingresa a DPV, se crea la CxP y se registra la venta.'}
 const saveSaleWithConsignment=saveSale;
 saveSale=async function(event){
-  if(saleVehicle?.tipo_compra==='Consignación'&&$('saleConsignmentControl')?.dataset.ready!=='1'){event.preventDefault();return showNotice('Debe presionar “Registrar compra e ingresar al inventario” antes de facturar el vehículo en consignación.','error');}
+  if(saleIsConsignment()&&$('saleConsignmentControl')?.dataset.ready!=='1'){event.preventDefault();return showNotice('Debe presionar “Registrar compra e ingresar al inventario” antes de facturar el vehículo en consignación.','error');}
   return saveSaleWithConsignment(event);
 };
 const calculateSaleWithConsignment=calculateSale;
-calculateSale=function(){calculateSaleWithConsignment();if(saleVehicle?.tipo_compra==='Consignación')updateConsignmentFee()};
+calculateSale=function(){calculateSaleWithConsignment();if(saleIsConsignment())updateConsignmentFee()};
 /* Planificación de compra: metas por modelo y disponibilidad semanal. */
 if(!accessModules.some(([key])=>key==='planificacion_compra'))accessModules.push(['planificacion_compra','Planificación de compra']);
 const accessModuleForNavigationWithPurchasePlanning=accessModuleForNavigation;
@@ -1057,7 +1061,7 @@ calculateSale=function(){
   else if(Math.abs(difference)<0.01){summary.textContent='Pagos cuadrados con el precio final.';summary.style.color='#087443'}
   else if(difference>0){summary.textContent='Pendiente por registrar: '+money(difference);summary.style.color='#9a6700'}
   else{summary.textContent='Los pagos exceden el precio final por '+money(Math.abs(difference))+'. Ajuste o quite un pago.';summary.style.color='#b42318'}
-  if(saleVehicle?.tipo_compra==='Consignación')updateConsignmentFee();
+  if(saleIsConsignment())updateConsignmentFee();
 };
 updateConsignmentFee=function(){let form=$('saleForm'),pct=Number(form?.elements.fee_administrativo_pct?.value||0),target=$('saleConsignmentFee');if(target)target.value=money(Math.max(precioFinalBoleta(),0)*pct/100)};
 const searchSaleVehicleWithEditableFinal=searchSaleVehicle;
@@ -1069,7 +1073,7 @@ saveSale=async function(event){
   let form=$('saleForm'),seller=(form?.elements.vendedor_nombre?.value||'').trim();
   if(!seller)return showNotice('Escriba el nombre del vendedor antes de facturar.','error');
   if(!saleVehicle)return;
-  if(saleVehicle.tipo_compra==='Consignación'&&$('saleConsignmentControl')?.dataset.ready!=='1')return showNotice('Debe presionar “Registrar compra e ingresar al inventario” antes de facturar el vehículo en consignación.','error');
+  if(saleIsConsignment()&&$('saleConsignmentControl')?.dataset.ready!=='1')return showNotice('Debe presionar “Registrar compra e ingresar al inventario” antes de facturar el vehículo en consignación.','error');
   let data=Object.fromEntries(new FormData(form).entries());
   data.vehiculo_id=saleVehicle.id;data.pagos=salePaymentDrafts;
   for(let field of ['precio_lista','descuento','precio_final'])data[field]=Number(data[field]||0);

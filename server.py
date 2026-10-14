@@ -2718,6 +2718,13 @@ def get_vehiculo_placa(placa):
     if not v:
         c.close(); return jsonify(error='Vehículo no encontrado con esa placa'),404
     data=dict(v)
+    # El tipo de compra histórico puede estar únicamente en Adquisiciones.
+    # La boleta necesita conocerlo para presentar el flujo de consignación.
+    acquisition=c.execute('''SELECT tipo_compra FROM adquisiciones WHERE vehiculo_id=?
+        ORDER BY id DESC LIMIT 1''',(data['id'],)).fetchone()
+    if acquisition and acquisition['tipo_compra']:
+        data['tipo_compra']=acquisition['tipo_compra']
+    data['es_consignacion']=data.get('tipo_compra')=='Consignación'
     # La boleta usa esta misma consulta inicial; incluir la lista evita que el
     # selector de vendedor dependa de una segunda llamada o de otro módulo.
     data['vendedores_activos']=[dict(row) for row in c.execute('''SELECT id,nombre
