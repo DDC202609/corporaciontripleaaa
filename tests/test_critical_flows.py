@@ -68,6 +68,30 @@ class CriticalFlowsTest(unittest.TestCase):
         self.assertEqual(response.get_json(), {'status': 'ok'})
         self.assertEqual(response.headers['X-Content-Type-Options'], 'nosniff')
 
+    def test_physical_inventory_count_compares_system_and_scanned_vins(self):
+        self.login_as_admin()
+        response = self.client.post('/api/conteos-inventario', json={
+            'nombre': 'Conteo QA', 'fecha': '2026-10-14'
+        })
+        self.assertEqual(response.status_code, 201)
+        count = response.get_json()
+        self.assertGreater(count['resumen']['existencia'], 0)
+        detail = next(item for item in count['detalles'] if item['existencia'] == 1)
+
+        capture = self.client.post(
+            f"/api/conteos-inventario/{count['conteo']['id']}/capturas",
+            json={'vin': detail['vin']},
+        )
+        self.assertEqual(capture.status_code, 200)
+        self.assertEqual(capture.get_json()['detalle']['fisico'], 1)
+        self.assertEqual(capture.get_json()['detalle']['diferencia'], 0)
+
+        current = self.client.get('/api/conteos-inventario/actual').get_json()
+        self.assertEqual(current['resumen']['fisico'], 1)
+        close = self.client.post(f"/api/conteos-inventario/{count['conteo']['id']}/cerrar")
+        self.assertEqual(close.status_code, 200)
+        self.assertEqual(close.get_json()['conteo']['estado'], 'Cerrado')
+
     def test_api_requires_a_session(self):
         response = self.client.get('/api/vehiculos')
         self.assertEqual(response.status_code, 401)

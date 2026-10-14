@@ -37,7 +37,7 @@ def ahora_operacion():
 ACCESS_MODULES=(
     ('dashboard','Dashboard'),('vehiculos','Vehículos'),('informacion_vehiculo','Información de vehículo'),
     ('proveedores','Proveedores'),('adquisiciones','Adquisiciones'),('taller','Taller'),('costeo','Costeo'),
-    ('ventas','Ventas y cobros'),('vendedores','Vendedores'),('inventario','Consulta de inventario'),
+    ('ventas','Ventas y cobros'),('vendedores','Vendedores'),('inventario','Consulta de inventario'),('conteo_inventario','Conteo físico de inventario'),
     ('catalogo','Catálogo contable'),('centros_costo','Centros de costo'),('cartera','Cuentas por cobrar y pagar'),('contabilidad','Contabilidad'),
     ('caja_bancos','Caja y bancos'),('gastos','Registro de gastos'),('comisiones','Comisiones'),('planillas','Planillas'),
     ('planificacion_financiera','Planificación financiera'),('planificacion_compra','Planificación de compra'),('auditoria','Bitácora de auditoría'),
@@ -82,9 +82,9 @@ def init_access_control_schema():
                   (name,description,is_admin,is_system))
     profiles={row['nombre']:row['id'] for row in c.execute('SELECT id,nombre FROM perfiles')}
     all_modules={key for key,_ in ACCESS_MODULES}
-    operational={'dashboard','vehiculos','informacion_vehiculo','proveedores','adquisiciones','taller','costeo','ventas','inventario','catalogo','centros_costo','vendedores','gastos','cartera','planificacion_compra','planillas'}
+    operational={'dashboard','vehiculos','informacion_vehiculo','proveedores','adquisiciones','taller','costeo','ventas','inventario','conteo_inventario','catalogo','centros_costo','vendedores','gastos','cartera','planificacion_compra','planillas'}
     sales={'dashboard','vehiculos','ventas','vendedores','inventario','caja_bancos','comisiones'}
-    consultation={'dashboard','vehiculos','inventario','contabilidad','caja_bancos','ventas'}
+    consultation={'dashboard','vehiculos','inventario','conteo_inventario','contabilidad','caja_bancos','ventas'}
     for profile_name,allowed in (('Administrador',all_modules),('Operaciones',operational),('Ventas',sales),('Consulta',consultation)):
         profile_id=profiles.get(profile_name)
         if not profile_id: continue
@@ -131,6 +131,7 @@ def request_module(path):
     if path.startswith('/api/dashboard'): return 'dashboard'
     if path.startswith('/api/planificacion-financiera'): return 'planificacion_financiera'
     if path.startswith('/api/planificacion-compra'): return 'planificacion_compra'
+    if path.startswith('/api/conteos-inventario'): return 'conteo_inventario'
     if path.startswith('/api/contabilidad'): return 'contabilidad'
     if path.startswith('/api/cuentas-por-'): return 'cartera'
     if path.startswith('/api/caja'): return 'caja_bancos'
@@ -734,6 +735,31 @@ def init_db(sync_history=True):
     c.execute('CREATE INDEX IF NOT EXISTS ix_empleados_planilla_cuenta ON empleados_planilla(cuenta_contable_id)')
     c.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_pagos_cxp_referencia ON pagos_cuentas_por_pagar(referencia) WHERE referencia IS NOT NULL AND referencia<>''")
     c.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_cobros_cxc_referencia ON cobros_cuentas_por_cobrar(referencia) WHERE referencia IS NOT NULL AND referencia<>''")
+    c.execute('''CREATE TABLE IF NOT EXISTS conteos_inventario(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        nombre TEXT NOT NULL,
+        fecha TEXT NOT NULL,
+        estado TEXT NOT NULL DEFAULT 'Abierto' CHECK(estado IN ('Abierto','Cerrado')),
+        creado_por INTEGER REFERENCES usuarios(id) ON DELETE SET NULL,
+        creado_en TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        cerrado_en TEXT
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS conteos_inventario_detalle(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        conteo_id INTEGER NOT NULL REFERENCES conteos_inventario(id) ON DELETE CASCADE,
+        vehiculo_id INTEGER REFERENCES vehiculos(id) ON DELETE SET NULL,
+        vin TEXT NOT NULL COLLATE NOCASE,
+        marca TEXT,
+        modelo TEXT,
+        anio INTEGER,
+        color TEXT,
+        existencia INTEGER NOT NULL DEFAULT 0 CHECK(existencia>=0),
+        fisico INTEGER NOT NULL DEFAULT 0 CHECK(fisico>=0),
+        contado_en TEXT,
+        UNIQUE(conteo_id,vin)
+    )''')
+    c.execute('CREATE INDEX IF NOT EXISTS ix_conteos_inventario_estado ON conteos_inventario(estado,fecha DESC)')
+    c.execute('CREATE INDEX IF NOT EXISTS ix_conteos_detalle_conteo ON conteos_inventario_detalle(conteo_id,vin)')
     c.execute('''CREATE TABLE IF NOT EXISTS bitacora_auditoria(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         fecha TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -2608,6 +2634,106 @@ def get_inventario():
         vehicle.update(costo_total=cost,precio_consulta=price,margen=margin,margen_pct=(margin/price*100 if price else 0),taller=workshop['taller'] if workshop and vehicle['estado']=='En Taller' else None,es_consignacion=vehicle.get('tipo_compra')=='Consignación',valor_consignado=float(vehicle.get('precio_compra') or 0))
         result.append(vehicle)
     c.close(); return jsonify(result)
+
+def conteo_inventario_payload(c, count):
+    """Devuelve el comparativo de una toma física sin alterar el inventario."""
+    if not count:
+        return {'conteo':None,'detalles':[], 'resumen':{'existencia':0,'fisico':0,'diferencia':0,'pendientes':0,'sobrantes':0}}
+    details=[dict(row) for row in c.execute('''SELECT id,vehiculo_id,vin,marca,modelo,anio,color,existencia,fisico,
+        contado_en,(fisico-existencia) diferencia FROM conteos_inventario_detalle
+        WHERE conteo_id=? ORDER BY diferencia DESC,marca,modelo,vin''',(count['id'],)).fetchall()]
+    summary={
+        'existencia':sum(int(row['existencia'] or 0) for row in details),
+        'fisico':sum(int(row['fisico'] or 0) for row in details),
+        'diferencia':sum(int(row['diferencia'] or 0) for row in details),
+        'pendientes':sum(1 for row in details if int(row['diferencia'] or 0)<0),
+        'sobrantes':sum(1 for row in details if int(row['diferencia'] or 0)>0),
+    }
+    return {'conteo':dict(count),'detalles':details,'resumen':summary}
+
+@app.get('/api/conteos-inventario/actual')
+def get_conteo_inventario_actual():
+    c=db()
+    count=c.execute("SELECT * FROM conteos_inventario WHERE estado='Abierto' ORDER BY id DESC LIMIT 1").fetchone()
+    payload=conteo_inventario_payload(c,count)
+    c.close(); return jsonify(payload)
+
+@app.post('/api/conteos-inventario')
+def post_conteo_inventario():
+    data=request.get_json(silent=True) or {}
+    name=(data.get('nombre') or '').strip() or f"Conteo físico {ahora_operacion().strftime('%d/%m/%Y')}"
+    date=(data.get('fecha') or ahora_operacion().strftime('%Y-%m-%d')).strip()
+    if len(name)>120: return jsonify(error='El nombre del conteo no puede exceder 120 caracteres.'),400
+    try: datetime.strptime(date,'%Y-%m-%d')
+    except ValueError: return jsonify(error='La fecha del conteo no es válida.'),400
+    c=db()
+    try:
+        current=c.execute("SELECT id,nombre FROM conteos_inventario WHERE estado='Abierto' ORDER BY id DESC LIMIT 1").fetchone()
+        if current:
+            return jsonify(error=f"Ya existe el conteo abierto «{current['nombre']}». Ciérrelo antes de iniciar otro."),409
+        created=c.execute('INSERT INTO conteos_inventario(nombre,fecha,creado_por) VALUES(?,?,?)',
+                          (name,date,session.get('user_id')))
+        count_id=created.lastrowid
+        vehicles=c.execute("""SELECT id,vin,marca,modelo,anio,color FROM vehiculos
+            WHERE estado<>'Vendido' ORDER BY marca,modelo,vin""").fetchall()
+        c.executemany('''INSERT INTO conteos_inventario_detalle
+            (conteo_id,vehiculo_id,vin,marca,modelo,anio,color,existencia,fisico)
+            VALUES(?,?,?,?,?,?,?,?,0)''',[(count_id,row['id'],row['vin'],row['marca'],row['modelo'],row['anio'],row['color'],1) for row in vehicles])
+        c.commit(); count=c.execute('SELECT * FROM conteos_inventario WHERE id=?',(count_id,)).fetchone()
+        payload=conteo_inventario_payload(c,count)
+    except sqlite3.Error:
+        c.rollback(); raise
+    finally:
+        c.close()
+    return jsonify(payload),201
+
+@app.post('/api/conteos-inventario/<int:count_id>/capturas')
+def post_captura_conteo_inventario(count_id):
+    data=request.get_json(silent=True) or {}
+    vin=re.sub(r'\s+','',(data.get('vin') or '')).upper()
+    if len(vin)<5 or len(vin)>40: return jsonify(error='Capture o digite un VIN válido.'),400
+    c=db()
+    try:
+        count=c.execute('SELECT * FROM conteos_inventario WHERE id=?',(count_id,)).fetchone()
+        if not count: return jsonify(error='El conteo no existe.'),404
+        if count['estado']!='Abierto': return jsonify(error='El conteo ya fue cerrado y no admite más capturas.'),409
+        detail=c.execute('SELECT * FROM conteos_inventario_detalle WHERE conteo_id=? AND vin=?',(count_id,vin)).fetchone()
+        already_counted=bool(detail and int(detail['fisico'] or 0)>0)
+        if detail:
+            if not already_counted:
+                c.execute("UPDATE conteos_inventario_detalle SET fisico=1,contado_en=? WHERE id=?",
+                          (ahora_operacion().isoformat(timespec='seconds'),detail['id']))
+        else:
+            vehicle=c.execute('SELECT id,vin,marca,modelo,anio,color FROM vehiculos WHERE UPPER(TRIM(vin))=?',(vin,)).fetchone()
+            c.execute('''INSERT INTO conteos_inventario_detalle
+                (conteo_id,vehiculo_id,vin,marca,modelo,anio,color,existencia,fisico,contado_en)
+                VALUES(?,?,?,?,?,?,?,?,1,?)''',(
+                    count_id,vehicle['id'] if vehicle else None,vin,vehicle['marca'] if vehicle else None,
+                    vehicle['modelo'] if vehicle else None,vehicle['anio'] if vehicle else None,
+                    vehicle['color'] if vehicle else None,0,ahora_operacion().isoformat(timespec='seconds')))
+        c.commit(); detail=c.execute('SELECT *,(fisico-existencia) diferencia FROM conteos_inventario_detalle WHERE conteo_id=? AND vin=?',(count_id,vin)).fetchone()
+    except sqlite3.Error:
+        c.rollback(); raise
+    finally:
+        c.close()
+    return jsonify(detalle=dict(detail),ya_contado=already_counted),200
+
+@app.post('/api/conteos-inventario/<int:count_id>/cerrar')
+def post_cerrar_conteo_inventario(count_id):
+    c=db()
+    try:
+        count=c.execute('SELECT * FROM conteos_inventario WHERE id=?',(count_id,)).fetchone()
+        if not count: return jsonify(error='El conteo no existe.'),404
+        if count['estado']=='Cerrado': return jsonify(error='El conteo ya está cerrado.'),409
+        c.execute("UPDATE conteos_inventario SET estado='Cerrado',cerrado_en=? WHERE id=?",
+                  (ahora_operacion().isoformat(timespec='seconds'),count_id))
+        c.commit(); count=c.execute('SELECT * FROM conteos_inventario WHERE id=?',(count_id,)).fetchone()
+        payload=conteo_inventario_payload(c,count)
+    except sqlite3.Error:
+        c.rollback(); raise
+    finally:
+        c.close()
+    return jsonify(payload)
 
 @app.get('/api/vendedores')
 def get_vendedores():
