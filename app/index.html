@@ -1177,5 +1177,33 @@ function editPayrollEmployee(id){let employee=payrollEmployees.find(row=>Number(
 async function savePayrollEmployee(event){event.preventDefault();let form=event.target,data=Object.fromEntries(new FormData(form).entries()),id=data.id;for(let key of ['salario','comisiones','bonos','ihss','rap','otras_deducciones','departamento_id','cuenta_contable_id'])data[key]=Number(data[key]||0);let response=await fetch(id?`/api/planillas/${Number(id)}`:'/api/planillas',{method:id?'PUT':'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)}),result=await response.json();if(!response.ok)return showNotice(result.error||'No se pudo guardar el empleado.','error');showNotice(id?'Empleado de planilla actualizado.':'Empleado agregado a planillas.');await loadPayroll();resetPayrollForm()}
 const goWithPayroll=go;
 go=function(id,button){goWithPayroll(id,button);if(id==='payroll')void loadPayroll()};
+/* Respaldo visible para consignación: el control existe desde que carga la boleta. */
+function ensureVisibleConsignmentControl(){
+  const form=$('saleForm');
+  if(!form)return null;
+  let control=$('saleConsignmentControl');
+  if(!control){
+    const actions=form.querySelector('.actions'),panel=form.querySelector('.panel');
+    const html='<div id="saleConsignmentControl" class="sale-consignment hidden"><b>Vehículo en consignación</b><div class="sub">Antes de facturar debe ingresarse al inventario y crear la CxP al proveedor por su costo consignado.</div><div class="formgrid" style="margin-top:10px"><div class="field"><label>Fee administrativo (%)</label><input name="fee_administrativo_pct" type="number" min="0" max="100" step="0.01" value="0" oninput="updateConsignmentFee()"></div><div class="field"><label>Fee administrativo</label><input id="saleConsignmentFee" readonly></div></div><button type="button" class="primary" onclick="confirmConsignmentPurchase()">Registrar compra e ingresar al inventario</button><div id="saleConsignmentReady" class="sub" style="margin-top:8px"></div></div>';
+    if(actions)actions.insertAdjacentHTML('beforebegin',html);else if(panel)panel.insertAdjacentHTML('beforeend',html);else form.insertAdjacentHTML('beforeend',html);
+    control=$('saleConsignmentControl');
+  }
+  return control;
+}
+const searchSaleVehicleWithVisibleConsignmentControl=searchSaleVehicle;
+searchSaleVehicle=async function(){
+  await searchSaleVehicleWithVisibleConsignmentControl();
+  const control=ensureVisibleConsignmentControl();
+  if(!control)return;
+  const isConsignment=saleIsConsignment();
+  control.classList.toggle('hidden',!isConsignment);
+  if(isConsignment){
+    control.dataset.ready='';
+    const notice=$('saleConsignmentReady');
+    if(notice)notice.textContent='Presione el botón para registrar la compra e ingresarla al inventario antes de facturar.';
+    updateConsignmentFee();
+  }
+};
+ensureVisibleConsignmentControl();
 dash();
 </script></body></html>
