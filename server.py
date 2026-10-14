@@ -739,11 +739,16 @@ def init_db(sync_history=True):
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         nombre TEXT NOT NULL,
         fecha TEXT NOT NULL,
+        estatus TEXT NOT NULL DEFAULT 'Todos',
         estado TEXT NOT NULL DEFAULT 'Abierto' CHECK(estado IN ('Abierto','Cerrado')),
         creado_por INTEGER REFERENCES usuarios(id) ON DELETE SET NULL,
         creado_en TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         cerrado_en TEXT
     )''')
+    count_columns={row['name'] for row in c.execute('PRAGMA table_info(conteos_inventario)')}
+    if 'estatus' not in count_columns:
+        # Los conteos creados antes de este filtro ya contienen todas las etapas.
+        c.execute("ALTER TABLE conteos_inventario ADD COLUMN estatus TEXT NOT NULL DEFAULT 'Todos'")
     c.execute('''CREATE TABLE IF NOT EXISTS conteos_inventario_detalle(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         conteo_id INTEGER NOT NULL REFERENCES conteos_inventario(id) ON DELETE CASCADE,
@@ -2663,19 +2668,22 @@ def post_conteo_inventario():
     data=request.get_json(silent=True) or {}
     name=(data.get('nombre') or '').strip() or f"Conteo físico {ahora_operacion().strftime('%d/%m/%Y')}"
     date=(data.get('fecha') or ahora_operacion().strftime('%Y-%m-%d')).strip()
+    inventory_status=(data.get('estatus') or '').strip()
     if len(name)>120: return jsonify(error='El nombre del conteo no puede exceder 120 caracteres.'),400
     try: datetime.strptime(date,'%Y-%m-%d')
     except ValueError: return jsonify(error='La fecha del conteo no es válida.'),400
+    if inventory_status not in ('DPV','En Tránsito','En Taller'):
+        return jsonify(error='Seleccione el estatus que desea inventariar: DPV, En Tránsito o En Taller.'),400
     c=db()
     try:
         current=c.execute("SELECT id,nombre FROM conteos_inventario WHERE estado='Abierto' ORDER BY id DESC LIMIT 1").fetchone()
         if current:
             return jsonify(error=f"Ya existe el conteo abierto «{current['nombre']}». Ciérrelo antes de iniciar otro."),409
-        created=c.execute('INSERT INTO conteos_inventario(nombre,fecha,creado_por) VALUES(?,?,?)',
-                          (name,date,session.get('user_id')))
+        created=c.execute('INSERT INTO conteos_inventario(nombre,fecha,estatus,creado_por) VALUES(?,?,?,?)',
+                          (name,date,inventory_status,session.get('user_id')))
         count_id=created.lastrowid
         vehicles=c.execute("""SELECT id,vin,marca,modelo,anio,color FROM vehiculos
-            WHERE estado<>'Vendido' ORDER BY marca,modelo,vin""").fetchall()
+            WHERE estado=? ORDER BY marca,modelo,vin""",(inventory_status,)).fetchall()
         c.executemany('''INSERT INTO conteos_inventario_detalle
             (conteo_id,vehiculo_id,vin,marca,modelo,anio,color,existencia,fisico)
             VALUES(?,?,?,?,?,?,?,?,0)''',[(count_id,row['id'],row['vin'],row['marca'],row['modelo'],row['anio'],row['color'],1) for row in vehicles])
@@ -2704,7 +2712,9 @@ def post_captura_conteo_inventario(count_id):
                 c.execute("UPDATE conteos_inventario_detalle SET fisico=1,contado_en=? WHERE id=?",
                           (ahora_operacion().isoformat(timespec='seconds'),detail['id']))
         else:
-            vehicle=c.execute('SELECT id,vin,marca,modelo,anio,color FROM vehiculos WHERE UPPER(TRIM(vin))=?',(vin,)).fetchone()
+            vehicle=c.execute('SELECT id,vin,marca,modelo,anio,color,estado FROM vehiculos WHERE UPPER(TRIM(vin))=?',(vin,)).fetchone()
+            if vehicle and vehicle['estado']!=count['estatus']:
+                return jsonify(error=f"El VIN {vin} está en «{vehicle['estado']}» y no pertenece al conteo de «{count['estatus']}»."),409
             c.execute('''INSERT INTO conteos_inventario_detalle
                 (conteo_id,vehiculo_id,vin,marca,modelo,anio,color,existencia,fisico,contado_en)
                 VALUES(?,?,?,?,?,?,?,?,1,?)''',(

@@ -71,11 +71,18 @@ class CriticalFlowsTest(unittest.TestCase):
     def test_physical_inventory_count_compares_system_and_scanned_vins(self):
         self.login_as_admin()
         response = self.client.post('/api/conteos-inventario', json={
-            'nombre': 'Conteo QA', 'fecha': '2026-10-14'
+            'nombre': 'Conteo QA', 'fecha': '2026-10-14', 'estatus': 'DPV'
         })
         self.assertEqual(response.status_code, 201)
         count = response.get_json()
+        self.assertEqual(count['conteo']['estatus'], 'DPV')
         self.assertGreater(count['resumen']['existencia'], 0)
+        connection = self.server.db()
+        other_statuses = connection.execute('''SELECT COUNT(*) FROM conteos_inventario_detalle d
+            JOIN vehiculos v ON v.id=d.vehiculo_id
+            WHERE d.conteo_id=? AND v.estado<>'DPV' ''', (count['conteo']['id'],)).fetchone()[0]
+        connection.close()
+        self.assertEqual(other_statuses, 0)
         detail = next(item for item in count['detalles'] if item['existencia'] == 1)
 
         capture = self.client.post(
