@@ -2812,7 +2812,10 @@ def get_ventas():
         LEFT JOIN clientes cl ON cl.id=ve.cliente_id LEFT JOIN vendedores ven ON ven.id=ve.vendedor_id'''; args=[]
     if month:
         sql+=" WHERE substr(ve.fecha,1,7)=?"; args.append(month)
-    rows=c.execute(sql+' ORDER BY ve.fecha DESC,ve.id DESC',args).fetchall(); result=[]
+    # El correlativo es la secuencia operativa de la venta; siempre se muestra
+    # primero la transacción más reciente aunque la fecha haya sido digitada
+    # manualmente con un día anterior.
+    rows=c.execute(sql+' ORDER BY COALESCE(ve.correlativo,0) DESC,ve.id DESC',args).fetchall(); result=[]
     for row in rows:
         sale=dict(row); cost=costo_consolidado(c,sale['vehiculo_id']); price=float(sale['precio'] or 0); margin=price-cost
         sale.update(costo_consolidado=cost,margen_bruto=margin,margen_bruto_pct=(margin/price*100 if price else 0))

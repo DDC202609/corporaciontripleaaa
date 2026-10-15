@@ -1265,5 +1265,22 @@ async function scanPhysicalCountCamera(){if(!physicalCountScanning||!physicalCou
 function stopPhysicalCountCamera(){physicalCountScanning=false;if(physicalCountScanFrame)cancelAnimationFrame(physicalCountScanFrame);physicalCountScanFrame=null;if(physicalCountStream)physicalCountStream.getTracks().forEach(track=>track.stop());physicalCountStream=null;let video=$('physicalCountVideo');if(video)video.srcObject=null;$('physicalCountCameraPanel')?.classList.add('hidden')}
 const goWithPhysicalCount=go;
 go=function(id,button){goWithPhysicalCount(id,button);if(id==='physicalCount')void loadPhysicalCount()};
+/* Historial de ventas: fecha visible y orden estricto por correlativo. */
+function saleCorrelationValue(row){let match=String(row.numero_transaccion||'').match(/(\d+)(?!.*\d)/);return match?Number(match[1]):Number(row.correlativo||0)}
+function saleHistoryDate(value){let match=String(value||'').match(/^(\d{4})-(\d{2})-(\d{2})/);return match?`${match[3]}/${match[2]}/${match[1]}`:(value||'—')}
+const renderSalesHistoryWithDateAndCorrelation=renderSalesHistory;
+renderSalesHistory=function(){
+  salesHistoryRows.sort((left,right)=>saleCorrelationValue(right)-saleCorrelationValue(left)||Number(right.id||0)-Number(left.id||0));
+  renderSalesHistoryWithDateAndCorrelation();
+  let table=$('salesHistoryBody')?.closest('table'),head=table?.querySelector('thead tr');
+  if(!table||!head)return;
+  if(!head.querySelector('[data-sale-date]'))head.children[0].insertAdjacentHTML('afterend','<th data-sale-date>Fecha</th>');
+  let month=$('salesMonthFilter').value,rows=salesHistoryRows.filter(row=>!month||(row.fecha||'').startsWith(month));
+  $('salesHistoryBody').querySelectorAll('tr').forEach((element,index)=>{
+    let sale=rows[index];
+    if(sale&&element.children.length===10)element.children[0].insertAdjacentHTML('afterend',`<td>${esc(saleHistoryDate(sale.fecha))}</td>`);
+    else if(!sale&&element.children.length===1)element.children[0].colSpan=11;
+  });
+};
 dash();
 </script></body></html>
