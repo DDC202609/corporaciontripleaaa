@@ -1287,18 +1287,46 @@ let costingHistoryRows=[];
 function costeoHistoryDate(value){let match=String(value||'').match(/^(\d{4})-(\d{2})-(\d{2})/);return match?`${match[3]}/${match[2]}/${match[1]}`:(value||'—')}
 function ensureCostingHistory(){
   if($('costingHistory'))return;
-  $('cost').insertAdjacentHTML('beforeend',`<div id="costingHistory" class="panel wide-table"><div class="top"><div><h2>Historial de costeos</h2><div class="sub">Vehículos con costeo de adquisición guardado.</div></div><div class="actions"><select id="costingMonthFilter" onchange="renderCostingHistory()"><option value="">Todos los meses</option></select><button type="button" class="btn2" onclick="loadCostingHistory()">Actualizar</button></div></div><div class="tablewrap"><table><thead><tr><th>Fecha de costeo</th><th>VIN</th><th>Marca</th><th>Modelo</th><th>Año</th><th>Color</th><th>Nacionalización</th><th>Etapa actual</th><th>Costo total</th></tr></thead><tbody id="costingHistoryBody"><tr><td colspan="9" class="sub">Cargando historial...</td></tr></tbody></table></div></div>`);
+  $('cost').insertAdjacentHTML('beforeend',`<div id="costingHistory" class="panel wide-table"><div class="top"><div><h2>Historial de costeos</h2><div class="sub">Seleccione un vehículo para consultar su detalle. Solo la cuenta autorizada puede actualizarlo.</div></div><div class="actions"><select id="costingMonthFilter" onchange="renderCostingHistory()"><option value="">Todos los meses</option></select><button type="button" class="btn2" onclick="loadCostingHistory()">Actualizar</button></div></div><div class="tablewrap"><table><thead><tr><th>Fecha de costeo</th><th>VIN</th><th>Marca</th><th>Modelo</th><th>Año</th><th>Color</th><th>Nacionalización</th><th>Etapa actual</th><th>Costo total</th><th></th></tr></thead><tbody id="costingHistoryBody"><tr><td colspan="10" class="sub">Cargando historial...</td></tr></tbody></table></div></div>`);
+}
+const costeoEditorUsername='erickmadrid.sabillon@gmail.com';
+let costeoHistoryReadOnly=false;
+async function canUpdateCosteo(){
+  if(!accessSession){try{accessSession=await get('/api/sesion')}catch(error){return false}}
+  return String(accessSession?.usuario||'').trim().toLowerCase()===costeoEditorUsername;
+}
+async function applyCosteoEditMode(){
+  let form=$('costForm');if(!form)return;
+  let editable=(await canUpdateCosteo())&&!costeoHistoryReadOnly;
+  form.querySelectorAll('[name]').forEach(field=>field.disabled=!editable);
+  let save=form.querySelector('.actions .primary');
+  if(save)save.classList.toggle('hidden',!editable);
+  let note=$('costeoDetailPermission');
+  if(!note){form.querySelector('.actions').insertAdjacentHTML('afterbegin','<span id="costeoDetailPermission" class="sub" style="align-self:center"></span>');note=$('costeoDetailPermission')}
+  note.textContent=editable?'Puede actualizar este costeo.':'Consulta de costeo: solo la cuenta autorizada puede actualizarlo.';
 }
 function renderCostingHistory(){
   let body=$('costingHistoryBody'),filter=$('costingMonthFilter')?.value||'';
   if(!body)return;
   let rows=costingHistoryRows.filter(row=>!filter||String(row.fecha_actualizacion||'').startsWith(filter));
-  body.innerHTML=rows.map(row=>`<tr><td>${esc(costeoHistoryDate(row.fecha_actualizacion))}</td><td><b>${esc(row.vin||'—')}</b></td><td>${esc(row.marca||'—')}</td><td>${esc(row.modelo||'—')}</td><td>${esc(row.anio||'—')}</td><td>${esc(row.color||'—')}</td><td>${esc(row.estatus||'Pendiente')}</td><td>${esc(row.estado||'—')}</td><td><b>${money(row.costo_total||0)}</b></td></tr>`).join('')||'<tr><td colspan="9" class="sub">No hay costeos para el período seleccionado.</td></tr>';
+  body.innerHTML=rows.map(row=>`<tr style="cursor:pointer" onclick="openCostingHistoryDetail(${Number(row.vehiculo_id)},false)"><td>${esc(costeoHistoryDate(row.fecha_actualizacion))}</td><td><b>${esc(row.vin||'—')}</b></td><td>${esc(row.marca||'—')}</td><td>${esc(row.modelo||'—')}</td><td>${esc(row.anio||'—')}</td><td>${esc(row.color||'—')}</td><td>${esc(row.estatus||'Pendiente')}</td><td>${esc(row.estado||'—')}</td><td><b>${money(row.costo_total||0)}</b></td><td><button class="btn2" type="button" onclick="event.stopPropagation();openCostingHistoryDetail(${Number(row.vehiculo_id)},false)">Ver detalle</button>${canUpdateCosteoCached()?` <button class="btn2" type="button" onclick="event.stopPropagation();openCostingHistoryDetail(${Number(row.vehiculo_id)},true)">Editar</button>`:''}</td></tr>`).join('')||'<tr><td colspan="10" class="sub">No hay costeos para el período seleccionado.</td></tr>';
+}
+function canUpdateCosteoCached(){return String(accessSession?.usuario||'').trim().toLowerCase()===costeoEditorUsername}
+async function openCostingHistoryDetail(vehicleId,edit){
+  if(edit&&!(await canUpdateCosteo()))return showNotice('Solo la cuenta autorizada puede actualizar el costeo.','error');
+  let row=costingHistoryRows.find(item=>Number(item.vehiculo_id)===Number(vehicleId)),select=$('costVehicle');
+  if(!row||!select)return;
+  costeoHistoryReadOnly=!edit;
+  if(!select.querySelector(`option[value="${Number(vehicleId)}"]`))select.insertAdjacentHTML('beforeend',`<option value="${Number(vehicleId)}">${esc(row.vin)} · ${esc(`${row.marca||''} ${row.modelo||''}`.trim())}</option>`);
+  select.value=String(vehicleId);
+  await loadCostVehicle();
+  $('costForm').scrollIntoView({behavior:'smooth',block:'start'});
 }
 async function loadCostingHistory(){
   ensureCostingHistory();
   let select=$('costingMonthFilter'),previous=select.value;
   try{
+    await canUpdateCosteo();
     costingHistoryRows=await get('/api/costeos');
     let months=[...new Set(costingHistoryRows.map(row=>String(row.fecha_actualizacion||'').slice(0,7)).filter(Boolean))].sort().reverse();
     select.innerHTML='<option value="">Todos los meses</option>'+months.map(month=>`<option value="${esc(month)}">${esc(month)}</option>`).join('');
@@ -1310,5 +1338,11 @@ const loadCostingWithHistory=loadCosting;
 loadCosting=async function(){await loadCostingWithHistory();await loadCostingHistory()};
 const saveCosteoWithHistory=saveCosteo;
 saveCosteo=async function(event){await saveCosteoWithHistory(event);await loadCostingHistory()};
+const loadCostVehicleWithCosteoPermission=loadCostVehicle;
+loadCostVehicle=async function(){await loadCostVehicleWithCosteoPermission();await applyCosteoEditMode()};
+const searchCostVinWithCosteoPermission=searchCostVin;
+searchCostVin=function(){costeoHistoryReadOnly=false;return searchCostVinWithCosteoPermission()};
+let costVehicleForCosteoPermission=$('costVehicle');
+if(costVehicleForCosteoPermission)costVehicleForCosteoPermission.onchange=()=>{costeoHistoryReadOnly=false;loadCostVehicle()};
 dash();
 </script></body></html>

@@ -172,6 +172,21 @@ class CriticalFlowsTest(unittest.TestCase):
         self.assertTrue(all('vin' in row and 'costo_total' in row for row in rows))
         self.assertTrue(all(row['fecha_actualizacion'] for row in rows))
 
+    def test_only_authorized_account_can_update_costing(self):
+        connection = self.server.db()
+        profile = connection.execute('SELECT id FROM perfiles WHERE es_administrador=1 LIMIT 1').fetchone()
+        vehicle = connection.execute('SELECT id FROM vehiculos ORDER BY id LIMIT 1').fetchone()
+        cursor = connection.execute('''INSERT INTO usuarios(username,password_hash,nombre,email,rol,activo,perfil_id)
+            VALUES(?,?,?,?,?,?,?)''', ('other-costing-user', 'unused', 'Otro usuario', 'other-costing-user@example.com', 'Administrador', 1, profile['id']))
+        user_id = cursor.lastrowid
+        connection.commit()
+        connection.close()
+        with self.client.session_transaction() as session:
+            session['user_id'] = user_id
+            session['sesion_version'] = 1
+        response = self.client.put(f"/api/vehiculos/{vehicle['id']}/adquisicion", json={'ajuste_compra': 1})
+        self.assertEqual(response.status_code, 403)
+
     def test_continuing_workshop_does_not_create_a_new_order(self):
         self.login_as_admin()
         connection = self.server.db()

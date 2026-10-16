@@ -27,6 +27,7 @@ app=Flask(__name__)
 app.config.update(SECRET_KEY=SECRET_KEY,SESSION_COOKIE_HTTPONLY=True,SESSION_COOKIE_SAMESITE='Lax',SESSION_COOKIE_SECURE=os.environ.get('SESSION_COOKIE_SECURE','').lower() in {'1','true','yes'})
 ESTADOS_VEHICULO=('En Tránsito','Nacionalizado','En Taller','DPV','Reservado','Vendido')
 ZONA_HORARIA_OPERACION=ZoneInfo('America/Tegucigalpa')
+COSTEO_EDITOR_USERNAME=os.environ.get('COSTEO_EDITOR_USERNAME','erickmadrid.sabillon@gmail.com').strip().casefold()
 
 def ahora_operacion():
     """Fecha y hora que rigen los períodos operativos de Corporación Triple AAA."""
@@ -124,6 +125,11 @@ def user_access(user_id):
                  for item in c.execute('SELECT modulo,puede_ver,puede_modificar FROM perfil_permisos WHERE perfil_id=?',(data.get('perfil_id'),))}
     c.close(); data['permisos']=permissions
     return data
+
+def puede_actualizar_costeo():
+    """El costeo histórico solo puede ser actualizado por la cuenta autorizada."""
+    user=user_access(session.get('user_id')) if session.get('user_id') else None
+    return bool(user and str(user.get('username') or '').strip().casefold()==COSTEO_EDITOR_USERNAME)
 
 def request_module(path):
     if path.startswith('/api/usuarios') or path.startswith('/api/perfiles'): return 'usuarios'
@@ -4057,6 +4063,8 @@ def delete_costo(vid,cid):
 
 @app.put('/api/vehiculos/<int:vid>/adquisicion')
 def put_adquisicion(vid):
+    if not puede_actualizar_costeo():
+        return jsonify(error='Solo la cuenta autorizada puede actualizar el costeo.'),403
     d=request.get_json(force=True); c=db()
     vehicle=c.execute('SELECT id,estado,ubicacion,precio_compra FROM vehiculos WHERE id=?',(vid,)).fetchone()
     if not vehicle:
