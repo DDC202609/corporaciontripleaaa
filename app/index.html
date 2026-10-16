@@ -1344,5 +1344,19 @@ const searchCostVinWithCosteoPermission=searchCostVin;
 searchCostVin=function(){costeoHistoryReadOnly=false;return searchCostVinWithCosteoPermission()};
 let costVehicleForCosteoPermission=$('costVehicle');
 if(costVehicleForCosteoPermission)costVehicleForCosteoPermission.onchange=()=>{costeoHistoryReadOnly=false;loadCostVehicle()};
+/* Consulta de inventario: antigüedad basada en meses completos desde la adquisición. */
+function renderInventoryAgingReport(){
+  let summaries=$('inventorySummaries'),mainTable=$('inventoryBody')?.closest('.panel');
+  if(!summaries||!mainTable)return;
+  $('inventoryAgingReport')?.remove();
+  let now=new Date(),rows=inventoryRows.filter(row=>row.estado!=='Vendido').map(row=>{
+    let purchaseDate=purchaseDateValue(row.fecha_compra||row.fecha_adquisicion),months=purchaseDate?completedPurchaseMonths(purchaseDate,now):0;
+    return {...row,compraFecha:purchaseDate,antiguedad:months};
+  }).filter(row=>row.compraFecha&&row.antiguedad>=6).sort((left,right)=>right.antiguedad-left.antiguedad||String(left.vin||'').localeCompare(String(right.vin||'')));
+  let body=rows.map(row=>`<tr class="clickrow" onclick="openDetail(${Number(row.id)})"><td><b>${esc(row.vin)}</b></td><td>${esc(row.placa||'—')}</td><td>${esc(row.marca||'—')}</td><td>${esc(row.modelo||'—')}</td><td>${esc(row.fecha_compra||row.fecha_adquisicion||'—')}</td><td><b>${row.antiguedad} meses</b></td><td><span class="pill">${esc(row.estado||'—')}</span></td><td><b>${money(row.costo_total||0)}</b></td><td>${row.precio_venta?money(row.precio_venta):'—'}</td></tr>`).join('')||'<tr><td colspan="9" class="sub">No hay vehículos no vendidos con más de 6 meses desde la adquisición.</td></tr>';
+  mainTable.insertAdjacentHTML('beforebegin',`<div id="inventoryAgingReport" class="panel wide-table"><div class="detailhead"><div><h2 style="margin:0">Inventario con más de 6 meses desde la adquisición</h2><div class="sub">Vehículos no vendidos; seleccione una fila para ver su detalle.</div></div><b>${rows.length} unidades</b></div><table><thead><tr><th>VIN</th><th>Placa</th><th>Marca</th><th>Modelo</th><th>Fecha adquisición</th><th>Antigüedad</th><th>Estatus</th><th>Costo total</th><th>Precio de venta</th></tr></thead><tbody>${body}</tbody></table></div>`);
+}
+const loadInventoryScreenWithAgingReport=loadInventoryScreen;
+loadInventoryScreen=async function(){await loadInventoryScreenWithAgingReport();renderInventoryAgingReport()};
 dash();
 </script></body></html>
