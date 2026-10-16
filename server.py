@@ -152,6 +152,7 @@ def request_module(path):
     if path.startswith('/api/inventario'): return 'inventario'
     if path.startswith('/api/adquisiciones'): return 'adquisiciones'
     if path.startswith('/api/ordenes-trabajo') or path.startswith('/api/repuestos-ot'): return 'taller'
+    if path.startswith('/api/costeos'): return 'costeo'
     if path.startswith('/api/vehiculos'):
         return 'vehiculos'
     return None
@@ -4021,6 +4022,21 @@ def post_movimiento(vid):
 @app.get('/api/vehiculos/<int:vid>/costos')
 def get_costos(vid):
     c=db(); items=c.execute('SELECT * FROM costos_vehiculo WHERE vehiculo_id=? ORDER BY fecha DESC,id DESC',(vid,)).fetchall(); total=c.execute('SELECT COALESCE(SUM(monto),0) FROM costos_vehiculo WHERE vehiculo_id=?',(vid,)).fetchone()[0]; c.close(); return jsonify(total=total,items=[dict(x) for x in items])
+
+@app.get('/api/costeos')
+def get_costeos():
+    """Historial de vehículos con costeo de adquisición registrado."""
+    c=db()
+    rows=c.execute('''SELECT ca.*,v.vin,v.marca,v.modelo,v.anio,v.color,v.estado,v.placa
+        FROM costos_adquisicion ca
+        JOIN vehiculos v ON v.id=ca.vehiculo_id
+        ORDER BY ca.fecha_actualizacion DESC,ca.id DESC''').fetchall()
+    result=[]
+    for row in rows:
+        item=dict(row)
+        item['costo_total']=costo_consolidado(c,item['vehiculo_id'])
+        result.append(item)
+    c.close(); return jsonify(result)
 
 @app.post('/api/vehiculos/<int:vid>/costos')
 def post_costo(vid):

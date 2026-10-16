@@ -163,6 +163,15 @@ class CriticalFlowsTest(unittest.TestCase):
             sum(item['monto'] for item in breakdown), detail['costo_real'], places=2
         )
 
+    def test_costing_history_lists_registered_vehicle_costings(self):
+        self.login_as_admin()
+        response = self.client.get('/api/costeos')
+        self.assertEqual(response.status_code, 200)
+        rows = response.get_json()
+        self.assertTrue(rows)
+        self.assertTrue(all('vin' in row and 'costo_total' in row for row in rows))
+        self.assertTrue(all(row['fecha_actualizacion'] for row in rows))
+
     def test_continuing_workshop_does_not_create_a_new_order(self):
         self.login_as_admin()
         connection = self.server.db()

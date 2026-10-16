@@ -1282,5 +1282,33 @@ renderSalesHistory=function(){
     else if(!sale&&element.children.length===1)element.children[0].colSpan=11;
   });
 };
+/* Historial de costeo: conserva visibles los vehículos ya costeados, aunque ya no estén en tránsito. */
+let costingHistoryRows=[];
+function costeoHistoryDate(value){let match=String(value||'').match(/^(\d{4})-(\d{2})-(\d{2})/);return match?`${match[3]}/${match[2]}/${match[1]}`:(value||'—')}
+function ensureCostingHistory(){
+  if($('costingHistory'))return;
+  $('cost').insertAdjacentHTML('beforeend',`<div id="costingHistory" class="panel wide-table"><div class="top"><div><h2>Historial de costeos</h2><div class="sub">Vehículos con costeo de adquisición guardado.</div></div><div class="actions"><select id="costingMonthFilter" onchange="renderCostingHistory()"><option value="">Todos los meses</option></select><button type="button" class="btn2" onclick="loadCostingHistory()">Actualizar</button></div></div><div class="tablewrap"><table><thead><tr><th>Fecha de costeo</th><th>VIN</th><th>Marca</th><th>Modelo</th><th>Año</th><th>Color</th><th>Nacionalización</th><th>Etapa actual</th><th>Costo total</th></tr></thead><tbody id="costingHistoryBody"><tr><td colspan="9" class="sub">Cargando historial...</td></tr></tbody></table></div></div>`);
+}
+function renderCostingHistory(){
+  let body=$('costingHistoryBody'),filter=$('costingMonthFilter')?.value||'';
+  if(!body)return;
+  let rows=costingHistoryRows.filter(row=>!filter||String(row.fecha_actualizacion||'').startsWith(filter));
+  body.innerHTML=rows.map(row=>`<tr><td>${esc(costeoHistoryDate(row.fecha_actualizacion))}</td><td><b>${esc(row.vin||'—')}</b></td><td>${esc(row.marca||'—')}</td><td>${esc(row.modelo||'—')}</td><td>${esc(row.anio||'—')}</td><td>${esc(row.color||'—')}</td><td>${esc(row.estatus||'Pendiente')}</td><td>${esc(row.estado||'—')}</td><td><b>${money(row.costo_total||0)}</b></td></tr>`).join('')||'<tr><td colspan="9" class="sub">No hay costeos para el período seleccionado.</td></tr>';
+}
+async function loadCostingHistory(){
+  ensureCostingHistory();
+  let select=$('costingMonthFilter'),previous=select.value;
+  try{
+    costingHistoryRows=await get('/api/costeos');
+    let months=[...new Set(costingHistoryRows.map(row=>String(row.fecha_actualizacion||'').slice(0,7)).filter(Boolean))].sort().reverse();
+    select.innerHTML='<option value="">Todos los meses</option>'+months.map(month=>`<option value="${esc(month)}">${esc(month)}</option>`).join('');
+    select.value=months.includes(previous)?previous:'';
+    renderCostingHistory();
+  }catch(error){console.error(error);$('costingHistoryBody').innerHTML='<tr><td colspan="9" class="sub">No se pudo cargar el historial de costeos.</td></tr>'}
+}
+const loadCostingWithHistory=loadCosting;
+loadCosting=async function(){await loadCostingWithHistory();await loadCostingHistory()};
+const saveCosteoWithHistory=saveCosteo;
+saveCosteo=async function(event){await saveCosteoWithHistory(event);await loadCostingHistory()};
 dash();
 </script></body></html>
