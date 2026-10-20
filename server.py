@@ -1,7 +1,7 @@
 from flask import Flask, request, jsonify, send_from_directory, send_file, session, redirect, url_for, render_template_string, g, has_request_context
 from werkzeug.exceptions import HTTPException
 from werkzeug.security import check_password_hash, generate_password_hash
-import sqlite3, os, shutil, uuid, hmac, io, json, tempfile, zipfile, re, csv
+import sqlite3, os, shutil, uuid, hmac, io, json, tempfile, zipfile, re, csv, calendar
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 ROOT=os.path.dirname(os.path.abspath(__file__))
@@ -738,8 +738,56 @@ def init_db(sync_history=True):
         creado_en TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         actualizado_en TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     )''')
+    payroll_columns={row['name'] for row in c.execute('PRAGMA table_info(empleados_planilla)')}
+    if 'activo' not in payroll_columns:
+        c.execute('ALTER TABLE empleados_planilla ADD COLUMN activo INTEGER NOT NULL DEFAULT 1')
     c.execute('CREATE INDEX IF NOT EXISTS ix_empleados_planilla_departamento ON empleados_planilla(departamento_id)')
     c.execute('CREATE INDEX IF NOT EXISTS ix_empleados_planilla_cuenta ON empleados_planilla(cuenta_contable_id)')
+    # Comisiones variables y planillas generadas.  Se mantienen fuera del
+    # maestro para que cada quincena conserve exactamente lo que se calculó.
+    c.execute('''CREATE TABLE IF NOT EXISTS comisiones_planilla(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        empleado_id INTEGER NOT NULL REFERENCES empleados_planilla(id),
+        fecha TEXT NOT NULL,
+        monto REAL NOT NULL CHECK(monto>0),
+        descripcion TEXT,
+        creado_en TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )''')
+    c.execute('CREATE INDEX IF NOT EXISTS ix_comisiones_planilla_empleado_fecha ON comisiones_planilla(empleado_id,fecha)')
+    c.execute('''CREATE TABLE IF NOT EXISTS planillas_quincenales(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        periodo_inicio TEXT NOT NULL,
+        periodo_fin TEXT NOT NULL,
+        fecha_generacion TEXT NOT NULL,
+        estado TEXT NOT NULL DEFAULT 'Pagada',
+        total_salarios REAL NOT NULL DEFAULT 0,
+        total_comisiones REAL NOT NULL DEFAULT 0,
+        total_bonos REAL NOT NULL DEFAULT 0,
+        total_deducciones REAL NOT NULL DEFAULT 0,
+        total_neto REAL NOT NULL DEFAULT 0,
+        creado_en TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(periodo_inicio,periodo_fin)
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS planillas_quincenales_detalle(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        planilla_id INTEGER NOT NULL REFERENCES planillas_quincenales(id) ON DELETE CASCADE,
+        empleado_id INTEGER NOT NULL REFERENCES empleados_planilla(id),
+        empleado_nombre TEXT NOT NULL,
+        numero_identidad TEXT NOT NULL,
+        departamento_nombre TEXT,
+        cuenta_contable_nombre TEXT,
+        salario REAL NOT NULL DEFAULT 0,
+        comisiones_fijas REAL NOT NULL DEFAULT 0,
+        comisiones_registradas REAL NOT NULL DEFAULT 0,
+        comisiones REAL NOT NULL DEFAULT 0,
+        bonos REAL NOT NULL DEFAULT 0,
+        ihss REAL NOT NULL DEFAULT 0,
+        rap REAL NOT NULL DEFAULT 0,
+        otras_deducciones REAL NOT NULL DEFAULT 0,
+        total_devengado REAL NOT NULL DEFAULT 0,
+        neto REAL NOT NULL DEFAULT 0
+    )''')
+    c.execute('CREATE INDEX IF NOT EXISTS ix_planillas_quincenales_detalle_planilla ON planillas_quincenales_detalle(planilla_id)')
     c.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_pagos_cxp_referencia ON pagos_cuentas_por_pagar(referencia) WHERE referencia IS NOT NULL AND referencia<>''")
     c.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_cobros_cxc_referencia ON cobros_cuentas_por_cobrar(referencia) WHERE referencia IS NOT NULL AND referencia<>''")
     c.execute('''CREATE TABLE IF NOT EXISTS conteos_inventario(
@@ -2514,16 +2562,68 @@ def empleado_planilla_detalle(c, employee_id):
         WHERE ep.id=?''',(employee_id,)).fetchone()
     return dict(row) if row else None
 
+def fecha_planilla(value):
+    try:
+        return datetime.strptime(str(value), '%Y-%m-%d').date()
+    except (TypeError, ValueError):
+        return None
+
+def periodo_quincenal(fecha_referencia):
+    """Devuelve la quincena fija (1–15 o 16–fin de mes) de una fecha."""
+    fecha=fecha_planilla(fecha_referencia)
+    if not fecha:
+        return None
+    inicio=fecha.replace(day=1 if fecha.day<=15 else 16)
+    fin=fecha.replace(day=15 if fecha.day<=15 else calendar.monthrange(fecha.year,fecha.month)[1])
+    return inicio.isoformat(),fin.isoformat()
+
+def calcular_planilla_quincenal(c, fecha_referencia):
+    periodo=periodo_quincenal(fecha_referencia)
+    if not periodo:
+        return None, 'La fecha de referencia no es válida.'
+    inicio,fin=periodo
+    empleados=[dict(row) for row in c.execute('''SELECT ep.*,d.nombre departamento_nombre,
+        cc.codigo cuenta_codigo,cc.cuenta cuenta_nombre
+        FROM empleados_planilla ep
+        JOIN departamentos d ON d.id=ep.departamento_id
+        JOIN cuentas_contables cc ON cc.id=ep.cuenta_contable_id
+        WHERE ep.activo=1 ORDER BY ep.nombre COLLATE NOCASE,ep.id''').fetchall()]
+    comisiones={row['empleado_id']:float(row['monto'] or 0) for row in c.execute('''SELECT empleado_id,SUM(monto) monto
+        FROM comisiones_planilla WHERE fecha BETWEEN ? AND ? GROUP BY empleado_id''',(inicio,fin)).fetchall()}
+    detalles=[]
+    for empleado in empleados:
+        salario=round(float(empleado['salario'] or 0)/2,2)
+        comisiones_fijas=round(float(empleado['comisiones'] or 0)/2,2)
+        comisiones_registradas=round(comisiones.get(empleado['id'],0),2)
+        total_comisiones=round(comisiones_fijas+comisiones_registradas,2)
+        bonos=round(float(empleado['bonos'] or 0)/2,2)
+        ihss=round(float(empleado['ihss'] or 0)/2,2)
+        rap=round(float(empleado['rap'] or 0)/2,2)
+        otras=round(float(empleado['otras_deducciones'] or 0)/2,2)
+        devengado=round(salario+total_comisiones+bonos,2)
+        deducciones=round(ihss+rap+otras,2)
+        detalles.append({
+            'empleado_id':empleado['id'],'empleado_nombre':empleado['nombre'],'numero_identidad':empleado['numero_identidad'],
+            'departamento_nombre':empleado['departamento_nombre'],'cuenta_contable_nombre':f"{empleado['cuenta_codigo']} · {empleado['cuenta_nombre']}",
+            'salario':salario,'comisiones_fijas':comisiones_fijas,'comisiones_registradas':comisiones_registradas,
+            'comisiones':total_comisiones,'bonos':bonos,'ihss':ihss,'rap':rap,'otras_deducciones':otras,
+            'total_devengado':devengado,'total_deducciones':deducciones,'neto':round(devengado-deducciones,2)
+        })
+    totales={key:round(sum(detalle[key] for detalle in detalles),2) for key in
+        ('salario','comisiones','bonos','total_deducciones','neto')}
+    return {'periodo_inicio':inicio,'periodo_fin':fin,'empleados':detalles,'totales':totales},None
+
 @app.get('/api/planillas')
 def get_planillas():
     c=db()
+    activos=request.args.get('activos') in ('1','true','si')
     rows=c.execute('''SELECT ep.*,d.codigo departamento_codigo,d.nombre departamento_nombre,
         cc.codigo cuenta_codigo,cc.cuenta cuenta_nombre
         FROM empleados_planilla ep
         JOIN departamentos d ON d.id=ep.departamento_id
         JOIN cuentas_contables cc ON cc.id=ep.cuenta_contable_id
-        WHERE ep.activo=1
-        ORDER BY ep.nombre COLLATE NOCASE,ep.id''').fetchall()
+        WHERE (?=0 OR ep.activo=1)
+        ORDER BY ep.nombre COLLATE NOCASE,ep.id''',(1 if activos else 0,)).fetchall()
     c.close(); return jsonify([dict(row) for row in rows])
 
 @app.post('/api/planillas')
@@ -2544,6 +2644,120 @@ def crear_empleado_planilla():
     finally:
         c.close()
     return jsonify(employee),201
+
+@app.post('/api/planillas/<int:employee_id>/baja')
+def dar_baja_empleado_planilla(employee_id):
+    c=db()
+    try:
+        employee=empleado_planilla_detalle(c,employee_id)
+        if not employee: return jsonify(error='Empleado de planilla no encontrado.'),404
+        if not employee['activo']: return jsonify(error='El empleado ya está inactivo.'),409
+        c.execute('UPDATE empleados_planilla SET activo=0,actualizado_en=CURRENT_TIMESTAMP WHERE id=?',(employee_id,))
+        c.commit(); employee=empleado_planilla_detalle(c,employee_id)
+    finally:
+        c.close()
+    return jsonify(employee)
+
+@app.post('/api/planillas/<int:employee_id>/reactivar')
+def reactivar_empleado_planilla(employee_id):
+    c=db()
+    try:
+        employee=empleado_planilla_detalle(c,employee_id)
+        if not employee: return jsonify(error='Empleado de planilla no encontrado.'),404
+        c.execute('UPDATE empleados_planilla SET activo=1,actualizado_en=CURRENT_TIMESTAMP WHERE id=?',(employee_id,))
+        c.commit(); employee=empleado_planilla_detalle(c,employee_id)
+    finally:
+        c.close()
+    return jsonify(employee)
+
+@app.get('/api/planillas/comisiones')
+def get_comisiones_planilla():
+    c=db()
+    rows=c.execute('''SELECT cp.*,ep.nombre empleado_nombre,ep.numero_identidad
+        FROM comisiones_planilla cp JOIN empleados_planilla ep ON ep.id=cp.empleado_id
+        ORDER BY cp.fecha DESC,cp.id DESC''').fetchall()
+    c.close(); return jsonify([dict(row) for row in rows])
+
+@app.post('/api/planillas/comisiones')
+def crear_comision_planilla():
+    data=request.get_json(silent=True) or {}
+    try:
+        empleado_id=int(data.get('empleado_id') or 0); monto=round(float(data.get('monto') or 0),2)
+    except (TypeError,ValueError):
+        return jsonify(error='El empleado y el monto de la comisión son obligatorios.'),400
+    fecha=fecha_planilla(data.get('fecha'))
+    if not empleado_id or not fecha or monto<=0:
+        return jsonify(error='Indique un empleado activo, una fecha válida y un monto mayor que cero.'),400
+    c=db()
+    try:
+        if not c.execute('SELECT 1 FROM empleados_planilla WHERE id=? AND activo=1',(empleado_id,)).fetchone():
+            return jsonify(error='El empleado seleccionado no está activo.'),400
+        cur=c.execute('INSERT INTO comisiones_planilla(empleado_id,fecha,monto,descripcion) VALUES(?,?,?,?)',
+            (empleado_id,fecha.isoformat(),monto,(data.get('descripcion') or '').strip() or None))
+        c.commit()
+        row=c.execute('''SELECT cp.*,ep.nombre empleado_nombre,ep.numero_identidad FROM comisiones_planilla cp
+            JOIN empleados_planilla ep ON ep.id=cp.empleado_id WHERE cp.id=?''',(cur.lastrowid,)).fetchone()
+    finally:
+        c.close()
+    return jsonify(dict(row)),201
+
+@app.get('/api/planillas/quincenas/preview')
+def vista_previa_planilla_quincenal():
+    c=db()
+    try:
+        calculo,error=calcular_planilla_quincenal(c,request.args.get('fecha') or ahora_operacion().date().isoformat())
+        if error: return jsonify(error=error),400
+        existente=c.execute('SELECT id,estado FROM planillas_quincenales WHERE periodo_inicio=? AND periodo_fin=?',
+            (calculo['periodo_inicio'],calculo['periodo_fin'])).fetchone()
+        calculo['planilla_existente']=dict(existente) if existente else None
+        return jsonify(calculo)
+    finally:
+        c.close()
+
+@app.get('/api/planillas/quincenas')
+def get_planillas_quincenales():
+    c=db()
+    rows=c.execute('''SELECT p.*,COUNT(d.id) empleados
+        FROM planillas_quincenales p LEFT JOIN planillas_quincenales_detalle d ON d.planilla_id=p.id
+        GROUP BY p.id ORDER BY p.periodo_inicio DESC,p.id DESC''').fetchall()
+    c.close(); return jsonify([dict(row) for row in rows])
+
+@app.get('/api/planillas/quincenas/<int:payroll_id>')
+def get_planilla_quincenal(payroll_id):
+    c=db()
+    try:
+        header=c.execute('SELECT * FROM planillas_quincenales WHERE id=?',(payroll_id,)).fetchone()
+        if not header: return jsonify(error='Planilla no encontrada.'),404
+        details=c.execute('SELECT * FROM planillas_quincenales_detalle WHERE planilla_id=? ORDER BY empleado_nombre COLLATE NOCASE,id',(payroll_id,)).fetchall()
+        result=dict(header); result['empleados']=[dict(row) for row in details]
+        return jsonify(result)
+    finally:
+        c.close()
+
+@app.post('/api/planillas/quincenas')
+def generar_planilla_quincenal():
+    data=request.get_json(silent=True) or {}
+    c=db()
+    try:
+        calculo,error=calcular_planilla_quincenal(c,data.get('fecha_referencia') or ahora_operacion().date().isoformat())
+        if error: return jsonify(error=error),400
+        if not calculo['empleados']: return jsonify(error='No hay empleados activos para generar la planilla.'),400
+        existente=c.execute('SELECT id FROM planillas_quincenales WHERE periodo_inicio=? AND periodo_fin=?',
+            (calculo['periodo_inicio'],calculo['periodo_fin'])).fetchone()
+        if existente: return jsonify(error='Ya existe una planilla registrada para esta quincena.',planilla_id=existente['id']),409
+        totals=calculo['totales']
+        cur=c.execute('''INSERT INTO planillas_quincenales(periodo_inicio,periodo_fin,fecha_generacion,estado,total_salarios,total_comisiones,total_bonos,total_deducciones,total_neto)
+            VALUES(?,?,?,'Pagada',?,?,?,?,?)''',(calculo['periodo_inicio'],calculo['periodo_fin'],ahora_operacion().date().isoformat(),
+            totals['salario'],totals['comisiones'],totals['bonos'],totals['total_deducciones'],totals['neto']))
+        for detail in calculo['empleados']:
+            c.execute('''INSERT INTO planillas_quincenales_detalle(planilla_id,empleado_id,empleado_nombre,numero_identidad,departamento_nombre,cuenta_contable_nombre,
+                salario,comisiones_fijas,comisiones_registradas,comisiones,bonos,ihss,rap,otras_deducciones,total_devengado,neto)
+                VALUES(:planilla_id,:empleado_id,:empleado_nombre,:numero_identidad,:departamento_nombre,:cuenta_contable_nombre,:salario,:comisiones_fijas,
+                :comisiones_registradas,:comisiones,:bonos,:ihss,:rap,:otras_deducciones,:total_devengado,:neto)''',dict(detail,planilla_id=cur.lastrowid))
+        c.commit()
+        return jsonify(id=cur.lastrowid,**calculo),201
+    finally:
+        c.close()
 
 @app.put('/api/planillas/<int:employee_id>')
 def actualizar_empleado_planilla(employee_id):

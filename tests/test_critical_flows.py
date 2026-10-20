@@ -68,6 +68,50 @@ class CriticalFlowsTest(unittest.TestCase):
         self.assertEqual(response.get_json(), {'status': 'ok'})
         self.assertEqual(response.headers['X-Content-Type-Options'], 'nosniff')
 
+    def test_payroll_generates_biweekly_run_with_registered_commissions(self):
+        self.login_as_admin()
+        connection = self.server.db()
+        department = connection.execute('SELECT id FROM departamentos WHERE activo=1 ORDER BY id LIMIT 1').fetchone()
+        account = connection.execute('SELECT id FROM cuentas_contables WHERE activo=1 ORDER BY id LIMIT 1').fetchone()
+        connection.close()
+        self.assertIsNotNone(department)
+        self.assertIsNotNone(account)
+        employee_response = self.client.post('/api/planillas', json={
+            'nombre': 'Empleado Planilla QA', 'numero_identidad': 'QA-PLANILLA-001',
+            'salario': 20000, 'comisiones': 1200, 'bonos': 600,
+            'ihss': 400, 'rap': 200, 'otras_deducciones': 100,
+            'departamento_id': department['id'], 'cuenta_contable_id': account['id'],
+        })
+        self.assertEqual(employee_response.status_code, 201)
+        employee = employee_response.get_json()
+        commission_response = self.client.post('/api/planillas/comisiones', json={
+            'empleado_id': employee['id'], 'fecha': '2026-10-10',
+            'monto': 350, 'descripcion': 'Comisión QA',
+        })
+        self.assertEqual(commission_response.status_code, 201)
+        preview = self.client.get('/api/planillas/quincenas/preview?fecha=2026-10-10')
+        self.assertEqual(preview.status_code, 200)
+        preview_data = preview.get_json()
+        detail = next(row for row in preview_data['empleados'] if row['empleado_id'] == employee['id'])
+        self.assertEqual((preview_data['periodo_inicio'], preview_data['periodo_fin']), ('2026-10-01', '2026-10-15'))
+        self.assertAlmostEqual(detail['salario'], 10000)
+        self.assertAlmostEqual(detail['comisiones_fijas'], 600)
+        self.assertAlmostEqual(detail['comisiones_registradas'], 350)
+        self.assertAlmostEqual(detail['neto'], 10900)
+        generated = self.client.post('/api/planillas/quincenas', json={'fecha_referencia': '2026-10-10'})
+        self.assertEqual(generated.status_code, 201)
+        payroll_id = generated.get_json()['id']
+        history = self.client.get('/api/planillas/quincenas').get_json()
+        self.assertTrue(any(row['id'] == payroll_id and row['estado'] == 'Pagada' for row in history))
+        duplicate = self.client.post('/api/planillas/quincenas', json={'fecha_referencia': '2026-10-10'})
+        self.assertEqual(duplicate.status_code, 409)
+        termination = self.client.post(f"/api/planillas/{employee['id']}/baja")
+        self.assertEqual(termination.status_code, 200)
+        active = self.client.get('/api/planillas?activos=1').get_json()
+        self.assertFalse(any(row['id'] == employee['id'] for row in active))
+        all_employees = self.client.get('/api/planillas').get_json()
+        self.assertTrue(any(row['id'] == employee['id'] and not row['activo'] for row in all_employees))
+
     def test_physical_inventory_count_compares_system_and_scanned_vins(self):
         self.login_as_admin()
         response = self.client.post('/api/conteos-inventario', json={
