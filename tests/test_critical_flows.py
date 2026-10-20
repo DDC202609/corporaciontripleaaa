@@ -105,6 +105,10 @@ class CriticalFlowsTest(unittest.TestCase):
         self.assertTrue(any(row['id'] == payroll_id and row['estado'] == 'Generada' for row in history))
         duplicate = self.client.post('/api/planillas/quincenas', json={'fecha_referencia': '2026-10-10'})
         self.assertEqual(duplicate.status_code, 409)
+        missing_reference = self.client.post(f'/api/planillas/quincenas/{payroll_id}/registrar-pago', json={
+            'fecha_pago': '2026-10-16', 'banco': 'BAC Credomatic',
+        })
+        self.assertEqual(missing_reference.status_code, 400)
         paid = self.client.post(f'/api/planillas/quincenas/{payroll_id}/registrar-pago', json={
             'fecha_pago': '2026-10-16', 'banco': 'BAC Credomatic', 'referencia': 'QA-PLANILLA-PAGO',
         })

@@ -2757,8 +2757,8 @@ def registrar_pago_planilla_quincenal(payroll_id):
     fecha=fecha_planilla(data.get('fecha_pago') or ahora_operacion().date().isoformat())
     banco=(data.get('banco') or '').strip()
     referencia=(data.get('referencia') or '').strip()
-    if not fecha or not banco:
-        return jsonify(error='Indique la fecha de aplicación y el banco desde el que se pagó la planilla.'),400
+    if not fecha or not banco or not referencia:
+        return jsonify(error='Indique la fecha de aplicación, el banco y la referencia del pago de planilla.'),400
     c=db()
     try:
         planilla=c.execute('SELECT * FROM planillas_quincenales WHERE id=?',(payroll_id,)).fetchone()
