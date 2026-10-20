@@ -3804,6 +3804,63 @@ def get_planificacion_financiera():
 def _modelo_planificacion(value):
     return ' '.join(str(value or '').strip().split()).upper()
 
+# Configuración inicial entregada por gerencia.  El promedio mensual no se
+# guarda porque siempre se calcula a partir de las ventas de los últimos 12
+# meses.  Las metas por etapa y por año sí son parámetros editables.
+PARAMETROS_INVENTARIO_OPTIMO_BASE = [
+    ('CRV',5,5,5,{2010:1,2011:1,2014:2,2015:2,2016:2,2017:1,2018:1,2020:1,2023:1}),
+    ('F-150',3,3,2,{2016:2,2018:2,2020:2}),
+    ('EXPLORER',6,6,6,{2015:2,2018:2,2021:1,2022:1}),
+    ('RAV4',5,5,5,{2012:1,2014:1,2015:1,2016:2,2018:1,2020:2,2021:2,2022:1}),
+    ('ELANTRA',2,2,1,{2016:2,2018:2,2020:1}), ('COLORADO',2,2,2,{2018:1,2019:1}),
+    ('FRONTIER',3,2,2,{2015:1,2016:1,2017:1}), ('PRADO',0,0,0,{}),
+    ('ROGUE',2,1,1,{2016:2,2018:2}), ('NP300',0,0,0,{}),
+    ('ESCAPE',4,3,2,{2016:2,2018:2,2019:1,2020:2,2021:2}), ('TACOMA',4,3,1,{}),
+    ('RANGER',2,1,2,{2019:1,2020:1,2021:1,2022:1}), ('HILUX',0,0,0,{}),
+    ('COROLLA',2,2,1,{2010:1,2012:1,2017:1,2018:1,2022:1}), ('RAM',0,0,0,{}),
+    ('CIVIC',2,1,1,{2015:1,2016:1,2018:1,2020:1}), ('SORENTO',3,0,2,{2015:1,2018:1,2020:1}),
+    ('200',0,0,0,{}), ('EXPEDITION',1,0,1,{2020:1,2022:1}), ('PILOT',0,0,0,{}),
+    ('AMAROK',0,0,0,{}), ('RANGER RPTOR',0,0,0,{}), ('OUTLANDER',0,0,0,{2016:1,2018:1}),
+    ('WRANGLER',1,0,1,{2016:1,2017:1}), ('HRV',0,0,0,{}), ('LAND CRUSER',0,0,0,{}),
+    ('X3',0,0,0,{}), ('X5',0,0,0,{}), ('SIENNA',1,0,1,{2016:1}), ('SANTA FÉ',0,0,0,{}),
+    ('MURANO',0,0,0,{}), ('FIT',2,0,2,{2014:1,2016:1}), ('TUNDRA',0,0,0,{}),
+    ('EXPLORER LIMITED',0,0,0,{}), ('PATRIOT',0,0,0,{}), ('TAHOE',0,0,0,{}),
+    ('ODISSE',1,0,1,{2016:1}),
+]
+
+def _normalizar_parametros_planificacion(items):
+    if not isinstance(items,list): raise ValueError
+    normalized=[]; seen=set()
+    for item in items:
+        if not isinstance(item,dict): raise ValueError
+        model=_modelo_planificacion(item.get('modelo'))
+        if not model or model in seen: raise ValueError
+        seen.add(model)
+        quantities={key:max(0,int(float(item.get(key,0) or 0))) for key in ('dpv','taller','transito')}
+        distribution=item.get('distribucion') or {}
+        if not isinstance(distribution,dict): raise ValueError
+        years={str(year):max(0,int(float(quantity or 0))) for year,quantity in distribution.items()
+               if str(year).isdigit() and 1900<=int(year)<=2100}
+        normalized.append((model,quantities,years))
+    return normalized
+
+def _guardar_parametros_planificacion(items):
+    normalized=_normalizar_parametros_planificacion(items)
+    c=db()
+    try:
+        c.execute('DELETE FROM planificacion_compra_parametros')
+        for model,quantities,years in normalized:
+            # Se conservan incluso las filas en cero: son modelos que se
+            # controlan en la matriz y deben ser visibles para futuras ediciones.
+            c.execute('''INSERT INTO planificacion_compra_parametros(
+                modelo,inventario_optimo_dpv,inventario_optimo_taller,inventario_optimo_transito,distribucion_anios,actualizado_en)
+                VALUES(?,?,?,?,?,CURRENT_TIMESTAMP)''',
+                (model,quantities['dpv'],quantities['taller'],quantities['transito'],json.dumps(years,ensure_ascii=False)))
+        c.commit()
+    except Exception:
+        c.rollback(); raise
+    finally: c.close()
+
 def datos_planificacion_compra(c, semanas=12):
     """Calcula la disponibilidad semanal sin crear compras ni asientos."""
     today=datetime.now().date()
@@ -3901,9 +3958,11 @@ def datos_planificacion_compra(c, semanas=12):
         for year,value in sorted(param['distribucion'].items(),key=lambda pair:int(pair[0])):
             actual=current['anios'].get(year,0)
             distribution.append({'anio':int(year),'ideal':value,'actual':actual,'sugerido':max(0,value-actual)})
+        faltante_compra=max(0,target_total-current_total)
         rows.append({'modelo':model,'promedio_mensual':average,'ventas_12_meses':sales.get(model,0),
                      'inventario_actual':current,'inventario_optimo':param,'inventario_optimo_total':target_total,
-                     'sugerido_compra':max(0,target_total-current_total),'distribucion':distribution,'proyeccion':projection})
+                     'existencia_total':current_total,'faltante_compra':faltante_compra,
+                     'sugerido_compra':faltante_compra,'distribucion':distribution,'proyeccion':projection})
     for week in weekly:
         for key in ('demanda','faltante_dpv'): week[key]=round(week[key],2)
     return {'anios':sorted(year_values),'modelos':rows,'semanas':weekly,'transitos':transit_records,
@@ -3919,36 +3978,19 @@ def get_planificacion_compra():
 @app.put('/api/planificacion-compra/parametros')
 def put_planificacion_compra_parametros():
     data=request.get_json(silent=True) or {}; items=data.get('parametros')
-    if not isinstance(items,list): return jsonify(error='Se requiere la lista de parámetros.'),400
-    normalized=[]; seen=set()
     try:
-        for item in items:
-            if not isinstance(item,dict): raise ValueError
-            model=_modelo_planificacion(item.get('modelo'))
-            if not model or model in seen: raise ValueError
-            seen.add(model)
-            quantities={key:max(0,int(float(item.get(key,0) or 0))) for key in ('dpv','taller','transito')}
-            distribution=item.get('distribucion') or {}
-            if not isinstance(distribution,dict): raise ValueError
-            years={str(year):max(0,int(float(quantity or 0))) for year,quantity in distribution.items()
-                   if str(year).isdigit() and 1900<=int(year)<=2100}
-            normalized.append((model,quantities,years))
+        _guardar_parametros_planificacion(items)
     except (TypeError,ValueError,OverflowError):
         return jsonify(error='Revise las cantidades de los parámetros de compra.'),400
-    c=db()
-    try:
-        c.execute('DELETE FROM planificacion_compra_parametros')
-        for model,quantities,years in normalized:
-            if not (sum(quantities.values()) or sum(years.values())): continue
-            c.execute('''INSERT INTO planificacion_compra_parametros(
-                modelo,inventario_optimo_dpv,inventario_optimo_taller,inventario_optimo_transito,distribucion_anios,actualizado_en)
-                VALUES(?,?,?,?,?,CURRENT_TIMESTAMP)''',
-                (model,quantities['dpv'],quantities['taller'],quantities['transito'],json.dumps(years,ensure_ascii=False)))
-        c.commit()
-    except Exception:
-        c.rollback(); raise
-    finally: c.close()
     return jsonify(ok=True)
+
+@app.post('/api/planificacion-compra/parametros/base')
+def post_planificacion_compra_parametros_base():
+    items=[{'modelo':modelo,'dpv':dpv,'taller':taller,'transito':transito,
+            'distribucion':{str(year):quantity for year,quantity in distribution.items()}}
+           for modelo,dpv,taller,transito,distribution in PARAMETROS_INVENTARIO_OPTIMO_BASE]
+    _guardar_parametros_planificacion(items)
+    return jsonify(ok=True,cantidad=len(items))
 
 @app.put('/api/planificacion-compra/transitos/<int:adquisicion_id>/eta')
 def put_planificacion_compra_eta(adquisicion_id):

@@ -1020,7 +1020,21 @@ renderPurchasePlanning=function(){
   if(!models.length)return;
   let weeks=purchasePlanningData?.semanas||[];
   $('purchasePlanningWeekly').insertAdjacentHTML('beforeend',`<div class="sub" style="margin:18px 0 8px"><b>Detalle por modelo</b> · ordenado de mayor a menor por Prom. M.</div><table><thead><tr><th>Modelo</th><th>Prom. M.</th>${weeks.map(week=>`<th>${esc(week.inicio)}</th>`).join('')}</tr></thead><tbody>${models.map(model=>`<tr><td><b>${esc(model.modelo)}</b></td><td>${Number(model.promedio_mensual||0).toFixed(2)}</td>${(model.proyeccion||[]).map(week=>`<td>ETA ${Number(week.transito||0)}<br>Taller ${Number(week.taller||0)}<br><b class="${Number(week.faltante_dpv||0)>0?'warn':'good'}">Falt. ${Number(week.faltante_dpv||0).toFixed(2)}</b></td>`).join('')}</tr>`).join('')}</tbody></table>`);
+  let faltanteTotal=models.reduce((total,row)=>total+Number(row.faltante_compra??(row.sugerido_compra||0)),0);
+  let summaryCards=$('purchasePlanningSummary');
+  if(summaryCards?.lastElementChild){
+    summaryCards.lastElementChild.innerHTML=`<div class="label">Faltante de compra</div><b>${faltanteTotal}</b>`;
+  }
+  $('purchasePlanningModels').innerHTML=`<table><thead><tr><th>Modelo</th><th>Prom. M.</th><th>Existencia DPV / Taller / Tránsito</th><th>Inventario óptimo</th><th>Existencia total</th><th>Faltante de compra</th><th>Distribución ideal por año · actual · faltante</th></tr></thead><tbody>${models.map(row=>{let actual=row.inventario_actual||{},distribution=(row.distribucion||[]).map(item=>`${item.anio}: ${item.ideal} · ${item.actual} · <b>${item.sugerido}</b>`).join('<br>')||'—',faltante=Number(row.faltante_compra??(row.sugerido_compra||0));return `<tr><td><b>${esc(row.modelo)}</b></td><td>${Number(row.promedio_mensual||0).toFixed(2)}</td>${Number(actual.DPV||0)} / ${Number(actual['En Taller']||0)} / ${Number(actual['En Tránsito']||0)}</td><td>${Number(row.inventario_optimo_total||0)}</td><td>${Number(row.existencia_total??(Number(actual.DPV||0)+Number(actual['En Taller']||0)+Number(actual['En Tránsito']||0)))}</td><td><b class="${faltante>0?'warn':'good'}">${faltante}</b></td><td>${distribution}</td></tr>`}).join('')||'<tr><td colspan="7" class="sub">No hay modelos disponibles para planificar.</td></tr>'}</tbody></table>`;
+  let parameterHead=Array.from(document.querySelectorAll('#purchasePlanning .detailhead')).find(head=>head.textContent.includes('Parámetros de inventario óptimo'));
+  if(parameterHead&&!$('loadBasePurchasePlanningParameters'))parameterHead.insertAdjacentHTML('beforeend','<button id="loadBasePurchasePlanningParameters" class="btn2" type="button" onclick="loadBasePurchasePlanningParameters()">Cargar matriz base</button>');
 };
+async function loadBasePurchasePlanningParameters(){
+  if(!confirm('Esto reemplazará los parámetros actuales por la matriz de inventario óptimo proporcionada. ¿Desea continuar?'))return;
+  let response=await fetch('/api/planificacion-compra/parametros/base',{method:'POST'}),result=await response.json();
+  if(!response.ok)return showNotice(result.error||'No se pudo cargar la matriz base.','error');
+  showNotice(`Matriz base cargada: ${Number(result.cantidad||0)} modelos.`);await loadPurchasePlanning();
+}
 /* Boleta: el precio final puede aumentar; una rebaja exige descuento explícito. */
 const saleFinalPriceInput=$('saleFinalPrice');
 let saleFinalPriceWasEdited=false;

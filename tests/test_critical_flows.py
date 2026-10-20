@@ -614,8 +614,21 @@ class CriticalFlowsTest(unittest.TestCase):
         self.assertEqual({key:row['inventario_optimo'][key] for key in ('dpv','taller','transito')},
                          {'dpv':3,'taller':2,'transito':1})
         self.assertEqual(row['sugerido_compra'],6)
+        self.assertEqual(row['existencia_total'],0)
+        self.assertEqual(row['faltante_compra'],6)
         self.assertEqual(len(row['proyeccion']),12)
         self.assertEqual(len(data['semanas']),12)
+
+    def test_purchase_planning_loads_supplied_optimal_inventory_matrix(self):
+        self.login_as_admin()
+        response=self.client.post('/api/planificacion-compra/parametros/base')
+        self.assertEqual(response.status_code,200)
+        self.assertEqual(response.get_json()['cantidad'],38)
+        data=self.client.get('/api/planificacion-compra').get_json()
+        crv=next(item for item in data['modelos'] if item['modelo']=='CRV')
+        self.assertEqual(crv['inventario_optimo'],{'dpv':5,'taller':5,'transito':5,
+                         'distribucion':{'2010':1,'2011':1,'2014':2,'2015':2,'2016':2,
+                                          '2017':1,'2018':1,'2020':1,'2023':1}})
 
     def test_purchase_adjustment_increases_original_payable_and_posts_once(self):
         self.login_as_admin()
