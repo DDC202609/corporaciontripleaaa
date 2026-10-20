@@ -1413,6 +1413,38 @@ function renderContracts(rows,payables){$('contractsBody').innerHTML=rows.map(ro
 async function loadContracts(){try{let [rows,providers,accounts,payables]=await Promise.all([get('/api/contratos'),get('/api/proveedores'),get('/api/catalogo'),get('/api/cuentas-por-pagar-contratos')]);contractRows=rows;contractProviders=providers;contractAccounts=accounts;contractOptions();renderContracts(rows,payables);let form=$('contractDepositForm');if(!form.elements.fecha.value)form.elements.fecha.value=payrollToday()}catch(error){console.error(error);showNotice('No fue posible cargar los contratos.','error')}}
 async function saveContract(event){event.preventDefault();let data=Object.fromEntries(new FormData(event.target).entries());data.proveedor_id=Number(data.proveedor_id);data.cuenta_contable_id=Number(data.cuenta_contable_id);data.monto_mensual=Number(data.monto_mensual);data.dia_pago=Number(data.dia_pago);let response=await fetch('/api/contratos',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)}),result=await response.json();if(!response.ok)return showNotice(result.error||'No se pudo guardar el contrato.','error');event.target.reset();showNotice('Contrato guardado.');await loadContracts()}
 async function saveContractDeposit(event){event.preventDefault();let data=Object.fromEntries(new FormData(event.target).entries()),id=data.contrato_id;data.monto=Number(data.monto);let response=await fetch(`/api/contratos/${id}/depositos-garantia`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)}),result=await response.json();if(!response.ok)return showNotice(result.error||'No se pudo registrar el depósito.','error');event.target.elements.monto.value='';event.target.elements.descripcion.value='';showNotice('Depósito en garantía registrado.');await loadContracts()}
+/* Contratos en USD: se proyectan sin crear una provisión ni convertirlos a L. */
+let monedaContratoField=$('contractForm')?.querySelector('[name="monto_mensual"]')?.closest('.field');
+if(monedaContratoField&&!$('contractCurrencyField'))monedaContratoField.insertAdjacentHTML('afterend','<div id="contractCurrencyField" class="field"><label>Moneda del pago mensual *</label><select name="moneda" required><option value="L">Lempiras (L)</option><option value="USD">Dólares estadounidenses (USD)</option></select></div>');
+function montoContrato(row){let amount=Number(row.monto_mensual||0);return row.moneda==='USD'?`US$ ${amount.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})}`:money(amount)}
+const renderContractsWithCurrency=renderContracts;
+renderContracts=function(rows,payables){
+  renderContractsWithCurrency(rows,payables);
+  let table=$('contractsBody')?.closest('table'),header=table?.querySelector('thead tr');
+  if(header&&!header.querySelector('[data-contract-currency]'))header.querySelectorAll('th')[4]?.insertAdjacentHTML('beforebegin','<th data-contract-currency>Moneda</th>');
+  $('contractsBody').innerHTML=rows.map(row=>`<tr><td><b>${esc(row.numero_contrato)}</b></td><td>${esc(row.proveedor_nombre)}</td><td>${payrollDate(row.fecha_inicio)} – ${payrollDate(row.fecha_fin)}</td><td>Día ${row.dia_pago}</td><td>${row.moneda==='USD'?'USD':'L'}</td><td>${montoContrato(row)}</td><td>${esc(row.cuenta_codigo)} · ${esc(row.cuenta_nombre)}</td><td>${money(row.depositos_garantia)}</td><td><span class="pill">${Number(row.activo)?'Activo':'Inactivo'}</span></td></tr>`).join('')||'<tr><td colspan="9" class="sub">No hay contratos registrados.</td></tr>';
+};
+let financialPlanningUsdRows=[];
+function usdMoney(value){return `US$ ${Number(value||0).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})}`}
+const loadFinancialPlanningWithUsdContracts=loadFinancialPlanning;
+loadFinancialPlanning=async function(){
+  try{
+    let data=await get('/api/planificacion-financiera');
+    financialPlanningRows=data.compromisos||[];financialPlanningUsdRows=data.compromisos_usd||[];
+    let monthInput=$('financialPlanningMonth');if(!monthInput.value)monthInput.value=new Date().toISOString().slice(0,7);
+    renderFinancialPlanning();
+  }catch(error){$('financialPlanningTable').innerHTML='<div class="form-feedback error" style="display:block">No fue posible cargar la planificación financiera.</div>'}
+};
+const renderFinancialPlanningWithUsdContracts=renderFinancialPlanning;
+renderFinancialPlanning=function(){
+  renderFinancialPlanningWithUsdContracts();
+  let month=$('financialPlanningMonth')?.value;if(!month)return;
+  let rows=financialPlanningUsdRows.filter(row=>String(row.fecha_compromiso||'').slice(0,7)===month);
+  let total=rows.reduce((sum,row)=>sum+Number(row.pendiente||0),0);
+  $('financialPlanningSummary')?.insertAdjacentHTML('beforeend',`<div class="kpi"><div class="label">Contratos USD · ${month}</div><b>${usdMoney(total)}</b><div class="sub">Solo proyección; sin CxP automática.</div></div>`);
+  $('financialPlanningUsd')?.remove();
+  $('financialPlanningTable')?.closest('.panel')?.insertAdjacentHTML('afterend',`<div id="financialPlanningUsd" class="panel wide-table"><div class="detailhead"><div><h2 style="margin:0">Compromisos de contratos en USD</h2><div class="sub">Se muestran en dólares y no se convierten ni generan CxP, asiento o salida bancaria hasta registrar el pago real.</div></div><b>${usdMoney(total)}</b></div>${reportTable(rows,[{label:'Fecha de pago',value:r=>esc(r.fecha_compromiso)},{label:'Contrato',value:r=>`<b>${esc(r.documento)}</b>`},{label:'Proveedor',value:r=>esc(r.proveedor||'—')},{label:'Moneda',value:()=> 'USD'},{label:'Monto proyectado',value:r=>`<b>${usdMoney(r.pendiente)}</b>`}])}</div>`);
+};
 const goWithContracts=go;
 go=function(id,button){goWithContracts(id,button);if(id==='contracts')void loadContracts()};
 </script></body></html>

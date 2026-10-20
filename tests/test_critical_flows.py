@@ -156,6 +156,38 @@ class CriticalFlowsTest(unittest.TestCase):
         })
         self.assertEqual(deposit.status_code, 201)
 
+    def test_usd_contract_is_projected_without_automatic_payable_or_entry(self):
+        self.login_as_admin()
+        connection = self.server.db()
+        provider = connection.execute('SELECT id FROM proveedores WHERE activo=1 ORDER BY id LIMIT 1').fetchone()
+        account = connection.execute('SELECT id FROM cuentas_contables WHERE activo=1 AND acepta_movimiento=1 ORDER BY id LIMIT 1').fetchone()
+        connection.close()
+        response = self.client.post('/api/contratos', json={
+            'numero_contrato': 'QA-CONTRATO-USD-001', 'proveedor_id': provider['id'],
+            'fecha_inicio': '2026-10-01', 'fecha_fin': '2026-12-31',
+            'monto_mensual': 275.50, 'moneda': 'USD', 'dia_pago': 25,
+            'cuenta_contable_id': account['id'],
+        })
+        self.assertEqual(response.status_code, 201)
+        contract_id = response.get_json()['id']
+
+        plan = self.client.get('/api/planificacion-financiera').get_json()
+        projected = next(row for row in plan['compromisos_usd']
+                         if row['id'] == contract_id and row['fecha_compromiso'] == '2026-10-25')
+        self.assertEqual(projected['moneda'], 'USD')
+        self.assertAlmostEqual(projected['pendiente'], 275.50)
+        self.assertAlmostEqual(plan['resumen']['total'],
+                               plan['resumen']['transito'] + plan['resumen']['taller'])
+
+        payables = self.client.get('/api/cuentas-por-pagar-contratos').get_json()
+        self.assertFalse(any(row['contrato_id'] == contract_id for row in payables))
+        connection = self.server.db()
+        entry = connection.execute('''SELECT 1 FROM asientos_contables ac
+            JOIN cuentas_por_pagar_contratos cp ON cp.id=ac.referencia_id
+            WHERE ac.referencia_tipo='contrato_cxp' AND cp.contrato_id=?''', (contract_id,)).fetchone()
+        connection.close()
+        self.assertIsNone(entry)
+
     def test_physical_inventory_count_compares_system_and_scanned_vins(self):
         self.login_as_admin()
         response = self.client.post('/api/conteos-inventario', json={

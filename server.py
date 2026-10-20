@@ -824,12 +824,16 @@ def init_db(sync_history=True):
         fecha_inicio TEXT NOT NULL,
         fecha_fin TEXT NOT NULL,
         monto_mensual REAL NOT NULL CHECK(monto_mensual>0),
+        moneda TEXT NOT NULL DEFAULT 'L' CHECK(moneda IN ('L','USD')),
         dia_pago INTEGER NOT NULL CHECK(dia_pago BETWEEN 1 AND 31),
         cuenta_contable_id INTEGER NOT NULL REFERENCES cuentas_contables(id),
         activo INTEGER NOT NULL DEFAULT 1,
         creado_en TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         actualizado_en TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     )''')
+    contract_columns={row['name'] for row in c.execute('PRAGMA table_info(contratos)')}
+    if 'moneda' not in contract_columns:
+        c.execute("ALTER TABLE contratos ADD COLUMN moneda TEXT NOT NULL DEFAULT 'L'")
     c.execute('''CREATE TABLE IF NOT EXISTS contratos_depositos_garantia(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         contrato_id INTEGER NOT NULL REFERENCES contratos(id) ON DELETE CASCADE,
@@ -2645,8 +2649,10 @@ def datos_contrato(data):
         return None,'Proveedor, cuenta, monto mensual y fecha de pago son obligatorios.'
     if not numero or not fecha_inicio or not fecha_fin or fecha_fin<fecha_inicio or not proveedor_id or not cuenta_id or monto<=0 or not 1<=dia<=31:
         return None,'Revise el número, la vigencia, el monto, el día de pago, el proveedor y la cuenta contable.'
+    moneda=(data.get('moneda') or 'L').strip().upper()
+    if moneda not in ('L','USD'): return None,'Seleccione una moneda válida.'
     return {'numero_contrato':numero,'proveedor_id':proveedor_id,'fecha_inicio':fecha_inicio.isoformat(),'fecha_fin':fecha_fin.isoformat(),
-            'monto_mensual':monto,'dia_pago':dia,'cuenta_contable_id':cuenta_id},None
+            'monto_mensual':monto,'moneda':moneda,'dia_pago':dia,'cuenta_contable_id':cuenta_id},None
 
 def fecha_vencimiento_contrato(year,month,day):
     return datetime(year,month,min(day,calendar.monthrange(year,month)[1])).date()
@@ -2659,6 +2665,8 @@ def generar_cxp_contratos_programadas(c, fecha=None):
     siguiente=(hoy.replace(day=28)+timedelta(days=4)).replace(day=1)
     meses.append((siguiente.year,siguiente.month))
     for contrato in contratos:
+        if contrato['moneda']!='L':
+            continue
         inicio=fecha_planilla(contrato['fecha_inicio']); fin=fecha_planilla(contrato['fecha_fin'])
         for year,month in meses:
             vence=fecha_vencimiento_contrato(year,month,int(contrato['dia_pago']))
@@ -2695,8 +2703,8 @@ def crear_contrato():
     try:
         if not c.execute('SELECT 1 FROM proveedores WHERE id=? AND activo=1',(data['proveedor_id'],)).fetchone(): return jsonify(error='Seleccione un proveedor activo.'),400
         if not c.execute('SELECT 1 FROM cuentas_contables WHERE id=? AND activo=1 AND acepta_movimiento=1',(data['cuenta_contable_id'],)).fetchone(): return jsonify(error='Seleccione una cuenta contable activa que acepte movimientos.'),400
-        cur=c.execute('''INSERT INTO contratos(numero_contrato,proveedor_id,fecha_inicio,fecha_fin,monto_mensual,dia_pago,cuenta_contable_id)
-            VALUES(:numero_contrato,:proveedor_id,:fecha_inicio,:fecha_fin,:monto_mensual,:dia_pago,:cuenta_contable_id)''',data)
+        cur=c.execute('''INSERT INTO contratos(numero_contrato,proveedor_id,fecha_inicio,fecha_fin,monto_mensual,moneda,dia_pago,cuenta_contable_id)
+            VALUES(:numero_contrato,:proveedor_id,:fecha_inicio,:fecha_fin,:monto_mensual,:moneda,:dia_pago,:cuenta_contable_id)''',data)
         c.commit(); return jsonify(id=cur.lastrowid),201
     except sqlite3.IntegrityError:
         c.rollback(); return jsonify(error='Ya existe un contrato con ese número.'),409
@@ -3636,7 +3644,30 @@ def get_planificacion_financiera():
     summary={'transito':round(sum(item['pendiente'] for item in rows if item['etapa']=='En Tránsito'),2),
              'taller':round(sum(item['pendiente'] for item in rows if item['etapa']=='En Taller'),2)}
     summary['total']=round(summary['transito']+summary['taller'],2)
-    c.close(); return jsonify(resumen=summary,compromisos=rows)
+    # Los contratos en dólares se muestran como compromisos de caja, pero no se
+    # provisionan: la CxP y el asiento se registran al pagar, con el tipo de
+    # cambio real de ese día. Por eso tampoco se suman a los totales en Lempiras.
+    contratos_usd=c.execute('''SELECT co.id,co.numero_contrato,co.fecha_inicio,co.fecha_fin,
+            co.monto_mensual,co.dia_pago,p.nombre proveedor
+        FROM contratos co JOIN proveedores p ON p.id=co.proveedor_id
+        WHERE co.activo=1 AND co.moneda='USD'
+        ORDER BY co.fecha_inicio,co.id''').fetchall()
+    compromisos_usd=[]
+    for contrato in contratos_usd:
+        inicio=fecha_planilla(contrato['fecha_inicio']); fin=fecha_planilla(contrato['fecha_fin'])
+        cursor=inicio.replace(day=1)
+        while cursor<=fin:
+            vence=fecha_vencimiento_contrato(cursor.year,cursor.month,int(contrato['dia_pago']))
+            if inicio<=vence<=fin:
+                compromisos_usd.append({
+                    'id':contrato['id'],'fecha_compromiso':vence.isoformat(),'fecha_origen':contrato['fecha_inicio'],
+                    'pendiente':round(float(contrato['monto_mensual'] or 0),2),'monto_original':round(float(contrato['monto_mensual'] or 0),2),
+                    'anticipos':0,'proveedor':contrato['proveedor'],'documento':f"Contrato {contrato['numero_contrato']}",
+                    'origen':'Contrato en USD','etapa':'Contrato USD','moneda':'USD',
+                })
+            cursor=(cursor.replace(day=28)+timedelta(days=4)).replace(day=1)
+    compromisos_usd.sort(key=lambda item:(item['fecha_compromiso'],item['id']))
+    c.close(); return jsonify(resumen=summary,compromisos=rows,compromisos_usd=compromisos_usd)
 
 def _modelo_planificacion(value):
     return ' '.join(str(value or '').strip().split()).upper()
