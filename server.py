@@ -759,7 +759,10 @@ def init_db(sync_history=True):
         periodo_inicio TEXT NOT NULL,
         periodo_fin TEXT NOT NULL,
         fecha_generacion TEXT NOT NULL,
-        estado TEXT NOT NULL DEFAULT 'Pagada',
+        estado TEXT NOT NULL DEFAULT 'Generada',
+        fecha_pago TEXT,
+        banco TEXT,
+        referencia_pago TEXT,
         total_salarios REAL NOT NULL DEFAULT 0,
         total_comisiones REAL NOT NULL DEFAULT 0,
         total_bonos REAL NOT NULL DEFAULT 0,
@@ -768,12 +771,21 @@ def init_db(sync_history=True):
         creado_en TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         UNIQUE(periodo_inicio,periodo_fin)
     )''')
+    payroll_run_columns={row['name'] for row in c.execute('PRAGMA table_info(planillas_quincenales)')}
+    for name, definition in [('fecha_pago','TEXT'),('banco','TEXT'),('referencia_pago','TEXT')]:
+        if name not in payroll_run_columns:
+            c.execute(f'ALTER TABLE planillas_quincenales ADD COLUMN {name} {definition}')
+    # Las planillas creadas antes de separar generación y pago eran solo un
+    # cálculo; al no tener banco ni fecha de pago quedan en revisión.
+    c.execute("UPDATE planillas_quincenales SET estado='Generada' WHERE estado='Pagada' AND fecha_pago IS NULL")
     c.execute('''CREATE TABLE IF NOT EXISTS planillas_quincenales_detalle(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         planilla_id INTEGER NOT NULL REFERENCES planillas_quincenales(id) ON DELETE CASCADE,
         empleado_id INTEGER NOT NULL REFERENCES empleados_planilla(id),
         empleado_nombre TEXT NOT NULL,
         numero_identidad TEXT NOT NULL,
+        departamento_id INTEGER,
+        cuenta_contable_id INTEGER,
         departamento_nombre TEXT,
         cuenta_contable_nombre TEXT,
         salario REAL NOT NULL DEFAULT 0,
@@ -787,6 +799,10 @@ def init_db(sync_history=True):
         total_devengado REAL NOT NULL DEFAULT 0,
         neto REAL NOT NULL DEFAULT 0
     )''')
+    payroll_detail_columns={row['name'] for row in c.execute('PRAGMA table_info(planillas_quincenales_detalle)')}
+    for name, definition in [('departamento_id','INTEGER'),('cuenta_contable_id','INTEGER')]:
+        if name not in payroll_detail_columns:
+            c.execute(f'ALTER TABLE planillas_quincenales_detalle ADD COLUMN {name} {definition}')
     c.execute('CREATE INDEX IF NOT EXISTS ix_planillas_quincenales_detalle_planilla ON planillas_quincenales_detalle(planilla_id)')
     c.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_pagos_cxp_referencia ON pagos_cuentas_por_pagar(referencia) WHERE referencia IS NOT NULL AND referencia<>''")
     c.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_cobros_cxc_referencia ON cobros_cuentas_por_cobrar(referencia) WHERE referencia IS NOT NULL AND referencia<>''")
@@ -2604,6 +2620,7 @@ def calcular_planilla_quincenal(c, fecha_referencia):
         deducciones=round(ihss+rap+otras,2)
         detalles.append({
             'empleado_id':empleado['id'],'empleado_nombre':empleado['nombre'],'numero_identidad':empleado['numero_identidad'],
+            'departamento_id':empleado['departamento_id'],'cuenta_contable_id':empleado['cuenta_contable_id'],
             'departamento_nombre':empleado['departamento_nombre'],'cuenta_contable_nombre':f"{empleado['cuenta_codigo']} · {empleado['cuenta_nombre']}",
             'salario':salario,'comisiones_fijas':comisiones_fijas,'comisiones_registradas':comisiones_registradas,
             'comisiones':total_comisiones,'bonos':bonos,'ihss':ihss,'rap':rap,'otras_deducciones':otras,
@@ -2734,6 +2751,47 @@ def get_planilla_quincenal(payroll_id):
     finally:
         c.close()
 
+@app.post('/api/planillas/quincenas/<int:payroll_id>/registrar-pago')
+def registrar_pago_planilla_quincenal(payroll_id):
+    data=request.get_json(silent=True) or {}
+    fecha=fecha_planilla(data.get('fecha_pago') or ahora_operacion().date().isoformat())
+    banco=(data.get('banco') or '').strip()
+    referencia=(data.get('referencia') or '').strip()
+    if not fecha or not banco:
+        return jsonify(error='Indique la fecha de aplicación y el banco desde el que se pagó la planilla.'),400
+    c=db()
+    try:
+        planilla=c.execute('SELECT * FROM planillas_quincenales WHERE id=?',(payroll_id,)).fetchone()
+        if not planilla: return jsonify(error='Planilla no encontrada.'),404
+        if planilla['estado']=='Pagada': return jsonify(error='Esta planilla ya fue registrada como pagada.'),409
+        detalles=[dict(row) for row in c.execute('SELECT * FROM planillas_quincenales_detalle WHERE planilla_id=?',(payroll_id,)).fetchall()]
+        if not detalles: return jsonify(error='La planilla no tiene empleados para pagar.'),400
+        por_cuenta={}
+        for detalle in detalles:
+            cuenta_id=detalle.get('cuenta_contable_id')
+            if not cuenta_id:
+                empleado=c.execute('SELECT cuenta_contable_id FROM empleados_planilla WHERE id=?',(detalle['empleado_id'],)).fetchone()
+                cuenta_id=empleado['cuenta_contable_id'] if empleado else None
+            cuenta=c.execute('SELECT id FROM cuentas_contables WHERE id=? AND activo=1 AND acepta_movimiento=1',(cuenta_id,)).fetchone()
+            if not cuenta:
+                return jsonify(error=f"La cuenta contable del empleado {detalle['empleado_nombre']} ya no está disponible."),400
+            por_cuenta[cuenta_id]=round(por_cuenta.get(cuenta_id,0)+float(detalle['neto'] or 0),2)
+        total=round(sum(por_cuenta.values()),2)
+        if total<=0: return jsonify(error='El neto a pagar debe ser mayor que cero.'),400
+        descripcion=f"Pago de planilla quincenal {planilla['periodo_inicio']} al {planilla['periodo_fin']}"
+        lineas=[{'cuenta_id':cuenta_id,'debe':monto} for cuenta_id,monto in por_cuenta.items() if monto]
+        lineas.append({'cuenta_id':cuenta_contable_id(c,'caja_bancos'),'haber':total})
+        registrar_asiento(c,fecha.isoformat(),descripcion,'pago_planilla',payroll_id,lineas)
+        registrar_movimiento_caja(c,fecha.isoformat(),'Pago de planilla','Banco',banco,0,total,descripcion,'pago_planilla',payroll_id)
+        c.execute("UPDATE planillas_quincenales SET estado='Pagada',fecha_pago=?,banco=?,referencia_pago=? WHERE id=?",
+            (fecha.isoformat(),normalizar_nombre_banco(banco),referencia or None,payroll_id))
+        c.commit()
+        return jsonify(ok=True,id=payroll_id,total=total,estado='Pagada')
+    except ValueError as error:
+        c.rollback(); return jsonify(error=str(error)),400
+    finally:
+        c.close()
+
 @app.post('/api/planillas/quincenas')
 def generar_planilla_quincenal():
     data=request.get_json(silent=True) or {}
@@ -2747,12 +2805,12 @@ def generar_planilla_quincenal():
         if existente: return jsonify(error='Ya existe una planilla registrada para esta quincena.',planilla_id=existente['id']),409
         totals=calculo['totales']
         cur=c.execute('''INSERT INTO planillas_quincenales(periodo_inicio,periodo_fin,fecha_generacion,estado,total_salarios,total_comisiones,total_bonos,total_deducciones,total_neto)
-            VALUES(?,?,?,'Pagada',?,?,?,?,?)''',(calculo['periodo_inicio'],calculo['periodo_fin'],ahora_operacion().date().isoformat(),
+            VALUES(?,?,?,'Generada',?,?,?,?,?)''',(calculo['periodo_inicio'],calculo['periodo_fin'],ahora_operacion().date().isoformat(),
             totals['salario'],totals['comisiones'],totals['bonos'],totals['total_deducciones'],totals['neto']))
         for detail in calculo['empleados']:
-            c.execute('''INSERT INTO planillas_quincenales_detalle(planilla_id,empleado_id,empleado_nombre,numero_identidad,departamento_nombre,cuenta_contable_nombre,
+            c.execute('''INSERT INTO planillas_quincenales_detalle(planilla_id,empleado_id,empleado_nombre,numero_identidad,departamento_id,cuenta_contable_id,departamento_nombre,cuenta_contable_nombre,
                 salario,comisiones_fijas,comisiones_registradas,comisiones,bonos,ihss,rap,otras_deducciones,total_devengado,neto)
-                VALUES(:planilla_id,:empleado_id,:empleado_nombre,:numero_identidad,:departamento_nombre,:cuenta_contable_nombre,:salario,:comisiones_fijas,
+                VALUES(:planilla_id,:empleado_id,:empleado_nombre,:numero_identidad,:departamento_id,:cuenta_contable_id,:departamento_nombre,:cuenta_contable_nombre,:salario,:comisiones_fijas,
                 :comisiones_registradas,:comisiones,:bonos,:ihss,:rap,:otras_deducciones,:total_devengado,:neto)''',dict(detail,planilla_id=cur.lastrowid))
         c.commit()
         return jsonify(id=cur.lastrowid,**calculo),201
