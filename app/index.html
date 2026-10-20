@@ -1538,4 +1538,27 @@ async function correctSeptemberPayrollEntries(){
   showNotice(`${(result.corregidas||[]).length} planilla(s) reclasificada(s)${errors?`; ${errors} requieren revisión`:''}.`);
   await Promise.all([loadPayroll(),loadAccounting?.()]);
 }
+/* Gastos: cada registro abre una ficha de consulta sin habilitar edición. */
+document.body.insertAdjacentHTML('beforeend','<div id="expenseDetailModal" class="modal hidden"><div class="modalbox" style="max-width:760px"><div class="modalhead"><div><h2 style="margin:0">Detalle del gasto</h2><div class="sub">Consulta del pago y su soporte contable.</div></div><button class="close" type="button" onclick="closeExpenseDetail()">×</button></div><div id="expenseDetailContent" class="formgrid" style="margin-top:18px"></div><div class="actions"><button class="btn2" type="button" onclick="closeExpenseDetail()">Cerrar</button></div></div></div>');
+let expenseRows=[];
+function expenseDetailValue(label,value){return `<div><div class="label">${esc(label)}</div><b>${value||'—'}</b></div>`}
+function openExpenseDetail(id){
+  let row=expenseRows.find(item=>Number(item.id)===Number(id));if(!row)return showNotice('No fue posible encontrar el gasto seleccionado.','error');
+  $('expenseDetailContent').innerHTML=[
+    expenseDetailValue('Fecha de pago',esc(row.fecha_pago)),expenseDetailValue('Concepto',esc(row.concepto)),
+    expenseDetailValue('Cuenta contable',`${esc(row.cuenta_codigo||'—')} · ${esc(row.cuenta_nombre||'—')}`),expenseDetailValue('Documento',esc(row.documento||'—')),
+    expenseDetailValue('Proveedor',esc(row.proveedor_nombre||'—')),expenseDetailValue('Forma de pago',esc(row.forma_pago||'—')),
+    expenseDetailValue('Banco',esc(row.banco||'—')),expenseDetailValue('Referencia',esc(row.referencia||'—')),
+    expenseDetailValue('Sub total',money(row.subtotal)),expenseDetailValue('ISV',money(row.isv)),expenseDetailValue('Total',money(row.total)),
+    `<div class="span2"><div class="label">Observaciones</div><b>${esc(row.observaciones||'—')}</b></div>`
+  ].join('');
+  $('expenseDetailModal').classList.remove('hidden');
+}
+function closeExpenseDetail(){$('expenseDetailModal').classList.add('hidden')}
+function renderExpenseRowsWithDetail(){
+  let body=$('expenseBody');if(!body)return;
+  body.innerHTML=expenseRows.map(row=>`<tr class="clickrow" style="cursor:pointer" tabindex="0" onclick="openExpenseDetail(${Number(row.id)})" onkeydown="if(event.key==='Enter')openExpenseDetail(${Number(row.id)})"><td>${esc(row.fecha_pago)}</td><td><b>${esc(row.concepto)}</b></td><td>${esc(row.cuenta_codigo)} · ${esc(row.cuenta_nombre)}</td><td>${esc(row.documento||'—')}</td><td>${esc(row.proveedor_nombre)}</td><td>${esc(row.forma_pago)}</td><td>${esc(row.banco||'—')}</td><td>${money(row.subtotal)}</td><td>${money(row.isv)}</td><td><b>${money(row.total)}</b></td></tr>`).join('')||'<tr><td colspan="10" class="sub">Aún no hay pagos de gastos registrados.</td></tr>';
+}
+const loadExpensesWithDetail=loadExpenses;
+loadExpenses=async function(){await loadExpensesWithDetail();expenseRows=await get('/api/gastos-operativos');renderExpenseRowsWithDetail()};
 </script></body></html>
