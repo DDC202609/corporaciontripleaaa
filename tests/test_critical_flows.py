@@ -624,6 +624,33 @@ class CriticalFlowsTest(unittest.TestCase):
         self.assertEqual(self.server._redondear_unidad_compra(0.50), 1)
         self.assertEqual(self.server._redondear_unidad_compra(1.65), 2)
 
+    def test_purchase_planning_counts_only_physical_stages_and_separates_consignment(self):
+        self.login_as_admin()
+        connection=self.server.db()
+        model='MODELO INVENTARIO FISICO QA'
+        for vin,state,purchase_type in (
+            ('QA-PHYSICAL-DPV','DPV','Compra local'),
+            ('QA-PHYSICAL-WORKSHOP','En Taller','Compra local'),
+            ('QA-PHYSICAL-CONSIGNMENT','DPV','Consignación'),
+            ('QA-NOT-PHYSICAL-STAGE','Nacionalizado','Compra local'),
+        ):
+            connection.execute('''INSERT INTO vehiculos(vin,modelo,anio,estado,tipo_compra)
+                VALUES(?,?,?,?,?)''',(vin,model,2020,state,purchase_type))
+        connection.commit(); connection.close()
+        saved=self.client.put('/api/planificacion-compra/parametros',json={'parametros':[{
+            'modelo':model,'dpv':3,'taller':0,'transito':0,'distribucion':{'2020':3}
+        }]})
+        self.assertEqual(saved.status_code,200)
+        data=self.client.get('/api/planificacion-compra').get_json()
+        row=next(item for item in data['modelos'] if item['modelo']==model)
+        self.assertEqual(row['inventario_actual'],{
+            'DPV':1,'En Taller':1,'En Tránsito':0,'Consignación':1,'anios':{'2020':3}
+        })
+        self.assertEqual(row['existencia_total'],3)
+        self.assertEqual(row['existencia_para_compra'],2)
+        self.assertEqual(row['faltante_compra'],1)
+        self.assertEqual(row['distribucion'],[{'anio':2020,'ideal':3,'actual':3,'sugerido':0}])
+
     def test_purchase_planning_loads_supplied_optimal_inventory_matrix(self):
         self.login_as_admin()
         response=self.client.post('/api/planificacion-compra/parametros/base')

@@ -3918,16 +3918,21 @@ def datos_planificacion_compra(c, semanas=12):
         }
     inventory={}
     models=set(parameters)
-    for row in c.execute("""SELECT modelo,anio,estado,COUNT(*) cantidad FROM vehiculos
-        WHERE estado<>'Vendido' AND TRIM(COALESCE(modelo,''))<>''
-        GROUP BY modelo,anio,estado"""):
+    for row in c.execute("""SELECT modelo,anio,estado,COALESCE(tipo_compra,'') tipo_compra,COUNT(*) cantidad
+        FROM vehiculos
+        WHERE estado IN ('DPV','En Taller','En Tránsito') AND TRIM(COALESCE(modelo,''))<>''
+        GROUP BY modelo,anio,estado,COALESCE(tipo_compra,'')"""):
         model=_modelo_planificacion(row['modelo']); models.add(model)
-        item=inventory.setdefault(model,{'DPV':0,'En Taller':0,'En Tránsito':0,'anios':{}})
+        item=inventory.setdefault(model,{'DPV':0,'En Taller':0,'En Tránsito':0,'Consignación':0,'anios':{}})
         state=row['estado'] or ''
-        if state in item: item[state]+=int(row['cantidad'] or 0)
+        quantity=int(row['cantidad'] or 0)
+        # La consignación puede tener una etapa operativa (por ejemplo DPV),
+        # pero debe verse separada y no cubrir la meta de compra propia.
+        if row['tipo_compra']=='Consignación': item['Consignación']+=quantity
+        elif state in item: item[state]+=quantity
         if row['anio']:
             year=str(int(row['anio'])); year_values.add(int(year))
-            item['anios'][year]=item['anios'].get(year,0)+int(row['cantidad'] or 0)
+            item['anios'][year]=item['anios'].get(year,0)+quantity
     start_month=(today.replace(day=1)-timedelta(days=335)).isoformat()
     sales={}
     for row in c.execute("""SELECT v.modelo,COUNT(*) cantidad FROM ventas ve
@@ -3969,11 +3974,15 @@ def datos_planificacion_compra(c, semanas=12):
     rows=[]; weekly=[{'inicio':week.isoformat(),'fin':(week+timedelta(days=6)).isoformat(),
                       'transito':0,'taller':0,'demanda':0.0,'faltante_dpv':0.0} for week in weeks]
     for model in sorted(models,key=lambda item:(-sales.get(item,0),item)):
-        current=inventory.get(model,{'DPV':0,'En Taller':0,'En Tránsito':0,'anios':{}})
+        current=inventory.get(model,{'DPV':0,'En Taller':0,'En Tránsito':0,'Consignación':0,'anios':{}})
         param=parameters.get(model,{'dpv':0,'taller':0,'transito':0,'distribucion':{}})
         average=round(sales.get(model,0)/12,2)
         target_total=param['dpv']+param['taller']+param['transito']
+        # El faltante de compra solo considera inventario propio: DPV,
+        # Taller y Tránsito. La consignación sí se informa como existencia
+        # física, pero no se utiliza para reducir una compra planificada.
         current_total=current['DPV']+current['En Taller']+current['En Tránsito']
+        physical_total=current_total+current['Consignación']
         arrivals=0; deliveries=0; demand_total=0.0; projection=[]
         for index,week in enumerate(weeks):
             arrivals+=transit_by_model.get(model,[0]*semanas)[index]
@@ -3999,7 +4008,7 @@ def datos_planificacion_compra(c, semanas=12):
         faltante_compra=_redondear_unidad_compra(faltante_bruto)
         rows.append({'modelo':model,'promedio_mensual':average,'ventas_12_meses':sales.get(model,0),
                      'inventario_actual':current,'inventario_optimo':param,'inventario_optimo_total':target_total,
-                     'existencia_total':current_total,'faltante_compra':faltante_compra,
+                     'existencia_total':physical_total,'existencia_para_compra':current_total,'faltante_compra':faltante_compra,
                      'sugerido_compra':faltante_compra,'distribucion':distribution,'proyeccion':projection})
     for week in weekly:
         for key in ('demanda','faltante_dpv'): week[key]=round(week[key],2)
