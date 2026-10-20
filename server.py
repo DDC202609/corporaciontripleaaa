@@ -844,6 +844,11 @@ def init_db(sync_history=True):
     deposit_columns={row['name'] for row in c.execute('PRAGMA table_info(contratos_depositos_garantia)')}
     if 'moneda' not in deposit_columns:
         c.execute("ALTER TABLE contratos_depositos_garantia ADD COLUMN moneda TEXT NOT NULL DEFAULT 'L'")
+    # Regulariza depósitos creados antes de que el módulo manejara moneda.
+    # El importe no cambia: hereda la moneda del contrato al que pertenece.
+    c.execute('''UPDATE contratos_depositos_garantia
+        SET moneda=COALESCE((SELECT moneda FROM contratos WHERE contratos.id=contratos_depositos_garantia.contrato_id),'L')
+        WHERE moneda IS NULL OR moneda<>COALESCE((SELECT moneda FROM contratos WHERE contratos.id=contratos_depositos_garantia.contrato_id),'L')''')
     c.execute('''CREATE TABLE IF NOT EXISTS cuentas_por_pagar_contratos(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         contrato_id INTEGER NOT NULL REFERENCES contratos(id) ON DELETE CASCADE,
