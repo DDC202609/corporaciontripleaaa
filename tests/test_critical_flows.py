@@ -181,12 +181,21 @@ class CriticalFlowsTest(unittest.TestCase):
 
         payables = self.client.get('/api/cuentas-por-pagar-contratos').get_json()
         self.assertFalse(any(row['contrato_id'] == contract_id for row in payables))
+        deposit = self.client.post(f'/api/contratos/{contract_id}/depositos-garantia', json={
+            'fecha': '2026-10-20', 'monto': 500, 'moneda': 'L',
+            'descripcion': 'Garantía USD QA',
+        })
+        self.assertEqual(deposit.status_code, 201)
+        self.assertEqual(deposit.get_json()['moneda'], 'USD')
         connection = self.server.db()
         entry = connection.execute('''SELECT 1 FROM asientos_contables ac
             JOIN cuentas_por_pagar_contratos cp ON cp.id=ac.referencia_id
             WHERE ac.referencia_tipo='contrato_cxp' AND cp.contrato_id=?''', (contract_id,)).fetchone()
+        deposit_currency = connection.execute('SELECT moneda FROM contratos_depositos_garantia WHERE contrato_id=?',
+                                              (contract_id,)).fetchone()['moneda']
         connection.close()
         self.assertIsNone(entry)
+        self.assertEqual(deposit_currency, 'USD')
 
     def test_physical_inventory_count_compares_system_and_scanned_vins(self):
         self.login_as_admin()

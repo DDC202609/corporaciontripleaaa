@@ -838,8 +838,12 @@ def init_db(sync_history=True):
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         contrato_id INTEGER NOT NULL REFERENCES contratos(id) ON DELETE CASCADE,
         fecha TEXT NOT NULL,monto REAL NOT NULL CHECK(monto>0),
+        moneda TEXT NOT NULL DEFAULT 'L' CHECK(moneda IN ('L','USD')),
         descripcion TEXT,creado_en TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     )''')
+    deposit_columns={row['name'] for row in c.execute('PRAGMA table_info(contratos_depositos_garantia)')}
+    if 'moneda' not in deposit_columns:
+        c.execute("ALTER TABLE contratos_depositos_garantia ADD COLUMN moneda TEXT NOT NULL DEFAULT 'L'")
     c.execute('''CREATE TABLE IF NOT EXISTS cuentas_por_pagar_contratos(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         contrato_id INTEGER NOT NULL REFERENCES contratos(id) ON DELETE CASCADE,
@@ -2718,8 +2722,13 @@ def crear_deposito_garantia(contract_id):
     if not fecha or monto<=0:return jsonify(error='Indique una fecha y un monto de depósito válidos.'),400
     c=db()
     try:
-        if not c.execute('SELECT 1 FROM contratos WHERE id=?',(contract_id,)).fetchone():return jsonify(error='Contrato no encontrado.'),404
-        cur=c.execute('INSERT INTO contratos_depositos_garantia(contrato_id,fecha,monto,descripcion) VALUES(?,?,?,?)',(contract_id,fecha.isoformat(),monto,(data.get('descripcion') or '').strip() or None));c.commit();return jsonify(id=cur.lastrowid),201
+        contrato=c.execute('SELECT moneda FROM contratos WHERE id=?',(contract_id,)).fetchone()
+        if not contrato:return jsonify(error='Contrato no encontrado.'),404
+        # La moneda se toma del contrato; nunca se acepta una distinta desde pantalla o API.
+        moneda=contrato['moneda'] or 'L'
+        cur=c.execute('''INSERT INTO contratos_depositos_garantia(contrato_id,fecha,monto,moneda,descripcion)
+            VALUES(?,?,?,?,?)''',(contract_id,fecha.isoformat(),monto,moneda,(data.get('descripcion') or '').strip() or None))
+        c.commit();return jsonify(id=cur.lastrowid,moneda=moneda),201
     finally:c.close()
 
 @app.get('/api/cuentas-por-pagar-contratos')
