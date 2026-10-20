@@ -649,7 +649,7 @@ class CriticalFlowsTest(unittest.TestCase):
         self.assertEqual(row['existencia_total'],3)
         self.assertEqual(row['existencia_para_compra'],2)
         self.assertEqual(row['faltante_compra'],1)
-        self.assertEqual(row['distribucion'],[{'anio':2020,'ideal':3,'actual':2,'sugerido':1}])
+        self.assertEqual(row['distribucion'],[{'anio':2020,'ideal':3,'actual':2,'sugerido':1,'autorizada':0}])
 
     def test_purchase_planning_loads_supplied_optimal_inventory_matrix(self):
         self.login_as_admin()
@@ -820,6 +820,38 @@ class CriticalFlowsTest(unittest.TestCase):
             self.assertIn('semana_compra',row)
             self.assertIn('fecha_disponibilidad',row)
             self.assertTrue(row['motivo'].startswith('Cobertura hasta '))
+
+    def test_authorized_purchase_is_saved_by_model_year_and_only_projected(self):
+        self.login_as_admin()
+        self.client.post('/api/planificacion-compra/parametros/base')
+        planning=self.client.get('/api/planificacion-compra').get_json()
+        model=next(item for item in planning['modelos'] if item['distribucion'])
+        detail=model['distribucion'][0]
+        connection=self.server.db()
+        before_adquisiciones=connection.execute('SELECT COUNT(*) cantidad FROM adquisiciones').fetchone()['cantidad']
+        before_cxp=connection.execute('SELECT COUNT(*) cantidad FROM cuentas_por_pagar').fetchone()['cantidad']
+        connection.close()
+
+        response=self.client.put('/api/planificacion-compra/autorizaciones',json={
+            'modelo':model['modelo'],'anio':detail['anio'],'cantidad':3,
+        })
+        self.assertEqual(response.status_code,200)
+        self.assertEqual(response.get_json()['cantidad'],3)
+        updated=self.client.get('/api/planificacion-compra').get_json()
+        updated_model=next(item for item in updated['modelos'] if item['modelo']==model['modelo'])
+        updated_detail=next(item for item in updated_model['distribucion'] if item['anio']==detail['anio'])
+        self.assertEqual(updated_detail['autorizada'],3)
+
+        finance=self.client.get('/api/planificacion-financiera?mes=2026-10').get_json()
+        authorized=next(item for item in finance['compras_autorizadas']
+                        if item['modelo']==model['modelo'] and item['anio']==detail['anio'])
+        self.assertEqual(authorized['unidades'],3)
+        self.assertEqual(authorized['origen'],'Compra autorizada')
+        self.assertEqual(authorized['pendiente'],round(3*authorized['costo_promedio'],2))
+        connection=self.server.db()
+        self.assertEqual(connection.execute('SELECT COUNT(*) cantidad FROM adquisiciones').fetchone()['cantidad'],before_adquisiciones)
+        self.assertEqual(connection.execute('SELECT COUNT(*) cantidad FROM cuentas_por_pagar').fetchone()['cantidad'],before_cxp)
+        connection.close()
 
 
 if __name__ == '__main__':

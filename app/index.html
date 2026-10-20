@@ -1026,6 +1026,8 @@ renderPurchasePlanning=function(){
     summaryCards.lastElementChild.innerHTML=`<div class="label">Faltante de compra</div><b>${faltanteTotal}</b>`;
   }
   $('purchasePlanningModels').innerHTML=`<table><thead><tr><th>Modelo</th><th>Prom. M.</th><th>Existencia DPV / Taller / Tránsito / Consignación</th><th>Inventario óptimo</th><th>Existencia física total</th><th>Faltante de compra</th><th>Distribución por año</th></tr></thead><tbody>${models.map(row=>{let actual=row.inventario_actual||{},distribution=(row.distribucion||[]).map(item=>`<tr><td>${esc(item.anio)}</td><td>${Number(item.ideal||0)}</td><td>${Number(item.actual||0)}</td><td><b class="${Number(item.sugerido||0)>0?'warn':'good'}">${Number(item.sugerido||0)}</b></td></tr>`).join('')||'<tr><td colspan="4" class="sub">Sin distribución configurada.</td></tr>',faltante=Number(row.faltante_compra??(row.sugerido_compra||0));return `<tr><td><b>${esc(row.modelo)}</b></td><td>${Number(row.promedio_mensual||0).toFixed(2)}</td><td>${Number(actual.DPV||0)} / ${Number(actual['En Taller']||0)} / ${Number(actual['En Tránsito']||0)} / ${Number(actual['Consignación']||0)}</td><td>${Number(row.inventario_optimo_total||0)}</td><td>${Number(row.existencia_total??(Number(actual.DPV||0)+Number(actual['En Taller']||0)+Number(actual['En Tránsito']||0)+Number(actual['Consignación']||0)))}</td><td><b class="${faltante>0?'warn':'good'}">${faltante}</b></td><td><table class="purchase-distribution-table"><thead><tr><th>Año</th><th>Dist. ideal</th><th>Inv. actual</th><th>Faltante</th></tr></thead><tbody>${distribution}</tbody></table></td></tr>`}).join('')||'<tr><td colspan="7" class="sub">No hay modelos disponibles para planificar.</td></tr>'}</tbody></table>`;
+  let suggestedHead=$('purchasePlanningModels')?.closest('.panel')?.querySelector('.detailhead');
+  if(suggestedHead&&!$('purchaseSuggestionIntegrationButton'))suggestedHead.insertAdjacentHTML('beforeend','<button id="purchaseSuggestionIntegrationButton" class="btn2" type="button" onclick="openPurchaseSuggestionIntegration()">Ver integración de compra sugerida</button>');
   let parameterHead=Array.from(document.querySelectorAll('#purchasePlanning .detailhead')).find(head=>head.textContent.includes('Parámetros de inventario óptimo'));
   if(parameterHead&&!$('loadBasePurchasePlanningParameters'))parameterHead.insertAdjacentHTML('beforeend','<button id="loadBasePurchasePlanningParameters" class="btn2" type="button" onclick="loadBasePurchasePlanningParameters()">Cargar matriz base</button>');
 };
@@ -1034,6 +1036,31 @@ async function loadBasePurchasePlanningParameters(){
   let response=await fetch('/api/planificacion-compra/parametros/base',{method:'POST'}),result=await response.json();
   if(!response.ok)return showNotice(result.error||'No se pudo cargar la matriz base.','error');
   showNotice(`Matriz base cargada: ${Number(result.cantidad||0)} modelos.`);await loadPurchasePlanning();
+}
+function purchaseSuggestionIntegrationRows(){
+  return (purchasePlanningData?.modelos||[]).flatMap(model=>
+    (model.distribucion||[]).filter(detail=>Number(detail.sugerido||0)>0||Number(detail.autorizada||0)>0).map(detail=>({
+      modelo:model.modelo,anio:Number(detail.anio),faltante:Number(detail.sugerido||0),
+      autorizada:Number(detail.autorizada||0),costo_promedio:Number(model.costo_promedio||0)
+    }))
+  );
+}
+function closePurchaseSuggestionIntegration(){$('purchaseSuggestionIntegrationModal')?.remove()}
+function openPurchaseSuggestionIntegration(){
+  closePurchaseSuggestionIntegration();
+  let rows=purchaseSuggestionIntegrationRows();
+  let modal=document.createElement('div');modal.id='purchaseSuggestionIntegrationModal';modal.className='modal';
+  modal.innerHTML=`<div class="modalbox wide-table" style="max-width:1250px"><div class="modalhead"><div><h2>Integración de compra sugerida</h2><div class="sub">Registre la compra autorizada por modelo y año. Es informativa: aparecerá separada en Planificación financiera y no crea compras, CxP ni asientos.</div></div><button class="icon" type="button" onclick="closePurchaseSuggestionIntegration()">×</button></div><table><thead><tr><th>Modelo</th><th>Año</th><th>Faltante</th><th>Compra autorizada</th><th>Costo promedio</th><th>Monto sugerido</th><th>Monto autorizado</th><th></th></tr></thead><tbody>${rows.map((row,index)=>`<tr><td><b>${esc(row.modelo)}</b></td><td>${row.anio}</td><td><b class="${row.faltante>0?'warn':'good'}">${row.faltante}</b></td><td><input id="purchaseAuthorized${index}" type="number" min="0" step="1" value="${row.autorizada}"></td><td>${money(row.costo_promedio)}</td><td>${money(row.faltante*row.costo_promedio)}</td><td>${money(row.autorizada*row.costo_promedio)}</td><td><button class="primary" type="button" onclick="savePurchaseSuggestionAuthorization(${index})">Guardar</button></td></tr>`).join('')||'<tr><td colspan="8" class="sub">No hay faltantes por año para integrar.</td></tr>'}</tbody></table><div class="actions" style="justify-content:flex-end;margin-top:18px"><button class="btn2" type="button" onclick="closePurchaseSuggestionIntegration()">Cerrar</button></div></div>`;
+  modal.dataset.rows=JSON.stringify(rows);document.body.appendChild(modal);
+}
+async function savePurchaseSuggestionAuthorization(index){
+  let modal=$('purchaseSuggestionIntegrationModal'),rows=JSON.parse(modal?.dataset.rows||'[]'),row=rows[Number(index)];
+  if(!row)return showNotice('No se encontró la fila de integración.','error');
+  let cantidad=purchasePlanningInteger($('purchaseAuthorized'+index)?.value);
+  let response=await fetch('/api/planificacion-compra/autorizaciones',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({modelo:row.modelo,anio:row.anio,cantidad})}),result=await response.json();
+  if(!response.ok)return showNotice(result.error||'No se pudo guardar la compra autorizada.','error');
+  showNotice('Compra autorizada guardada. Ya se reflejará separada en Planificación financiera.');
+  await loadPurchasePlanning();openPurchaseSuggestionIntegration();
 }
 /* Boleta: el precio final puede aumentar; una rebaja exige descuento explícito. */
 const saleFinalPriceInput=$('saleFinalPrice');
@@ -1344,31 +1371,41 @@ function ensureCostingHistory(){
   if($('costingHistory'))return;
   $('cost').insertAdjacentHTML('beforeend',`<div id="costingHistory" class="panel wide-table"><div class="top"><div><h2>Historial de costeos</h2><div class="sub">Seleccione un vehículo para consultar su detalle. Solo la cuenta autorizada puede actualizarlo.</div></div><div class="actions"><select id="costingMonthFilter" onchange="renderCostingHistory()"><option value="">Todos los meses</option></select><button type="button" class="btn2" onclick="loadCostingHistory()">Actualizar</button></div></div><div class="tablewrap"><table><thead><tr><th>Fecha de costeo</th><th>VIN</th><th>Marca</th><th>Modelo</th><th>Año</th><th>Color</th><th>Nacionalización</th><th>Etapa actual</th><th>Costo total</th><th></th></tr></thead><tbody id="costingHistoryBody"><tr><td colspan="10" class="sub">Cargando historial...</td></tr></tbody></table></div></div>`);
 }
-const costeoEditorUsername='erickmadrid.sabillon@gmail.com';
 let costeoHistoryReadOnly=false;
+function costeoAccessCached(){return accessSession?.costeo_acceso||'ninguno'}
 async function canUpdateCosteo(){
   if(!accessSession){try{accessSession=await get('/api/sesion')}catch(error){return false}}
-  return String(accessSession?.usuario||'').trim().toLowerCase()===costeoEditorUsername;
+  return costeoAccessCached()==='total';
+}
+async function canEditCosteo(){
+  if(!accessSession){try{accessSession=await get('/api/sesion')}catch(error){return false}}
+  return costeoAccessCached()!=='ninguno';
 }
 async function applyCosteoEditMode(){
   let form=$('costForm');if(!form)return;
-  let editable=(await canUpdateCosteo())&&!costeoHistoryReadOnly;
-  form.querySelectorAll('[name]').forEach(field=>field.disabled=!editable);
+  await canEditCosteo();
+  let level=costeoAccessCached(),editable=level!=='ninguno'&&!costeoHistoryReadOnly;
+  form.querySelectorAll('[name]').forEach(field=>{
+    let nationalizationField=['estatus','placa_nacionalizacion'].includes(field.name);
+    let amountStillOpen=Number(field.value||0)===0;
+    field.disabled=!editable||(level==='nacionalizacion'&&!nationalizationField&&!amountStillOpen);
+  });
   let save=form.querySelector('.actions .primary');
   if(save)save.classList.toggle('hidden',!editable);
   let note=$('costeoDetailPermission');
   if(!note){form.querySelector('.actions').insertAdjacentHTML('afterbegin','<span id="costeoDetailPermission" class="sub" style="align-self:center"></span>');note=$('costeoDetailPermission')}
-  note.textContent=editable?'Puede actualizar este costeo.':'Consulta de costeo: solo la cuenta autorizada puede actualizarlo.';
+  note.textContent=!editable?'Consulta de costeo: no tiene permiso para actualizarlo.':level==='nacionalizacion'?'Puede actualizar Nacionalización y Placa; los importes solo mientras estén en cero.':'Puede actualizar este costeo.';
 }
 function renderCostingHistory(){
   let body=$('costingHistoryBody'),filter=$('costingMonthFilter')?.value||'';
   if(!body)return;
   let rows=costingHistoryRows.filter(row=>!filter||String(row.fecha_actualizacion||'').startsWith(filter));
-  body.innerHTML=rows.map(row=>`<tr style="cursor:pointer" onclick="openCostingHistoryDetail(${Number(row.vehiculo_id)},false)"><td>${esc(costeoHistoryDate(row.fecha_actualizacion))}</td><td><b>${esc(row.vin||'—')}</b></td><td>${esc(row.marca||'—')}</td><td>${esc(row.modelo||'—')}</td><td>${esc(row.anio||'—')}</td><td>${esc(row.color||'—')}</td><td>${esc(row.estatus||'Pendiente')}</td><td>${esc(row.estado||'—')}</td><td><b>${money(row.costo_total||0)}</b></td><td><button class="btn2" type="button" onclick="event.stopPropagation();openCostingHistoryDetail(${Number(row.vehiculo_id)},false)">Ver detalle</button>${canUpdateCosteoCached()?` <button class="btn2" type="button" onclick="event.stopPropagation();openCostingHistoryDetail(${Number(row.vehiculo_id)},true)">Editar</button>`:''}</td></tr>`).join('')||'<tr><td colspan="10" class="sub">No hay costeos para el período seleccionado.</td></tr>';
+  body.innerHTML=rows.map(row=>`<tr style="cursor:pointer" onclick="openCostingHistoryDetail(${Number(row.vehiculo_id)},false)"><td>${esc(costeoHistoryDate(row.fecha_actualizacion))}</td><td><b>${esc(row.vin||'—')}</b></td><td>${esc(row.marca||'—')}</td><td>${esc(row.modelo||'—')}</td><td>${esc(row.anio||'—')}</td><td>${esc(row.color||'—')}</td><td>${esc(row.estatus||'Pendiente')}</td><td>${esc(row.estado||'—')}</td><td><b>${money(row.costo_total||0)}</b></td><td><button class="btn2" type="button" onclick="event.stopPropagation();openCostingHistoryDetail(${Number(row.vehiculo_id)},false)">Ver detalle</button>${canEditCosteoCached()?` <button class="btn2" type="button" onclick="event.stopPropagation();openCostingHistoryDetail(${Number(row.vehiculo_id)},true)">Editar</button>`:''}</td></tr>`).join('')||'<tr><td colspan="10" class="sub">No hay costeos para el período seleccionado.</td></tr>';
 }
-function canUpdateCosteoCached(){return String(accessSession?.usuario||'').trim().toLowerCase()===costeoEditorUsername}
+function canUpdateCosteoCached(){return costeoAccessCached()==='total'}
+function canEditCosteoCached(){return costeoAccessCached()!=='ninguno'}
 async function openCostingHistoryDetail(vehicleId,edit){
-  if(edit&&!(await canUpdateCosteo()))return showNotice('Solo la cuenta autorizada puede actualizar el costeo.','error');
+  if(edit&&!(await canEditCosteo()))return showNotice('No tiene permiso para actualizar el costeo.','error');
   let row=costingHistoryRows.find(item=>Number(item.vehiculo_id)===Number(vehicleId)),select=$('costVehicle');
   if(!row||!select)return;
   costeoHistoryReadOnly=!edit;
@@ -1452,14 +1489,14 @@ contractOptions=function(){
   if(form&&!form.dataset.currencyBound){form.elements.contrato_id.addEventListener('change',actualizarMonedaDeposito);form.dataset.currencyBound='true'}
   actualizarMonedaDeposito();
 };
-let financialPlanningUsdRows=[],financialPlanningPurchaseRows=[];
+let financialPlanningUsdRows=[],financialPlanningPurchaseRows=[],financialPlanningAuthorizedPurchaseRows=[];
 function usdMoney(value){return `US$ ${Number(value||0).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})}`}
 const loadFinancialPlanningWithUsdContracts=loadFinancialPlanning;
 loadFinancialPlanning=async function(){
   try{
     let monthInput=$('financialPlanningMonth');if(!monthInput.value)monthInput.value=new Date().toISOString().slice(0,7);
     let data=await get(`/api/planificacion-financiera?mes=${encodeURIComponent(monthInput.value)}`);
-    financialPlanningRows=data.compromisos||[];financialPlanningUsdRows=data.compromisos_usd||[];financialPlanningPurchaseRows=data.compras_planificadas||[];
+    financialPlanningRows=data.compromisos||[];financialPlanningUsdRows=data.compromisos_usd||[];financialPlanningPurchaseRows=data.compras_sugeridas||data.compras_planificadas||[];financialPlanningAuthorizedPurchaseRows=data.compras_autorizadas||[];
     renderFinancialPlanning();
   }catch(error){$('financialPlanningTable').innerHTML='<div class="form-feedback error" style="display:block">No fue posible cargar la planificación financiera.</div>'}
 };
@@ -1468,12 +1505,14 @@ const renderFinancialPlanningWithUsdContracts=renderFinancialPlanning;
 renderFinancialPlanning=function(){
   renderFinancialPlanningWithUsdContracts();
   let month=$('financialPlanningMonth')?.value;if(!month)return;
-  let compras=financialPlanningPurchaseRows.filter(row=>String(row.fecha_compromiso||'').slice(0,7)===month),totalCompras=compras.reduce((sum,row)=>sum+Number(row.pendiente||0),0),baseTotal=financialPlanningRows.filter(row=>String(row.fecha_compromiso||'').slice(0,7)===month).reduce((sum,row)=>sum+Number(row.pendiente||0),0);
+  let compras=financialPlanningPurchaseRows.filter(row=>String(row.fecha_compromiso||'').slice(0,7)===month),autorizadas=financialPlanningAuthorizedPurchaseRows.filter(row=>String(row.fecha_compromiso||'').slice(0,7)===month),totalCompras=compras.reduce((sum,row)=>sum+Number(row.pendiente||0),0),totalAutorizadas=autorizadas.reduce((sum,row)=>sum+Number(row.pendiente||0),0),baseTotal=financialPlanningRows.filter(row=>String(row.fecha_compromiso||'').slice(0,7)===month).reduce((sum,row)=>sum+Number(row.pendiente||0),0);
   let semanasCompra=planningWeeks(month),comprasPorSemana=Object.fromEntries(semanasCompra.map(week=>[week.key,{...week,unidades:0,monto:0}]));
   compras.forEach(row=>{let date=planningDate(row.fecha_compromiso);if(!date)return;let week=comprasPorSemana[planningMonday(date).toISOString().slice(0,10)];if(!week)return;week.unidades+=Number(row.unidades||0);week.monto+=Number(row.pendiente||0)});
-  $('financialPlanningSummary')?.insertAdjacentHTML('beforeend',`<div class="kpi"><div class="label">Compra planificada · ${month}</div><b>${money(totalCompras)}</b><div class="sub">${compras.reduce((sum,row)=>sum+Number(row.unidades||0),0)} vehículos sugeridos.</div></div><div class="kpi"><div class="label">Total con compra planificada</div><b>${money(baseTotal+totalCompras)}</b></div>`);
+  $('financialPlanningSummary')?.insertAdjacentHTML('beforeend',`<div class="kpi"><div class="label">Compra sugerida · ${month}</div><b>${money(totalCompras)}</b><div class="sub">${compras.reduce((sum,row)=>sum+Number(row.unidades||0),0)} vehículos sugeridos.</div></div><div class="kpi"><div class="label">Compra autorizada · ${month}</div><b>${money(totalAutorizadas)}</b><div class="sub">${autorizadas.reduce((sum,row)=>sum+Number(row.unidades||0),0)} vehículos autorizados.</div></div><div class="kpi"><div class="label">Total con compras planificadas</div><b>${money(baseTotal+totalCompras+totalAutorizadas)}</b></div>`);
   $('financialPlanningPurchases')?.remove();
-  $('financialPlanningTable')?.closest('.panel')?.insertAdjacentHTML('afterend',`<div id="financialPlanningPurchases" class="panel wide-table"><div class="detailhead"><div><h2 style="margin:0">Compra planificada por semana</h2><div class="sub">La fecha indica cuándo debe ordenarse la compra: se anticipa al quiebre de inventario con una cobertura de 70 días. Taller entra en 30 días o en la fecha de entrega de la OT; Tránsito entra en 45 días. No genera CxP ni contabilidad.</div></div><b>${money(totalCompras)}</b></div><table><thead><tr><th>Semana de compra</th><th>Unidades</th><th>Monto planificado</th></tr></thead><tbody>${semanasCompra.map(week=>{let item=comprasPorSemana[week.key];return `<tr><td><b>${week.label}</b></td><td>${Number(item.unidades||0)} vehículo${Number(item.unidades||0)===1?'':'s'}</td><td><b>${money(item.monto||0)}</b></td></tr>`}).join('')}<tr class="total-row"><td><b>Total del mes</b></td><td><b>${compras.reduce((sum,row)=>sum+Number(row.unidades||0),0)}</b></td><td><b>${money(totalCompras)}</b></td></tr></tbody></table><div class="sub" style="margin:18px 0 8px"><b>Detalle de órdenes sugeridas</b></div>${reportTable(compras,[{label:'Semana de compra',value:r=>{let date=planningDate(r.fecha_compromiso);return date?`Semana ${planningIsoWeek(date)}`:'—'}},{label:'Modelo',value:r=>`<b>${esc(r.modelo)}</b>`},{label:'Unidades',value:r=>`${Number(r.unidades||0)} vehículo${Number(r.unidades||0)===1?'':'s'}`},{label:'Disponible desde',value:r=>esc(r.fecha_disponibilidad||'—')},{label:'Cobertura',value:r=>esc(r.motivo||'—')},{label:'Costo promedio',value:r=>money(r.costo_promedio||0)},{label:'Compra planificada',value:r=>`<b>${money(r.pendiente||0)}</b>`}])}</div>`);
+  $('financialPlanningTable')?.closest('.panel')?.insertAdjacentHTML('afterend',`<div id="financialPlanningPurchases" class="panel wide-table"><div class="detailhead"><div><h2 style="margin:0">Compra sugerida por semana</h2><div class="sub">La fecha indica cuándo debe ordenarse la compra: se anticipa al quiebre de inventario con una cobertura de 70 días. Taller entra en 30 días o en la fecha de entrega de la OT; Tránsito entra en 45 días. No genera CxP ni contabilidad.</div></div><b>${money(totalCompras)}</b></div><table><thead><tr><th>Semana de compra</th><th>Unidades</th><th>Monto sugerido</th></tr></thead><tbody>${semanasCompra.map(week=>{let item=comprasPorSemana[week.key];return `<tr><td><b>${week.label}</b></td><td>${Number(item.unidades||0)} vehículo${Number(item.unidades||0)===1?'':'s'}</td><td><b>${money(item.monto||0)}</b></td></tr>`}).join('')}<tr class="total-row"><td><b>Total del mes</b></td><td><b>${compras.reduce((sum,row)=>sum+Number(row.unidades||0),0)}</b></td><td><b>${money(totalCompras)}</b></td></tr></tbody></table><div class="sub" style="margin:18px 0 8px"><b>Detalle de órdenes sugeridas</b></div>${reportTable(compras,[{label:'Semana de compra',value:r=>{let date=planningDate(r.fecha_compromiso);return date?`Semana ${planningIsoWeek(date)}`:'—'}},{label:'Modelo',value:r=>`<b>${esc(r.modelo)}</b>`},{label:'Unidades',value:r=>`${Number(r.unidades||0)} vehículo${Number(r.unidades||0)===1?'':'s'}`},{label:'Disponible desde',value:r=>esc(r.fecha_disponibilidad||'—')},{label:'Cobertura',value:r=>esc(r.motivo||'—')},{label:'Costo promedio',value:r=>money(r.costo_promedio||0)},{label:'Compra sugerida',value:r=>`<b>${money(r.pendiente||0)}</b>`}])}</div>`);
+  $('financialPlanningAuthorizedPurchases')?.remove();
+  $('financialPlanningPurchases')?.insertAdjacentHTML('afterend',`<div id="financialPlanningAuthorizedPurchases" class="panel wide-table"><div class="detailhead"><div><h2 style="margin:0">Compra autorizada</h2><div class="sub">Autorizaciones registradas desde la integración de compra sugerida. Son una proyección de compra: no crean CxP, banco ni asientos.</div></div><b>${money(totalAutorizadas)}</b></div>${reportTable(autorizadas,[{label:'Modelo',value:r=>`<b>${esc(r.modelo)}</b>`},{label:'Año',value:r=>esc(r.anio)},{label:'Unidades autorizadas',value:r=>`${Number(r.unidades||0)}`},{label:'Costo promedio',value:r=>money(r.costo_promedio||0)},{label:'Compra autorizada',value:r=>`<b>${money(r.pendiente||0)}</b>`}])}</div>`);
   let rows=financialPlanningUsdRows.filter(row=>String(row.fecha_compromiso||'').slice(0,7)===month);
   let total=rows.reduce((sum,row)=>sum+Number(row.pendiente||0),0);
   $('financialPlanningSummary')?.insertAdjacentHTML('beforeend',`<div class="kpi"><div class="label">Contratos USD · ${month}</div><b>${usdMoney(total)}</b><div class="sub">Solo proyección; sin CxP automática.</div></div>`);

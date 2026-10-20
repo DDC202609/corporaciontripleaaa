@@ -28,6 +28,7 @@ app.config.update(SECRET_KEY=SECRET_KEY,SESSION_COOKIE_HTTPONLY=True,SESSION_COO
 ESTADOS_VEHICULO=('En Tránsito','Nacionalizado','En Taller','DPV','Reservado','Vendido')
 ZONA_HORARIA_OPERACION=ZoneInfo('America/Tegucigalpa')
 COSTEO_EDITOR_USERNAME=os.environ.get('COSTEO_EDITOR_USERNAME','erickmadrid.sabillon@gmail.com').strip().casefold()
+COSTEO_NACIONALIZACION_USERNAME=os.environ.get('COSTEO_NACIONALIZACION_USERNAME','alorenzo').strip().casefold()
 
 def ahora_operacion():
     """Fecha y hora que rigen los períodos operativos de Corporación Triple AAA."""
@@ -126,10 +127,17 @@ def user_access(user_id):
     c.close(); data['permisos']=permissions
     return data
 
-def puede_actualizar_costeo():
-    """El costeo histórico solo puede ser actualizado por la cuenta autorizada."""
+def nivel_actualizacion_costeo():
+    """Distingue el editor total del usuario limitado a nacionalización."""
     user=user_access(session.get('user_id')) if session.get('user_id') else None
-    return bool(user and str(user.get('username') or '').strip().casefold()==COSTEO_EDITOR_USERNAME)
+    username=str(user.get('username') or '').strip().casefold() if user else ''
+    if username==COSTEO_EDITOR_USERNAME: return 'total'
+    if username==COSTEO_NACIONALIZACION_USERNAME: return 'nacionalizacion'
+    return 'ninguno'
+
+def puede_actualizar_costeo():
+    """El costeo histórico completo solo puede ser actualizado por la cuenta autorizada."""
+    return nivel_actualizacion_costeo()=='total'
 
 def request_module(path):
     if path.startswith('/api/usuarios') or path.startswith('/api/perfiles'): return 'usuarios'
@@ -491,6 +499,15 @@ def init_db(sync_history=True):
         inventario_optimo_transito INTEGER NOT NULL DEFAULT 0,
         distribucion_anios TEXT NOT NULL DEFAULT '{}',
         actualizado_en TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )''')
+    # Las autorizaciones se conservan separadas de la meta de inventario: son
+    # una decisión de compra manual y no deben alterar el sugerido calculado.
+    c.execute('''CREATE TABLE IF NOT EXISTS planificacion_compra_autorizaciones(
+        modelo TEXT NOT NULL COLLATE NOCASE,
+        anio INTEGER NOT NULL,
+        cantidad INTEGER NOT NULL DEFAULT 0,
+        actualizado_en TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY(modelo,anio)
     )''')
     c.execute('''CREATE TABLE IF NOT EXISTS ordenes_trabajo(
         id INTEGER PRIMARY KEY AUTOINCREMENT,vehiculo_id INTEGER NOT NULL REFERENCES vehiculos(id),adquisicion_id INTEGER REFERENCES adquisiciones(id),
@@ -1689,7 +1706,7 @@ def sesion_actual():
     if not user: return jsonify(error='Sesión requerida.'),401
     return jsonify(usuario=user['username'],nombre=user.get('nombre') or user['username'],
                    perfil=user.get('perfil_nombre') or 'Sin perfil',es_administrador=bool(user.get('es_administrador')),
-                   permisos=user.get('permisos',{}))
+                   permisos=user.get('permisos',{}),costeo_acceso=nivel_actualizacion_costeo())
 
 @app.post('/api/sesion/actividad')
 def registrar_actividad_sesion():
@@ -3842,8 +3859,9 @@ def get_planificacion_financiera():
         modelo=_modelo_planificacion(row['modelo'])
         llegadas_transito.setdefault(modelo,[]).append(inicio_plan+timedelta(days=45))
 
+    planificacion_compra=datos_planificacion_compra(c)
     compras_planificadas=[]
-    for modelo in datos_planificacion_compra(c)['modelos']:
+    for modelo in planificacion_compra['modelos']:
         unidades=int(modelo.get('faltante_compra') or 0)
         if unidades<=0: continue
         actual=modelo.get('inventario_actual') or {}
@@ -3896,10 +3914,33 @@ def get_planificacion_financiera():
             grouped['fecha_disponibilidad']=min(grouped['fecha_disponibilidad'],item['fecha_disponibilidad'])
     compras_planificadas=sorted(consolidadas.values(),key=lambda item:(item['fecha_compromiso'],item['modelo']))
     compras_del_mes=[item for item in compras_planificadas if item['fecha_compromiso'][:7]==mes]
-    summary['compra_planificada']=round(sum(item['pendiente'] for item in compras_del_mes),2)
-    summary['total_con_compra_planificada']=round(summary['total']+summary['compra_planificada'],2)
+    # La compra autorizada se muestra aparte de la sugerida. Es una intención
+    # aprobada por gerencia: no crea una adquisición, CxP ni asiento contable.
+    compras_autorizadas=[]
+    for modelo in planificacion_compra['modelos']:
+        costo_promedio=costos_promedio.get(modelo['modelo'],0)
+        for detalle in modelo.get('distribucion') or []:
+            unidades=max(0,int(detalle.get('autorizada') or 0))
+            if not unidades: continue
+            compras_autorizadas.append({
+                'fecha_compromiso':inicio_plan.isoformat(),
+                'semana_compra':(inicio_plan-timedelta(days=inicio_plan.weekday())).isoformat(),
+                'modelo':modelo['modelo'],'anio':int(detalle['anio']),'unidades':unidades,
+                'costo_promedio':costo_promedio,'pendiente':round(unidades*costo_promedio,2),
+                'origen':'Compra autorizada','etapa':'Compra autorizada',
+                'motivo':'Autorización manual desde integración de compra sugerida.',
+            })
+    compras_autorizadas.sort(key=lambda item:(item['modelo'],item['anio']))
+    autorizadas_del_mes=[item for item in compras_autorizadas if item['fecha_compromiso'][:7]==mes]
+    summary['compra_sugerida']=round(sum(item['pendiente'] for item in compras_del_mes),2)
+    # Se conserva la clave anterior para integraciones que ya la consumen.
+    summary['compra_planificada']=summary['compra_sugerida']
+    summary['compra_autorizada']=round(sum(item['pendiente'] for item in autorizadas_del_mes),2)
+    summary['total_con_compra_planificada']=round(summary['total']+summary['compra_sugerida']+summary['compra_autorizada'],2)
     c.close(); return jsonify(resumen=summary,compromisos=rows,compromisos_usd=compromisos_usd,
-                              compras_planificadas=compras_planificadas)
+                              compras_planificadas=compras_planificadas,
+                              compras_sugeridas=compras_planificadas,
+                              compras_autorizadas=compras_autorizadas)
 
 def _modelo_planificacion(value):
     return ' '.join(str(value or '').strip().split()).upper()
@@ -3972,6 +4013,12 @@ def datos_planificacion_compra(c, semanas=12):
     weeks=[monday+timedelta(days=index*7) for index in range(semanas)]
     year_values=set(range(2010,today.year+1))
     parameters={}
+    autorizaciones={}
+    for row in c.execute('SELECT modelo,anio,cantidad FROM planificacion_compra_autorizaciones'):
+        modelo=_modelo_planificacion(row['modelo'])
+        try: anio=int(row['anio'])
+        except (TypeError,ValueError): continue
+        autorizaciones[(modelo,anio)]=max(0,int(row['cantidad'] or 0))
     for row in c.execute('SELECT * FROM planificacion_compra_parametros'):
         item=dict(row)
         try: distribution=json.loads(item.get('distribucion_anios') or '{}')
@@ -4014,6 +4061,14 @@ def datos_planificacion_compra(c, semanas=12):
         GROUP BY v.modelo""",(start_month,today.isoformat())):
         model=_modelo_planificacion(row['modelo']); models.add(model)
         sales[model]=int(row['cantidad'] or 0)
+    costos_promedio={}
+    for row in c.execute('''SELECT v.modelo,
+            AVG(CASE WHEN COALESCE(a.costo_compra,0)>0 THEN a.costo_compra
+                     WHEN COALESCE(v.precio_compra,0)>0 THEN v.precio_compra END) costo_promedio
+        FROM vehiculos v LEFT JOIN adquisiciones a ON a.vehiculo_id=v.id
+        WHERE COALESCE(a.costo_compra,v.precio_compra,0)>0
+        GROUP BY v.modelo'''):
+        costos_promedio[_modelo_planificacion(row['modelo'])]=round(float(row['costo_promedio'] or 0),2)
     transit_by_model={model:[0]*semanas for model in models}; workshop_by_model={model:[0]*semanas for model in models}
     transit_records=[]
     without_eta=[]; without_delivery=[]
@@ -4079,7 +4134,9 @@ def datos_planificacion_compra(c, semanas=12):
         for year in sorted(distribution_years,key=int):
             value=param['distribucion'].get(year,0)
             actual=current['anios'].get(year,0)
-            distribution.append({'anio':int(year),'ideal':value,'actual':actual,'sugerido':max(0,value-actual)})
+            anio=int(year)
+            distribution.append({'anio':anio,'ideal':value,'actual':actual,'sugerido':max(0,value-actual),
+                                 'autorizada':autorizaciones.get((model,anio),0)})
         # El sugerido se compra por unidades completas: medio vehículo o más
         # requiere una unidad; cualquier fracción menor no genera compra.
         faltante_bruto=max(0,target_total-current_total)
@@ -4087,7 +4144,8 @@ def datos_planificacion_compra(c, semanas=12):
         rows.append({'modelo':model,'promedio_mensual':average,'ventas_12_meses':sales.get(model,0),
                      'inventario_actual':current,'inventario_optimo':param,'inventario_optimo_total':target_total,
                      'existencia_total':physical_total,'existencia_para_compra':current_total,'faltante_compra':faltante_compra,
-                     'sugerido_compra':faltante_compra,'distribucion':distribution,'proyeccion':projection})
+                     'sugerido_compra':faltante_compra,'costo_promedio':costos_promedio.get(model,0),
+                     'distribucion':distribution,'proyeccion':projection})
     for week in weekly:
         for key in ('demanda','faltante_dpv'): week[key]=round(week[key],2)
     return {'anios':sorted(year_values),'modelos':rows,'semanas':weekly,'transitos':transit_records,
@@ -4099,6 +4157,32 @@ def get_planificacion_compra():
     try: data=datos_planificacion_compra(c)
     finally: c.close()
     return jsonify(data)
+
+@app.put('/api/planificacion-compra/autorizaciones')
+def put_planificacion_compra_autorizaciones():
+    """Guarda unidades autorizadas por modelo/año, sin generar documentos."""
+    data=request.get_json(silent=True) or {}
+    try:
+        modelo=_modelo_planificacion(data.get('modelo'))
+        anio=int(data.get('anio'))
+        cantidad=max(0,int(float(data.get('cantidad',0) or 0)))
+        if not modelo or not 1900<=anio<=2100: raise ValueError
+    except (TypeError,ValueError,OverflowError):
+        return jsonify(error='Revise el modelo, año y cantidad autorizada.'),400
+    c=db()
+    try:
+        if cantidad:
+            c.execute('''INSERT INTO planificacion_compra_autorizaciones(modelo,anio,cantidad,actualizado_en)
+                VALUES(?,?,?,CURRENT_TIMESTAMP)
+                ON CONFLICT(modelo,anio) DO UPDATE SET cantidad=excluded.cantidad,actualizado_en=CURRENT_TIMESTAMP''',
+                (modelo,anio,cantidad))
+        else:
+            c.execute('DELETE FROM planificacion_compra_autorizaciones WHERE modelo=? AND anio=?',(modelo,anio))
+        c.commit()
+    except Exception:
+        c.rollback(); raise
+    finally: c.close()
+    return jsonify(ok=True,modelo=modelo,anio=anio,cantidad=cantidad)
 
 @app.put('/api/planificacion-compra/parametros')
 def put_planificacion_compra_parametros():
@@ -4803,6 +4887,8 @@ def get_costeos():
 
 @app.post('/api/vehiculos/<int:vid>/costos')
 def post_costo(vid):
+    if nivel_actualizacion_costeo()=='nacionalizacion':
+        return jsonify(error='Su acceso de Costeo solo permite actualizar Nacionalización y Placa.'),403
     d=request.get_json(force=True)
     if not d.get('concepto') or d.get('monto') is None: return jsonify(error='Concepto y monto son obligatorios'),400
     c=db();
@@ -4816,12 +4902,15 @@ def post_costo(vid):
 
 @app.delete('/api/vehiculos/<int:vid>/costos/<int:cid>')
 def delete_costo(vid,cid):
+    if nivel_actualizacion_costeo()=='nacionalizacion':
+        return jsonify(error='Su acceso de Costeo solo permite actualizar Nacionalización y Placa.'),403
     c=db(); c.execute('DELETE FROM costos_vehiculo WHERE id=? AND vehiculo_id=?',(cid,vid)); c.commit(); c.close(); return jsonify(ok=True)
 
 @app.put('/api/vehiculos/<int:vid>/adquisicion')
 def put_adquisicion(vid):
-    if not puede_actualizar_costeo():
-        return jsonify(error='Solo la cuenta autorizada puede actualizar el costeo.'),403
+    access=nivel_actualizacion_costeo()
+    if access=='ninguno':
+        return jsonify(error='No tiene permiso para actualizar el costeo.'),403
     d=request.get_json(force=True); c=db()
     vehicle=c.execute('SELECT id,estado,ubicacion,precio_compra FROM vehiculos WHERE id=?',(vid,)).fetchone()
     if not vehicle:
@@ -4829,10 +4918,20 @@ def put_adquisicion(vid):
     previous=c.execute('SELECT * FROM costos_adquisicion WHERE vehiculo_id=?',(vid,)).fetchone()
     previous=dict(previous) if previous else {}
     def amount(key):
-        try: return float(d[key]) if key in d else float(previous.get(key) or 0)
+        try:
+            saved=float(previous.get(key) or 0)
+            proposed=float(d[key]) if key in d else saved
+            # El costeo se completa por etapas. Para el acceso limitado cada
+            # importe sigue abierto mientras su valor guardado sea cero; una
+            # vez cargado, se vuelve histórico y ya no puede reemplazarse.
+            if access=='nacionalizacion' and previous and saved!=0 and proposed!=saved:
+                raise PermissionError(key)
+            return proposed
         except (TypeError,ValueError): raise ValueError(key)
     try:
         ajuste=amount('ajuste_compra'); grua=amount('grua'); flete=amount('flete'); isv=amount('isv_pagado'); std=amount('cl_std'); almacenaje=amount('almacenaje'); gastos=amount('gastos_aduaneros')
+    except PermissionError:
+        c.close(); return jsonify(error='Solo puede registrar importes cuyo valor actual sea cero.'),403
     except ValueError:
         c.close(); return jsonify(error='Los valores de costeo deben ser numéricos'),400
     estatus=d.get('estatus',previous.get('estatus') or 'Pendiente')
