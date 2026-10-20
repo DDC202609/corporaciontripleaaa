@@ -619,6 +619,11 @@ class CriticalFlowsTest(unittest.TestCase):
         self.assertEqual(len(row['proyeccion']),12)
         self.assertEqual(len(data['semanas']),12)
 
+    def test_purchase_planning_rounds_purchase_shortage_to_whole_vehicles(self):
+        self.assertEqual(self.server._redondear_unidad_compra(0.49), 0)
+        self.assertEqual(self.server._redondear_unidad_compra(0.50), 1)
+        self.assertEqual(self.server._redondear_unidad_compra(1.65), 2)
+
     def test_purchase_planning_loads_supplied_optimal_inventory_matrix(self):
         self.login_as_admin()
         response=self.client.post('/api/planificacion-compra/parametros/base')

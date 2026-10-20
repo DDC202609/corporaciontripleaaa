@@ -3828,6 +3828,10 @@ PARAMETROS_INVENTARIO_OPTIMO_BASE = [
     ('ODISSE',1,0,1,{2016:1}),
 ]
 
+def _redondear_unidad_compra(cantidad):
+    """Convierte un faltante no negativo a una cantidad comprable entera."""
+    return int(max(0,float(cantidad or 0))+0.5)
+
 def _normalizar_parametros_planificacion(items):
     if not isinstance(items,list): raise ValueError
     normalized=[]; seen=set()
@@ -3958,7 +3962,10 @@ def datos_planificacion_compra(c, semanas=12):
         for year,value in sorted(param['distribucion'].items(),key=lambda pair:int(pair[0])):
             actual=current['anios'].get(year,0)
             distribution.append({'anio':int(year),'ideal':value,'actual':actual,'sugerido':max(0,value-actual)})
-        faltante_compra=max(0,target_total-current_total)
+        # El sugerido se compra por unidades completas: medio vehículo o más
+        # requiere una unidad; cualquier fracción menor no genera compra.
+        faltante_bruto=max(0,target_total-current_total)
+        faltante_compra=_redondear_unidad_compra(faltante_bruto)
         rows.append({'modelo':model,'promedio_mensual':average,'ventas_12_meses':sales.get(model,0),
                      'inventario_actual':current,'inventario_optimo':param,'inventario_optimo_total':target_total,
                      'existencia_total':current_total,'faltante_compra':faltante_compra,
