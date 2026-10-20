@@ -3816,18 +3816,87 @@ def get_planificacion_financiera():
         WHERE COALESCE(a.costo_compra,v.precio_compra,0)>0
         GROUP BY v.modelo''').fetchall():
         costos_promedio[_modelo_planificacion(costo['modelo'])]=round(float(costo['costo_promedio'] or 0),2)
+    # La fecha es la semana de ORDENAR la compra, no la de recibirla. Se
+    # anticipa la orden cuando la cobertura se agotará dentro de 70 días. Así,
+    # por ejemplo, un quiebre estimado en 70 días exige comprar hoy. Las
+    # unidades actuales en Taller vuelven en 30 días o en su fecha de OT, y
+    # las de Tránsito se consideran disponibles en 45 días.
+    inicio_mes=datetime.strptime(f'{mes}-01','%Y-%m-%d').date()
+    inicio_plan=max(inicio_mes,ahora_operacion().date())
+    entregas_taller={}
+    for row in c.execute('''SELECT v.modelo,
+            MIN(CASE WHEN o.estado='Pendiente' AND TRIM(COALESCE(o.fecha_entrega_estimada,''))<>''
+                     THEN o.fecha_entrega_estimada END) fecha_entrega
+        FROM vehiculos v
+        LEFT JOIN ordenes_trabajo o ON o.vehiculo_id=v.id
+        WHERE v.estado='En Taller' AND COALESCE(v.tipo_compra,'')<>'Consignación'
+        GROUP BY v.id,v.modelo''').fetchall():
+        modelo=_modelo_planificacion(row['modelo'])
+        fecha=fecha_planilla(row['fecha_entrega'])
+        entregas_taller.setdefault(modelo,[]).append(fecha or inicio_plan+timedelta(days=30))
+    llegadas_transito={}
+    for row in c.execute('''SELECT v.modelo,a.fecha
+        FROM vehiculos v
+        LEFT JOIN adquisiciones a ON a.vehiculo_id=v.id
+        WHERE v.estado='En Tránsito' AND COALESCE(v.tipo_compra,'')<>'Consignación' ''').fetchall():
+        modelo=_modelo_planificacion(row['modelo'])
+        llegadas_transito.setdefault(modelo,[]).append(inicio_plan+timedelta(days=45))
+
     compras_planificadas=[]
     for modelo in datos_planificacion_compra(c)['modelos']:
         unidades=int(modelo.get('faltante_compra') or 0)
         if unidades<=0: continue
+        actual=modelo.get('inventario_actual') or {}
         costo_promedio=costos_promedio.get(modelo['modelo'],0)
-        compras_planificadas.append({
-            'fecha_compromiso':f'{mes}-01','modelo':modelo['modelo'],'unidades':unidades,
-            'costo_promedio':costo_promedio,'pendiente':round(unidades*costo_promedio,2),
-            'origen':'Compra planificada','etapa':'Compra planificada',
-        })
-    compras_planificadas.sort(key=lambda item:(-item['pendiente'],item['modelo']))
-    summary['compra_planificada']=round(sum(item['pendiente'] for item in compras_planificadas),2)
+        # Eventos de disponibilidad ya en curso. Se aplican al saldo DPV para
+        # estimar la fecha de quiebre de cada modelo.
+        disponibilidades={}
+        for fecha in entregas_taller.get(modelo['modelo'],[]):
+            disponibilidades[fecha]=disponibilidades.get(fecha,0)+1
+        for fecha in llegadas_transito.get(modelo['modelo'],[]):
+            disponibilidades[fecha]=disponibilidades.get(fecha,0)+1
+        compras_en_camino={}
+        demanda_diaria=float(modelo.get('promedio_mensual') or 0)/30.4375
+
+        def fecha_quiebre():
+            disponible=float(actual.get('DPV') or 0)
+            for offset in range(367):
+                fecha=inicio_plan+timedelta(days=offset)
+                disponible+=disponibilidades.get(fecha,0)+compras_en_camino.get(fecha,0)
+                disponible-=demanda_diaria
+                if disponible<=0: return fecha
+            return inicio_plan+timedelta(days=366)
+
+        # Cada unidad faltante se coloca en la semana en que hay que ordenarla
+        # para proteger una cobertura de 70 días. La llegada de esa compra se
+        # proyecta 45 días después, como un nuevo tránsito.
+        for _ in range(unidades):
+            quiebre=fecha_quiebre() if demanda_diaria>0 else inicio_plan
+            fecha=max(inicio_plan,quiebre-timedelta(days=70))
+            llegada=fecha+timedelta(days=45)
+            compras_en_camino[llegada]=compras_en_camino.get(llegada,0)+1
+            semana=fecha-timedelta(days=fecha.weekday())
+            compras_planificadas.append({
+                'fecha_compromiso':fecha.isoformat(),'semana_compra':semana.isoformat(),
+                'modelo':modelo['modelo'],'unidades':1,
+                'costo_promedio':costo_promedio,'pendiente':round(costo_promedio,2),
+                'origen':'Compra planificada','etapa':'Compra planificada',
+                'motivo':f'Cobertura hasta {quiebre.isoformat()}','fecha_disponibilidad':llegada.isoformat(),
+            })
+    # Se consolidan unidades de un mismo modelo en la misma semana para no
+    # llenar la planificación de líneas.
+    consolidadas={}
+    for item in compras_planificadas:
+        key=(item['semana_compra'],item['modelo'])
+        grouped=consolidadas.setdefault(key,{**item})
+        if grouped is not item:
+            grouped['unidades']+=item['unidades']
+            grouped['pendiente']=round(grouped['unidades']*grouped['costo_promedio'],2)
+            grouped['fecha_compromiso']=min(grouped['fecha_compromiso'],item['fecha_compromiso'])
+            grouped['fecha_disponibilidad']=min(grouped['fecha_disponibilidad'],item['fecha_disponibilidad'])
+    compras_planificadas=sorted(consolidadas.values(),key=lambda item:(item['fecha_compromiso'],item['modelo']))
+    compras_del_mes=[item for item in compras_planificadas if item['fecha_compromiso'][:7]==mes]
+    summary['compra_planificada']=round(sum(item['pendiente'] for item in compras_del_mes),2)
     summary['total_con_compra_planificada']=round(summary['total']+summary['compra_planificada'],2)
     c.close(); return jsonify(resumen=summary,compromisos=rows,compromisos_usd=compromisos_usd,
                               compras_planificadas=compras_planificadas)

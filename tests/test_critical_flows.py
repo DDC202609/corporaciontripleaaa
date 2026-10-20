@@ -817,6 +817,9 @@ class CriticalFlowsTest(unittest.TestCase):
         for row in planned:
             self.assertEqual(row['origen'],'Compra planificada')
             self.assertEqual(row['pendiente'],round(row['unidades']*row['costo_promedio'],2))
+            self.assertIn('semana_compra',row)
+            self.assertIn('fecha_disponibilidad',row)
+            self.assertTrue(row['motivo'].startswith('Cobertura hasta '))
 
 
 if __name__ == '__main__':
