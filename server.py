@@ -927,6 +927,11 @@ def init_db(sync_history=True):
     c.execute('''INSERT OR IGNORE INTO cuentas_contables
         (codigo,cuenta,tipo,grupo,naturaleza,acepta_movimiento,requiere_activo,requiere_centro_costo,activo)
         VALUES('1107','Anticipos a proveedores','Activo','Activo circulante','Deudora',1,0,0,1)''')
+    # Planillas: las bonificaciones se presentan y contabilizan por separado
+    # de las comisiones (6102) y de los sueldos/salarios.
+    c.execute('''INSERT OR IGNORE INTO cuentas_contables
+        (codigo,cuenta,tipo,grupo,naturaleza,acepta_movimiento,requiere_activo,requiere_centro_costo,activo)
+        VALUES('6103','Bonos al Personal','Gasto','Gasto de Venta','Deudora',1,0,0,1)''')
     sincronizar_anticipos_ot_en_kardex(c)
     reconciliar_auxiliar_cxc(c)
     c.execute("UPDATE vehiculos SET estado='DPV' WHERE estado NOT IN ('En Tránsito','Nacionalizado','En Taller','DPV','Reservado','Vendido')")
@@ -1976,9 +1981,7 @@ def catalogo():
     r=c.execute('SELECT * FROM cuentas_contables'+where+' ORDER BY CAST(codigo AS INTEGER),codigo').fetchall()
     c.close(); return jsonify([dict(x) for x in r])
 
-@app.put('/api/catalogo/<int:cuenta_id>')
-def actualizar_catalogo(cuenta_id):
-    data=request.get_json(silent=True) or {}
+def datos_cuenta_contable(data):
     codigo=(data.get('codigo') or '').strip()
     cuenta=(data.get('cuenta') or '').strip()
     tipo=(data.get('tipo') or '').strip()
@@ -1987,26 +1990,47 @@ def actualizar_catalogo(cuenta_id):
     tipos={'Activo','Contraactivo','Pasivo','Patrimonio','Ingreso','Costo','Gasto'}
     naturalezas={'Deudora','Acreedora'}
     if not codigo or not cuenta or not tipo or not naturaleza:
-        return jsonify(error='Código, cuenta, tipo y naturaleza son obligatorios.'),400
+        return None,'Código, cuenta, tipo y naturaleza son obligatorios.'
     if tipo not in tipos or naturaleza not in naturalezas:
-        return jsonify(error='Tipo o naturaleza contable no válidos.'),400
+        return None,'Tipo o naturaleza contable no válidos.'
+    return {
+        'codigo':codigo,'cuenta':cuenta,'tipo':tipo,'grupo':grupo,'naturaleza':naturaleza,
+        'acepta_movimiento':1 if bool(data.get('acepta_movimiento',True)) else 0,
+        'requiere_activo':1 if bool(data.get('requiere_activo',False)) else 0,
+        'requiere_centro_costo':1 if bool(data.get('requiere_centro_costo',False)) else 0,
+        'activo':1 if bool(data.get('activo',True)) else 0,
+    },None
+
+@app.post('/api/catalogo')
+def crear_catalogo():
+    data,error=datos_cuenta_contable(request.get_json(silent=True) or {})
+    if error: return jsonify(error=error),400
+    c=db()
     try:
-        acepta_movimiento=1 if bool(data.get('acepta_movimiento',True)) else 0
-        requiere_activo=1 if bool(data.get('requiere_activo',False)) else 0
-        requiere_centro_costo=1 if bool(data.get('requiere_centro_costo',False)) else 0
-        activo=1 if bool(data.get('activo',True)) else 0
-    except (TypeError,ValueError):
-        return jsonify(error='Los indicadores de la cuenta no son válidos.'),400
+        cur=c.execute('''INSERT INTO cuentas_contables(codigo,cuenta,tipo,grupo,naturaleza,
+            acepta_movimiento,requiere_activo,requiere_centro_costo,activo)
+            VALUES(:codigo,:cuenta,:tipo,:grupo,:naturaleza,:acepta_movimiento,:requiere_activo,:requiere_centro_costo,:activo)''',data)
+        c.commit()
+        return jsonify(dict(c.execute('SELECT * FROM cuentas_contables WHERE id=?',(cur.lastrowid,)).fetchone())),201
+    except sqlite3.IntegrityError:
+        c.rollback(); return jsonify(error='Ya existe una cuenta contable con ese código.'),409
+    finally:
+        c.close()
+
+@app.put('/api/catalogo/<int:cuenta_id>')
+def actualizar_catalogo(cuenta_id):
+    data,error=datos_cuenta_contable(request.get_json(silent=True) or {})
+    if error: return jsonify(error=error),400
     c=db()
     if not c.execute('SELECT id FROM cuentas_contables WHERE id=?',(cuenta_id,)).fetchone():
         c.close(); return jsonify(error='Cuenta contable no encontrada.'),404
-    duplicate=c.execute('SELECT id FROM cuentas_contables WHERE codigo=? AND id<>?',(codigo,cuenta_id)).fetchone()
+    duplicate=c.execute('SELECT id FROM cuentas_contables WHERE codigo=? AND id<>?',(data['codigo'],cuenta_id)).fetchone()
     if duplicate:
         c.close(); return jsonify(error='Ya existe otra cuenta con ese código.'),409
     try:
         c.execute('''UPDATE cuentas_contables SET codigo=?,cuenta=?,tipo=?,grupo=?,naturaleza=?,
             acepta_movimiento=?,requiere_activo=?,requiere_centro_costo=?,activo=? WHERE id=?''',
-            (codigo,cuenta,tipo,grupo,naturaleza,acepta_movimiento,requiere_activo,requiere_centro_costo,activo,cuenta_id))
+            (data['codigo'],data['cuenta'],data['tipo'],data['grupo'],data['naturaleza'],data['acepta_movimiento'],data['requiere_activo'],data['requiere_centro_costo'],data['activo'],cuenta_id))
         c.commit()
         row=dict(c.execute('SELECT * FROM cuentas_contables WHERE id=?',(cuenta_id,)).fetchone())
     except sqlite3.IntegrityError:
@@ -2632,9 +2656,22 @@ def get_areas():
 
 @app.get('/api/departamentos')
 def get_deps():
-    area=request.args.get('area_id'); c=db(); sql='SELECT * FROM departamentos WHERE activo=1'; args=[]
+    area=request.args.get('area_id'); c=db(); sql='''SELECT d.*,a.nombre area_nombre,
+        CASE WHEN a.nombre IN ('Administración','Finanzas') THEN 'Gasto Administrativo' ELSE 'Gasto de Venta' END grupo_resultado
+        FROM departamentos d JOIN areas a ON a.id=d.area_id WHERE d.activo=1'''; args=[]
     if area: sql+=' AND area_id=?'; args.append(area)
-    r=c.execute(sql+' ORDER BY area_id,codigo',args).fetchall(); c.close(); return jsonify([dict(x) for x in r])
+    r=c.execute(sql+' ORDER BY d.area_id,d.codigo',args).fetchall(); c.close(); return jsonify([dict(x) for x in r])
+
+def cuenta_salarios_departamento(c, departamento_id):
+    departamento=c.execute('''SELECT a.nombre area_nombre FROM departamentos d
+        JOIN areas a ON a.id=d.area_id WHERE d.id=? AND d.activo=1''',(departamento_id,)).fetchone()
+    if not departamento:
+        raise ValueError('El departamento seleccionado no está activo.')
+    codigo='6201' if departamento['area_nombre'] in ('Administración','Finanzas') else '6101'
+    cuenta=c.execute('SELECT id FROM cuentas_contables WHERE codigo=? AND activo=1 AND acepta_movimiento=1',(codigo,)).fetchone()
+    if not cuenta:
+        raise ValueError(f'No existe una cuenta activa de salarios para el grupo del departamento ({codigo}).')
+    return cuenta['id']
 
 def datos_empleado_planilla(data):
     """Valida el maestro de planillas sin crear movimientos contables."""
@@ -2755,10 +2792,11 @@ def cuentas_por_pagar_contratos():
     finally:c.close()
 
 def empleado_planilla_detalle(c, employee_id):
-    row=c.execute('''SELECT ep.*,d.codigo departamento_codigo,d.nombre departamento_nombre,
+    row=c.execute('''SELECT ep.*,d.codigo departamento_codigo,d.nombre departamento_nombre,a.nombre area_nombre,
+        CASE WHEN a.nombre IN ('Administración','Finanzas') THEN 'Gasto Administrativo' ELSE 'Gasto de Venta' END grupo_resultado,
         cc.codigo cuenta_codigo,cc.cuenta cuenta_nombre
         FROM empleados_planilla ep
-        JOIN departamentos d ON d.id=ep.departamento_id
+        JOIN departamentos d ON d.id=ep.departamento_id JOIN areas a ON a.id=d.area_id
         JOIN cuentas_contables cc ON cc.id=ep.cuenta_contable_id
         WHERE ep.id=?''',(employee_id,)).fetchone()
     return dict(row) if row else None
@@ -2820,10 +2858,11 @@ def calcular_planilla_quincenal(c, fecha_referencia):
 def get_planillas():
     c=db()
     activos=request.args.get('activos') in ('1','true','si')
-    rows=c.execute('''SELECT ep.*,d.codigo departamento_codigo,d.nombre departamento_nombre,
+    rows=c.execute('''SELECT ep.*,d.codigo departamento_codigo,d.nombre departamento_nombre,a.nombre area_nombre,
+        CASE WHEN a.nombre IN ('Administración','Finanzas') THEN 'Gasto Administrativo' ELSE 'Gasto de Venta' END grupo_resultado,
         cc.codigo cuenta_codigo,cc.cuenta cuenta_nombre
         FROM empleados_planilla ep
-        JOIN departamentos d ON d.id=ep.departamento_id
+        JOIN departamentos d ON d.id=ep.departamento_id JOIN areas a ON a.id=d.area_id
         JOIN cuentas_contables cc ON cc.id=ep.cuenta_contable_id
         WHERE (?=0 OR ep.activo=1)
         ORDER BY ep.nombre COLLATE NOCASE,ep.id''',(1 if activos else 0,)).fetchall()
@@ -2837,8 +2876,7 @@ def crear_empleado_planilla():
     try:
         if not c.execute('SELECT 1 FROM departamentos WHERE id=? AND activo=1',(data['departamento_id'],)).fetchone():
             return jsonify(error='El departamento seleccionado no está activo.'),400
-        if not c.execute('SELECT 1 FROM cuentas_contables WHERE id=? AND activo=1',(data['cuenta_contable_id'],)).fetchone():
-            return jsonify(error='La cuenta contable seleccionada no está activa.'),400
+        data['cuenta_contable_id']=cuenta_salarios_departamento(c,data['departamento_id'])
         cur=c.execute('''INSERT INTO empleados_planilla(nombre,numero_identidad,fecha_ingreso,salario,comisiones,bonos,ihss,rap,otras_deducciones,departamento_id,cuenta_contable_id)
             VALUES(:nombre,:numero_identidad,:fecha_ingreso,:salario,:comisiones,:bonos,:ihss,:rap,:otras_deducciones,:departamento_id,:cuenta_contable_id)''',data)
         c.commit(); employee=empleado_planilla_detalle(c,cur.lastrowid)
@@ -2953,15 +2991,23 @@ def registrar_pago_planilla_quincenal(payroll_id):
         detalles=[dict(row) for row in c.execute('SELECT * FROM planillas_quincenales_detalle WHERE planilla_id=?',(payroll_id,)).fetchall()]
         if not detalles: return jsonify(error='La planilla no tiene empleados para pagar.'),400
         por_cuenta={}
+        cuenta_comisiones=c.execute("SELECT id FROM cuentas_contables WHERE codigo='6102' AND activo=1 AND acepta_movimiento=1").fetchone()
+        cuenta_bonos=c.execute("SELECT id FROM cuentas_contables WHERE codigo='6103' AND activo=1 AND acepta_movimiento=1").fetchone()
+        if not cuenta_comisiones or not cuenta_bonos:
+            return jsonify(error='Deben existir las cuentas activas 6102 (Comisiones) y 6103 (Bonos al Personal).'),400
         for detalle in detalles:
-            cuenta_id=detalle.get('cuenta_contable_id')
-            if not cuenta_id:
-                empleado=c.execute('SELECT cuenta_contable_id FROM empleados_planilla WHERE id=?',(detalle['empleado_id'],)).fetchone()
-                cuenta_id=empleado['cuenta_contable_id'] if empleado else None
-            cuenta=c.execute('SELECT id FROM cuentas_contables WHERE id=? AND activo=1 AND acepta_movimiento=1',(cuenta_id,)).fetchone()
-            if not cuenta:
-                return jsonify(error=f"La cuenta contable del empleado {detalle['empleado_nombre']} ya no está disponible."),400
-            por_cuenta[cuenta_id]=round(por_cuenta.get(cuenta_id,0)+float(detalle['neto'] or 0),2)
+            cuenta_id=cuenta_salarios_departamento(c,detalle['departamento_id'])
+            comisiones=round(float(detalle.get('comisiones') or 0),2)
+            bonos=round(float(detalle.get('bonos') or 0),2)
+            salarios_neto=round(float(detalle['neto'] or 0)-comisiones-bonos,2)
+            if salarios_neto < -0.01:
+                return jsonify(error=f"Las deducciones de {detalle['empleado_nombre']} exceden el componente de salario de esta planilla."),400
+            if salarios_neto:
+                por_cuenta[cuenta_id]=round(por_cuenta.get(cuenta_id,0)+salarios_neto,2)
+            if comisiones:
+                por_cuenta[cuenta_comisiones['id']]=round(por_cuenta.get(cuenta_comisiones['id'],0)+comisiones,2)
+            if bonos:
+                por_cuenta[cuenta_bonos['id']]=round(por_cuenta.get(cuenta_bonos['id'],0)+bonos,2)
         total=round(sum(por_cuenta.values()),2)
         if total<=0: return jsonify(error='El neto a pagar debe ser mayor que cero.'),400
         descripcion=f"Pago de planilla quincenal {planilla['periodo_inicio']} al {planilla['periodo_fin']}"
@@ -3013,8 +3059,7 @@ def actualizar_empleado_planilla(employee_id):
             return jsonify(error='Empleado de planilla no encontrado.'),404
         if not c.execute('SELECT 1 FROM departamentos WHERE id=? AND activo=1',(data['departamento_id'],)).fetchone():
             return jsonify(error='El departamento seleccionado no está activo.'),400
-        if not c.execute('SELECT 1 FROM cuentas_contables WHERE id=? AND activo=1',(data['cuenta_contable_id'],)).fetchone():
-            return jsonify(error='La cuenta contable seleccionada no está activa.'),400
+        data['cuenta_contable_id']=cuenta_salarios_departamento(c,data['departamento_id'])
         c.execute('''UPDATE empleados_planilla SET nombre=:nombre,numero_identidad=:numero_identidad,fecha_ingreso=:fecha_ingreso,salario=:salario,
             comisiones=:comisiones,bonos=:bonos,ihss=:ihss,rap=:rap,otras_deducciones=:otras_deducciones,
             departamento_id=:departamento_id,cuenta_contable_id=:cuenta_contable_id,actualizado_en=CURRENT_TIMESTAMP WHERE id=:id''',

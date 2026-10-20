@@ -1472,7 +1472,7 @@ const renderPayrollEmployeesWithHireDate=renderPayrollEmployees;
 renderPayrollEmployees=function(){
   let body=$('payrollEmployeeBody');if(!body)return;
   let table=body.closest('table'),header=table?.querySelector('thead th:first-child');if(header)header.textContent='Empleado / Identidad / Ingreso';
-  body.innerHTML=payrollEmployees.map(employee=>{let values=payrollValues(employee);return `<tr><td><b>${esc(employee.nombre)}</b><br><span class="sub">${esc(employee.numero_identidad)} · Ingreso: ${payrollDate(employee.fecha_ingreso)}</span></td><td>${esc(employee.departamento_codigo||'')} · ${esc(employee.departamento_nombre||'')}</td><td>${esc(employee.cuenta_codigo||'')} · ${esc(employee.cuenta_nombre||'')}</td><td>${money(employee.salario)}</td><td>${money(employee.comisiones)}</td><td><b>${money(values.net)}</b></td><td><span class="pill">${Number(employee.activo)?'Activo':'Inactivo'}</span></td><td>${Number(employee.activo)?`<button class="btn2" type="button" onclick="editPayrollEmployee(${Number(employee.id)})">Editar</button> <button class="danger" type="button" onclick="deactivatePayrollEmployee(${Number(employee.id)})">Dar de baja</button>`:`<button class="btn2" type="button" onclick="reactivatePayrollEmployee(${Number(employee.id)})">Reactivar</button>`}</td></tr>`}).join('')||'<tr><td colspan="8" class="sub">Aún no hay empleados registrados en planillas.</td></tr>';
+  body.innerHTML=payrollEmployees.map(employee=>{let values=payrollValues(employee);return `<tr><td><b>${esc(employee.nombre)}</b><br><span class="sub">${esc(employee.numero_identidad)} · Ingreso: ${payrollDate(employee.fecha_ingreso)}</span></td><td>${esc(employee.departamento_codigo||'')} · ${esc(employee.departamento_nombre||'')}<br><span class="sub">${esc(employee.grupo_resultado||'')}</span></td><td>${esc(employee.cuenta_codigo||'')} · ${esc(employee.cuenta_nombre||'')}</td><td>${money(employee.salario)}</td><td>${money(employee.comisiones)}</td><td><b>${money(values.net)}</b></td><td><span class="pill">${Number(employee.activo)?'Activo':'Inactivo'}</span></td><td>${Number(employee.activo)?`<button class="btn2" type="button" onclick="editPayrollEmployee(${Number(employee.id)})">Editar</button> <button class="danger" type="button" onclick="deactivatePayrollEmployee(${Number(employee.id)})">Dar de baja</button>`:`<button class="btn2" type="button" onclick="reactivatePayrollEmployee(${Number(employee.id)})">Reactivar</button>`}</td></tr>`}).join('')||'<tr><td colspan="8" class="sub">Aún no hay empleados registrados en planillas.</td></tr>';
 };
 let commissionAmountField=$('payrollCommissionForm')?.querySelector('[name="monto"]')?.closest('.field');
 if(commissionAmountField&&!$('payrollBonusField'))commissionAmountField.insertAdjacentHTML('afterend','<div id="payrollBonusField" class="field"><label>Bono</label><input name="bono" type="number" min="0" step="0.01" value="0"></div>');
@@ -1483,4 +1483,47 @@ renderPayrollCommissions=function(){
   body.innerHTML=payrollCommissions.map(row=>`<tr><td>${payrollDate(row.fecha)}</td><td><b>${esc(row.empleado_nombre)}</b><br><span class="sub">${esc(row.numero_identidad)}</span></td><td>${esc(row.descripcion||'—')}</td><td><b>${money(row.monto)}</b></td><td><b>${money(row.bono||0)}</b></td></tr>`).join('')||'<tr><td colspan="5" class="sub">Aún no hay comisiones o bonos registrados.</td></tr>';
 };
 savePayrollCommission=async function(event){event.preventDefault();let form=event.target,data=Object.fromEntries(new FormData(form).entries());data.empleado_id=Number(data.empleado_id);data.monto=Number(data.monto);data.bono=Number(data.bono||0);let response=await fetch('/api/planillas/comisiones',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)}),result=await response.json();if(!response.ok)return showNotice(result.error||'No se pudo registrar la comisión y bono.','error');showNotice('Comisión y bono registrados.');form.elements.monto.value='';form.elements.bono.value=0;form.elements.descripcion.value='';await loadPayroll();payrollShowView('commissions')};
+/* Planillas: el departamento define la agrupación del Estado de Resultado. */
+let payrollDepartmentField=$('payrollForm')?.querySelector('[name="departamento_id"]')?.closest('.field');
+if(payrollDepartmentField&&!$('payrollIncomeGroupField'))payrollDepartmentField.insertAdjacentHTML('afterend','<div id="payrollIncomeGroupField" class="field"><label>Agrupación Estado de Resultado</label><input name="grupo_resultado" readonly placeholder="Seleccione departamento"></div>');
+function actualizarGrupoPlanilla(){
+  let form=$('payrollForm');if(!form)return;
+  let department=payrollDepartments.find(row=>String(row.id)===String(form.elements.departamento_id.value));
+  let group=department?.grupo_resultado||'';
+  if(form.elements.grupo_resultado)form.elements.grupo_resultado.value=group;
+  let code=group==='Gasto Administrativo'?'6201':'6101';
+  let account=payrollAccounts.find(row=>String(row.codigo)===code);
+  if(account)form.elements.cuenta_contable_id.value=String(account.id);
+}
+const payrollOptionsWithIncomeGroup=payrollOptions;
+payrollOptions=function(){
+  payrollOptionsWithIncomeGroup();
+  let form=$('payrollForm'),account=form?.elements.cuenta_contable_id;
+  if(!form||!account)return;
+  account.closest('.field')?.querySelector('label')&&(account.closest('.field').querySelector('label').textContent='Cuenta de sueldos (automática)');
+  account.style.pointerEvents='none';account.tabIndex=-1;account.setAttribute('aria-readonly','true');
+  if(!form.dataset.incomeGroupBound){form.elements.departamento_id.addEventListener('change',actualizarGrupoPlanilla);form.dataset.incomeGroupBound='true'}
+  actualizarGrupoPlanilla();
+};
+const editPayrollEmployeeWithIncomeGroup=editPayrollEmployee;
+editPayrollEmployee=function(id){editPayrollEmployeeWithIncomeGroup(id);actualizarGrupoPlanilla()};
+/* Catálogo contable: alta de cuentas desde la misma pantalla. */
+let catalogToolbar=$('cq')?.closest('.toolbar');
+if(catalogToolbar&&!$('newAccountButton'))catalogToolbar.insertAdjacentHTML('beforeend','<button id="newAccountButton" class="primary" type="button" onclick="openAccountCreate()">+ Nueva cuenta</button>');
+function openAccountCreate(){
+  let form=$('accountEditForm');form.reset();form.elements.id.value='';
+  form.querySelector('.modalhead h2').textContent='Nueva cuenta contable';
+  form.elements.acepta_movimiento.checked=true;form.elements.activo.checked=true;
+  $('accountEditModal').classList.remove('hidden');
+}
+const openAccountEditWithTitle=openAccountEdit;
+openAccountEdit=function(id){openAccountEditWithTitle(id);$('accountEditModal').querySelector('.modalhead h2').textContent='Editar cuenta contable'};
+const saveAccountEditWithCreate=saveAccountEdit;
+saveAccountEdit=async function(event){
+  event.preventDefault();let form=event.target,data={codigo:form.elements.codigo.value.trim(),cuenta:form.elements.cuenta.value.trim(),tipo:form.elements.tipo.value,grupo:form.elements.grupo.value.trim(),naturaleza:form.elements.naturaleza.value,acepta_movimiento:form.elements.acepta_movimiento.checked,requiere_activo:form.elements.requiere_activo.checked,requiere_centro_costo:form.elements.requiere_centro_costo.checked,activo:form.elements.activo.checked},id=form.elements.id.value;
+  if(id)return saveAccountEditWithCreate(event);
+  let response=await fetch('/api/catalogo',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)}),result=await response.json();
+  if(!response.ok)return showNotice(result.error||'No se pudo crear la cuenta.','error');
+  closeAccountEdit();showNotice('Cuenta contable creada.');await Promise.all([loadCat(),loadAccounting(),dash()]);
+};
 </script></body></html>

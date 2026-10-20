@@ -68,6 +68,18 @@ class CriticalFlowsTest(unittest.TestCase):
         self.assertEqual(response.get_json(), {'status': 'ok'})
         self.assertEqual(response.headers['X-Content-Type-Options'], 'nosniff')
 
+    def test_catalog_allows_creating_a_movement_account(self):
+        self.login_as_admin()
+        response = self.client.post('/api/catalogo', json={
+            'codigo': '7999', 'cuenta': 'Cuenta QA creada desde catálogo',
+            'tipo': 'Gasto', 'grupo': 'Gasto de Venta', 'naturaleza': 'Deudora',
+            'acepta_movimiento': True, 'activo': True,
+        })
+        self.assertEqual(response.status_code, 201)
+        account = response.get_json()
+        self.assertEqual(account['codigo'], '7999')
+        self.assertEqual(account['cuenta'], 'Cuenta QA creada desde catálogo')
+
     def test_payroll_generates_biweekly_run_with_registered_commissions(self):
         self.login_as_admin()
         connection = self.server.db()
@@ -120,11 +132,19 @@ class CriticalFlowsTest(unittest.TestCase):
         connection = self.server.db()
         cash = connection.execute("SELECT salida,banco FROM movimientos_caja WHERE referencia_tipo='pago_planilla' AND referencia_id=?", (payroll_id,)).fetchone()
         entries = connection.execute("SELECT debe,haber FROM partidas WHERE referencia_tipo='pago_planilla' AND referencia_id=?", (payroll_id,)).fetchall()
+        payroll_accounts = connection.execute('''SELECT cc.codigo,SUM(p.debe) debe
+            FROM partidas p JOIN cuentas_contables cc ON cc.id=p.cuenta_id
+            WHERE p.referencia_tipo='pago_planilla' AND p.referencia_id=?
+            GROUP BY cc.codigo''', (payroll_id,)).fetchall()
         connection.close()
         self.assertAlmostEqual(cash['salida'], 11150)
         self.assertEqual(cash['banco'], 'BAC Credomatic')
         self.assertAlmostEqual(sum(row['debe'] for row in entries), 11150)
         self.assertAlmostEqual(sum(row['haber'] for row in entries), 11150)
+        debits = {row['codigo']: row['debe'] for row in payroll_accounts}
+        self.assertAlmostEqual(debits['6201'], 9650)
+        self.assertAlmostEqual(debits['6102'], 950)
+        self.assertAlmostEqual(debits['6103'], 550)
         termination = self.client.post(f"/api/planillas/{employee['id']}/baja")
         self.assertEqual(termination.status_code, 200)
         active = self.client.get('/api/planillas?activos=1').get_json()
