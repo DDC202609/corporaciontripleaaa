@@ -1526,4 +1526,16 @@ saveAccountEdit=async function(event){
   if(!response.ok)return showNotice(result.error||'No se pudo crear la cuenta.','error');
   closeAccountEdit();showNotice('Cuenta contable creada.');await Promise.all([loadCat(),loadAccounting(),dash()]);
 };
+/* Corrección histórica controlada: solo reclasifica gasto, nunca banco ni pago. */
+let payrollCorrectionActions=$('payrollMainView')?.querySelector('.actions');
+if(payrollCorrectionActions&&!$('payrollSeptemberCorrection'))payrollCorrectionActions.insertAdjacentHTML('beforeend','<button id="payrollSeptemberCorrection" class="btn2" type="button" onclick="correctSeptemberPayrollEntries()">Corregir asientos de planilla · septiembre</button>');
+async function correctSeptemberPayrollEntries(){
+  const mes='2026-09';
+  if(!confirm('¿Reclasificar los asientos de planillas pagadas de septiembre? Solo se corrigen las cuentas de gasto; banco, pagos y referencias no se modificarán.'))return;
+  let response=await fetch('/api/planillas/reclasificar-pagos',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mes})}),result=await response.json();
+  if(!response.ok)return showNotice(result.error||'No fue posible reclasificar las planillas.','error');
+  let errors=(result.errores||[]).length;
+  showNotice(`${(result.corregidas||[]).length} planilla(s) reclasificada(s)${errors?`; ${errors} requieren revisión`:''}.`);
+  await Promise.all([loadPayroll(),loadAccounting?.()]);
+}
 </script></body></html>

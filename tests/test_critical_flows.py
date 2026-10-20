@@ -145,6 +145,25 @@ class CriticalFlowsTest(unittest.TestCase):
         self.assertAlmostEqual(debits['6201'], 9650)
         self.assertAlmostEqual(debits['6102'], 950)
         self.assertAlmostEqual(debits['6103'], 550)
+        # Simula la clasificación histórica que llevaba todo el pago a
+        # sueldos y verifica que la corrección no altera banco ni el pago.
+        connection = self.server.db()
+        legacy_salary = connection.execute("SELECT id FROM cuentas_contables WHERE codigo='6101'").fetchone()
+        connection.execute("UPDATE partidas SET cuenta_id=? WHERE referencia_tipo='pago_planilla' AND referencia_id=? AND debe>0", (legacy_salary['id'], payroll_id))
+        connection.commit(); connection.close()
+        reclassified = self.client.post('/api/planillas/reclasificar-pagos', json={'mes': '2026-10'})
+        self.assertEqual(reclassified.status_code, 200)
+        self.assertEqual(len(reclassified.get_json()['corregidas']), 1)
+        connection = self.server.db()
+        corrected = connection.execute('''SELECT cc.codigo,SUM(p.debe)-SUM(p.haber) saldo
+            FROM partidas p JOIN cuentas_contables cc ON cc.id=p.cuenta_id
+            WHERE (p.referencia_tipo='pago_planilla' OR p.referencia_tipo='reclasificacion_planilla')
+              AND p.referencia_id=? GROUP BY cc.codigo''', (payroll_id,)).fetchall()
+        connection.close()
+        corrected_balances = {row['codigo']: row['saldo'] for row in corrected}
+        self.assertAlmostEqual(corrected_balances['6201'], 9650)
+        self.assertAlmostEqual(corrected_balances['6102'], 950)
+        self.assertAlmostEqual(corrected_balances['6103'], 550)
         termination = self.client.post(f"/api/planillas/{employee['id']}/baja")
         self.assertEqual(termination.status_code, 200)
         active = self.client.get('/api/planillas?activos=1').get_json()

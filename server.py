@@ -2975,6 +2975,70 @@ def get_planilla_quincenal(payroll_id):
     finally:
         c.close()
 
+def lineas_reclasificacion_planilla(c, payroll_id):
+    """Devuelve el ajuste que reclasifica el gasto ya pagado, sin tocar banco."""
+    detalles=[dict(row) for row in c.execute('SELECT * FROM planillas_quincenales_detalle WHERE planilla_id=?',(payroll_id,)).fetchall()]
+    if not detalles:
+        raise ValueError('La planilla no tiene detalle para reclasificar.')
+    cuentas={}
+    for codigo,label in (('6102','Comisiones'),('6103','Bonos al Personal')):
+        cuenta=c.execute('SELECT id FROM cuentas_contables WHERE codigo=? AND activo=1 AND acepta_movimiento=1',(codigo,)).fetchone()
+        if not cuenta:
+            raise ValueError(f'No existe la cuenta activa {codigo} ({label}).')
+        cuentas[codigo]=cuenta['id']
+    esperado={}
+    for detalle in detalles:
+        salario=round(float(detalle.get('neto') or 0)-float(detalle.get('comisiones') or 0)-float(detalle.get('bonos') or 0),2)
+        if salario < -0.01:
+            raise ValueError(f"Las deducciones de {detalle['empleado_nombre']} exceden el componente de salario.")
+        for cuenta_id,monto in ((cuenta_salarios_departamento(c,detalle['departamento_id']),salario),
+                                (cuentas['6102'],round(float(detalle.get('comisiones') or 0),2)),
+                                (cuentas['6103'],round(float(detalle.get('bonos') or 0),2))):
+            if monto:
+                esperado[cuenta_id]=round(esperado.get(cuenta_id,0)+monto,2)
+    actual={row['cuenta_id']:round(float(row['debe'] or 0),2) for row in c.execute('''SELECT cuenta_id,SUM(debe) debe
+        FROM partidas WHERE referencia_tipo='pago_planilla' AND referencia_id=? AND debe>0 GROUP BY cuenta_id''',(payroll_id,)).fetchall()}
+    if not actual:
+        raise ValueError('No se encontró el asiento original del pago de esta planilla.')
+    if round(sum(actual.values()),2)!=round(sum(esperado.values()),2):
+        raise ValueError('El asiento original no cuadra con el neto de la planilla; requiere revisión manual.')
+    if actual==esperado:
+        return []
+    # Reversa exclusivamente los débitos de gasto previos y registra los
+    # nuevos. El crédito a banco, referencia y movimiento de caja no cambian.
+    return ([{'cuenta_id':cuenta_id,'haber':monto} for cuenta_id,monto in actual.items() if monto]+
+            [{'cuenta_id':cuenta_id,'debe':monto} for cuenta_id,monto in esperado.items() if monto])
+
+@app.post('/api/planillas/reclasificar-pagos')
+def reclasificar_pagos_planilla():
+    data=request.get_json(silent=True) or {}
+    mes=(data.get('mes') or '').strip()
+    if not re.fullmatch(r'\d{4}-\d{2}',mes):
+        return jsonify(error='Indique el mes a reclasificar en formato AAAA-MM.'),400
+    c=db(); corregidas=[]; sin_cambio=[]; errores=[]
+    try:
+        planillas=c.execute('''SELECT * FROM planillas_quincenales
+            WHERE estado='Pagada' AND substr(periodo_inicio,1,7)=? ORDER BY periodo_inicio,id''',(mes,)).fetchall()
+        for planilla in planillas:
+            if c.execute("SELECT 1 FROM asientos_contables WHERE referencia_tipo='reclasificacion_planilla' AND referencia_id=?",(planilla['id'],)).fetchone():
+                sin_cambio.append({'id':planilla['id'],'motivo':'Ya fue reclasificada.'}); continue
+            try:
+                lineas=lineas_reclasificacion_planilla(c,planilla['id'])
+                if not lineas:
+                    sin_cambio.append({'id':planilla['id'],'motivo':'Ya estaba correctamente clasificada.'}); continue
+                fecha=planilla['fecha_pago'] or planilla['periodo_fin']
+                descripcion=f"Reclasificación de planilla {planilla['periodo_inicio']} al {planilla['periodo_fin']}"
+                registrar_asiento(c,fecha,descripcion,'reclasificacion_planilla',planilla['id'],lineas)
+                corregidas.append({'id':planilla['id'],'periodo_inicio':planilla['periodo_inicio'],'periodo_fin':planilla['periodo_fin']})
+            except ValueError as error:
+                errores.append({'id':planilla['id'],'error':str(error)})
+        c.commit()
+        return jsonify(ok=True,mes=mes,corregidas=corregidas,sin_cambio=sin_cambio,errores=errores)
+    except Exception:
+        c.rollback(); raise
+    finally:
+        c.close()
+
 @app.post('/api/planillas/quincenas/<int:payroll_id>/registrar-pago')
 def registrar_pago_planilla_quincenal(payroll_id):
     data=request.get_json(silent=True) or {}
