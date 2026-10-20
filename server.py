@@ -3989,7 +3989,7 @@ def datos_planificacion_compra(c, semanas=12):
     models=set(parameters)
     for row in c.execute("""SELECT modelo,anio,estado,COALESCE(tipo_compra,'') tipo_compra,COUNT(*) cantidad
         FROM vehiculos
-        WHERE estado IN ('DPV','En Taller','En Tránsito') AND TRIM(COALESCE(modelo,''))<>''
+        WHERE estado IN ('DPV','En Taller','En Tránsito','Consignación') AND TRIM(COALESCE(modelo,''))<>''
         GROUP BY modelo,anio,estado,COALESCE(tipo_compra,'')"""):
         model=_modelo_planificacion(row['modelo']); models.add(model)
         item=inventory.setdefault(model,{'DPV':0,'En Taller':0,'En Tránsito':0,'Consignación':0,'anios':{}})
@@ -3997,9 +3997,13 @@ def datos_planificacion_compra(c, semanas=12):
         quantity=int(row['cantidad'] or 0)
         # La consignación puede tener una etapa operativa (por ejemplo DPV),
         # pero debe verse separada y no cubrir la meta de compra propia.
-        if row['tipo_compra']=='Consignación': item['Consignación']+=quantity
+        is_consignment=(row['tipo_compra'] or '').strip().casefold()=='consignación' or state=='Consignación'
+        if is_consignment: item['Consignación']+=quantity
         elif state in item: item[state]+=quantity
-        if row['anio']:
+        # La distribución por año debe representar el inventario propio que
+        # cubre la meta de compra; una unidad en consignación se muestra en su
+        # columna, pero no se mezcla con DPV/Taller/Tránsito.
+        if row['anio'] and not is_consignment:
             year=str(int(row['anio'])); year_values.add(int(year))
             item['anios'][year]=item['anios'].get(year,0)+quantity
     start_month=(today.replace(day=1)-timedelta(days=335)).isoformat()
@@ -4067,8 +4071,13 @@ def datos_planificacion_compra(c, semanas=12):
             weekly[index]['taller']+=workshop_by_model.get(model,[0]*semanas)[index]
             weekly[index]['demanda']+=weekly_demand
             weekly[index]['faltante_dpv']+=shortage
+        # No ocultar unidades reales por no pertenecer a un año objetivo. La
+        # tabla incluye la unión de años configurados y años actualmente en
+        # inventario para que sus "Inv. actual" cuadren con DPV/Taller/Tránsito.
         distribution=[]
-        for year,value in sorted(param['distribucion'].items(),key=lambda pair:int(pair[0])):
+        distribution_years=set(param['distribucion'])|set(current['anios'])
+        for year in sorted(distribution_years,key=int):
+            value=param['distribucion'].get(year,0)
             actual=current['anios'].get(year,0)
             distribution.append({'anio':int(year),'ideal':value,'actual':actual,'sugerido':max(0,value-actual)})
         # El sugerido se compra por unidades completas: medio vehículo o más

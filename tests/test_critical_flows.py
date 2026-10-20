@@ -644,12 +644,12 @@ class CriticalFlowsTest(unittest.TestCase):
         data=self.client.get('/api/planificacion-compra').get_json()
         row=next(item for item in data['modelos'] if item['modelo']==model)
         self.assertEqual(row['inventario_actual'],{
-            'DPV':1,'En Taller':1,'En Tránsito':0,'Consignación':1,'anios':{'2020':3}
+            'DPV':1,'En Taller':1,'En Tránsito':0,'Consignación':1,'anios':{'2020':2}
         })
         self.assertEqual(row['existencia_total'],3)
         self.assertEqual(row['existencia_para_compra'],2)
         self.assertEqual(row['faltante_compra'],1)
-        self.assertEqual(row['distribucion'],[{'anio':2020,'ideal':3,'actual':3,'sugerido':0}])
+        self.assertEqual(row['distribucion'],[{'anio':2020,'ideal':3,'actual':2,'sugerido':1}])
 
     def test_purchase_planning_loads_supplied_optimal_inventory_matrix(self):
         self.login_as_admin()
