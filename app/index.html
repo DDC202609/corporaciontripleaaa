@@ -1461,4 +1461,26 @@ renderFinancialPlanning=function(){
 };
 const goWithContracts=go;
 go=function(id,button){goWithContracts(id,button);if(id==='contracts')void loadContracts()};
+/* Planillas: fecha de ingreso y bono variable por registro de comisiones. */
+let payrollIdentityField=$('payrollForm')?.querySelector('[name="numero_identidad"]')?.closest('.field');
+if(payrollIdentityField&&!$('payrollHireDateField'))payrollIdentityField.insertAdjacentHTML('afterend','<div id="payrollHireDateField" class="field"><label>Fecha de ingreso *</label><input name="fecha_ingreso" type="date" required></div>');
+const resetPayrollFormWithHireDate=resetPayrollForm;
+resetPayrollForm=function(){resetPayrollFormWithHireDate();let form=$('payrollForm');if(form)form.elements.fecha_ingreso.value=payrollToday()};
+const editPayrollEmployeeWithHireDate=editPayrollEmployee;
+editPayrollEmployee=function(id){editPayrollEmployeeWithHireDate(id);let employee=payrollEmployees.find(row=>Number(row.id)===Number(id));let form=$('payrollForm');if(employee&&form)form.elements.fecha_ingreso.value=employee.fecha_ingreso||''};
+const renderPayrollEmployeesWithHireDate=renderPayrollEmployees;
+renderPayrollEmployees=function(){
+  let body=$('payrollEmployeeBody');if(!body)return;
+  let table=body.closest('table'),header=table?.querySelector('thead th:first-child');if(header)header.textContent='Empleado / Identidad / Ingreso';
+  body.innerHTML=payrollEmployees.map(employee=>{let values=payrollValues(employee);return `<tr><td><b>${esc(employee.nombre)}</b><br><span class="sub">${esc(employee.numero_identidad)} · Ingreso: ${payrollDate(employee.fecha_ingreso)}</span></td><td>${esc(employee.departamento_codigo||'')} · ${esc(employee.departamento_nombre||'')}</td><td>${esc(employee.cuenta_codigo||'')} · ${esc(employee.cuenta_nombre||'')}</td><td>${money(employee.salario)}</td><td>${money(employee.comisiones)}</td><td><b>${money(values.net)}</b></td><td><span class="pill">${Number(employee.activo)?'Activo':'Inactivo'}</span></td><td>${Number(employee.activo)?`<button class="btn2" type="button" onclick="editPayrollEmployee(${Number(employee.id)})">Editar</button> <button class="danger" type="button" onclick="deactivatePayrollEmployee(${Number(employee.id)})">Dar de baja</button>`:`<button class="btn2" type="button" onclick="reactivatePayrollEmployee(${Number(employee.id)})">Reactivar</button>`}</td></tr>`}).join('')||'<tr><td colspan="8" class="sub">Aún no hay empleados registrados en planillas.</td></tr>';
+};
+let commissionAmountField=$('payrollCommissionForm')?.querySelector('[name="monto"]')?.closest('.field');
+if(commissionAmountField&&!$('payrollBonusField'))commissionAmountField.insertAdjacentHTML('afterend','<div id="payrollBonusField" class="field"><label>Bono</label><input name="bono" type="number" min="0" step="0.01" value="0"></div>');
+renderPayrollCommissions=function(){
+  let form=$('payrollCommissionForm'),body=$('payrollCommissionBody');if(!form||!body)return;
+  let previous=form.elements.empleado_id.value;form.elements.empleado_id.innerHTML=payrollEmployeeSelect(previous);if(!form.elements.fecha.value)form.elements.fecha.value=payrollToday();
+  let table=body.closest('table'),header=table?.querySelector('thead tr');if(header&&!header.querySelector('[data-payroll-bonus]'))header.querySelectorAll('th')[3]?.insertAdjacentHTML('afterend','<th data-payroll-bonus>Bono</th>');
+  body.innerHTML=payrollCommissions.map(row=>`<tr><td>${payrollDate(row.fecha)}</td><td><b>${esc(row.empleado_nombre)}</b><br><span class="sub">${esc(row.numero_identidad)}</span></td><td>${esc(row.descripcion||'—')}</td><td><b>${money(row.monto)}</b></td><td><b>${money(row.bono||0)}</b></td></tr>`).join('')||'<tr><td colspan="5" class="sub">Aún no hay comisiones o bonos registrados.</td></tr>';
+};
+savePayrollCommission=async function(event){event.preventDefault();let form=event.target,data=Object.fromEntries(new FormData(form).entries());data.empleado_id=Number(data.empleado_id);data.monto=Number(data.monto);data.bono=Number(data.bono||0);let response=await fetch('/api/planillas/comisiones',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)}),result=await response.json();if(!response.ok)return showNotice(result.error||'No se pudo registrar la comisión y bono.','error');showNotice('Comisión y bono registrados.');form.elements.monto.value='';form.elements.bono.value=0;form.elements.descripcion.value='';await loadPayroll();payrollShowView('commissions')};
 </script></body></html>

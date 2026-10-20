@@ -78,6 +78,7 @@ class CriticalFlowsTest(unittest.TestCase):
         self.assertIsNotNone(account)
         employee_response = self.client.post('/api/planillas', json={
             'nombre': 'Empleado Planilla QA', 'numero_identidad': 'QA-PLANILLA-001',
+            'fecha_ingreso': '2026-01-15',
             'salario': 20000, 'comisiones': 1200, 'bonos': 600,
             'ihss': 400, 'rap': 200, 'otras_deducciones': 100,
             'departamento_id': department['id'], 'cuenta_contable_id': account['id'],
@@ -86,7 +87,7 @@ class CriticalFlowsTest(unittest.TestCase):
         employee = employee_response.get_json()
         commission_response = self.client.post('/api/planillas/comisiones', json={
             'empleado_id': employee['id'], 'fecha': '2026-10-10',
-            'monto': 350, 'descripcion': 'Comisión QA',
+            'monto': 350, 'bono': 250, 'descripcion': 'Comisión y bono QA',
         })
         self.assertEqual(commission_response.status_code, 201)
         preview = self.client.get('/api/planillas/quincenas/preview?fecha=2026-10-10')
@@ -97,7 +98,9 @@ class CriticalFlowsTest(unittest.TestCase):
         self.assertAlmostEqual(detail['salario'], 10000)
         self.assertAlmostEqual(detail['comisiones_fijas'], 600)
         self.assertAlmostEqual(detail['comisiones_registradas'], 350)
-        self.assertAlmostEqual(detail['neto'], 10900)
+        self.assertAlmostEqual(detail['bonos_registrados'], 250)
+        self.assertAlmostEqual(detail['bonos'], 550)
+        self.assertAlmostEqual(detail['neto'], 11150)
         generated = self.client.post('/api/planillas/quincenas', json={'fecha_referencia': '2026-10-10'})
         self.assertEqual(generated.status_code, 201)
         payroll_id = generated.get_json()['id']
@@ -113,15 +116,15 @@ class CriticalFlowsTest(unittest.TestCase):
             'fecha_pago': '2026-10-16', 'banco': 'BAC Credomatic', 'referencia': 'QA-PLANILLA-PAGO',
         })
         self.assertEqual(paid.status_code, 200)
-        self.assertAlmostEqual(paid.get_json()['total'], 10900)
+        self.assertAlmostEqual(paid.get_json()['total'], 11150)
         connection = self.server.db()
         cash = connection.execute("SELECT salida,banco FROM movimientos_caja WHERE referencia_tipo='pago_planilla' AND referencia_id=?", (payroll_id,)).fetchone()
         entries = connection.execute("SELECT debe,haber FROM partidas WHERE referencia_tipo='pago_planilla' AND referencia_id=?", (payroll_id,)).fetchall()
         connection.close()
-        self.assertAlmostEqual(cash['salida'], 10900)
+        self.assertAlmostEqual(cash['salida'], 11150)
         self.assertEqual(cash['banco'], 'BAC Credomatic')
-        self.assertAlmostEqual(sum(row['debe'] for row in entries), 10900)
-        self.assertAlmostEqual(sum(row['haber'] for row in entries), 10900)
+        self.assertAlmostEqual(sum(row['debe'] for row in entries), 11150)
+        self.assertAlmostEqual(sum(row['haber'] for row in entries), 11150)
         termination = self.client.post(f"/api/planillas/{employee['id']}/baja")
         self.assertEqual(termination.status_code, 200)
         active = self.client.get('/api/planillas?activos=1').get_json()

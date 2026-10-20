@@ -739,6 +739,7 @@ def init_db(sync_history=True):
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         nombre TEXT NOT NULL,
         numero_identidad TEXT NOT NULL UNIQUE COLLATE NOCASE,
+        fecha_ingreso TEXT,
         salario REAL NOT NULL DEFAULT 0,
         comisiones REAL NOT NULL DEFAULT 0,
         bonos REAL NOT NULL DEFAULT 0,
@@ -754,6 +755,8 @@ def init_db(sync_history=True):
     payroll_columns={row['name'] for row in c.execute('PRAGMA table_info(empleados_planilla)')}
     if 'activo' not in payroll_columns:
         c.execute('ALTER TABLE empleados_planilla ADD COLUMN activo INTEGER NOT NULL DEFAULT 1')
+    if 'fecha_ingreso' not in payroll_columns:
+        c.execute('ALTER TABLE empleados_planilla ADD COLUMN fecha_ingreso TEXT')
     c.execute('CREATE INDEX IF NOT EXISTS ix_empleados_planilla_departamento ON empleados_planilla(departamento_id)')
     c.execute('CREATE INDEX IF NOT EXISTS ix_empleados_planilla_cuenta ON empleados_planilla(cuenta_contable_id)')
     # Comisiones variables y planillas generadas.  Se mantienen fuera del
@@ -763,9 +766,13 @@ def init_db(sync_history=True):
         empleado_id INTEGER NOT NULL REFERENCES empleados_planilla(id),
         fecha TEXT NOT NULL,
         monto REAL NOT NULL CHECK(monto>0),
+        bono REAL NOT NULL DEFAULT 0 CHECK(bono>=0),
         descripcion TEXT,
         creado_en TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     )''')
+    payroll_commission_columns={row['name'] for row in c.execute('PRAGMA table_info(comisiones_planilla)')}
+    if 'bono' not in payroll_commission_columns:
+        c.execute('ALTER TABLE comisiones_planilla ADD COLUMN bono REAL NOT NULL DEFAULT 0')
     c.execute('CREATE INDEX IF NOT EXISTS ix_comisiones_planilla_empleado_fecha ON comisiones_planilla(empleado_id,fecha)')
     c.execute('''CREATE TABLE IF NOT EXISTS planillas_quincenales(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2633,8 +2640,9 @@ def datos_empleado_planilla(data):
     """Valida el maestro de planillas sin crear movimientos contables."""
     nombre=(data.get('nombre') or '').strip()
     identidad=(data.get('numero_identidad') or '').strip()
-    if not nombre or not identidad:
-        return None, 'Nombre del empleado y número de identidad son obligatorios.'
+    fecha_ingreso=fecha_planilla(data.get('fecha_ingreso'))
+    if not nombre or not identidad or not fecha_ingreso:
+        return None, 'Nombre, número de identidad y fecha de ingreso son obligatorios.'
     try:
         values={key:round(float(data.get(key) or 0),2) for key in
                 ('salario','comisiones','bonos','ihss','rap','otras_deducciones')}
@@ -2646,7 +2654,7 @@ def datos_empleado_planilla(data):
         return None, 'Los importes de planilla no pueden ser negativos.'
     if not departamento_id or not cuenta_contable_id:
         return None, 'Seleccione un departamento y una cuenta contable.'
-    values.update(nombre=nombre,numero_identidad=identidad,departamento_id=departamento_id,cuenta_contable_id=cuenta_contable_id)
+    values.update(nombre=nombre,numero_identidad=identidad,fecha_ingreso=fecha_ingreso.isoformat(),departamento_id=departamento_id,cuenta_contable_id=cuenta_contable_id)
     return values, None
 
 def datos_contrato(data):
@@ -2781,15 +2789,16 @@ def calcular_planilla_quincenal(c, fecha_referencia):
         JOIN departamentos d ON d.id=ep.departamento_id
         JOIN cuentas_contables cc ON cc.id=ep.cuenta_contable_id
         WHERE ep.activo=1 ORDER BY ep.nombre COLLATE NOCASE,ep.id''').fetchall()]
-    comisiones={row['empleado_id']:float(row['monto'] or 0) for row in c.execute('''SELECT empleado_id,SUM(monto) monto
+    variables={row['empleado_id']:{'comisiones':float(row['monto'] or 0),'bonos':float(row['bono'] or 0)} for row in c.execute('''SELECT empleado_id,SUM(monto) monto,SUM(bono) bono
         FROM comisiones_planilla WHERE fecha BETWEEN ? AND ? GROUP BY empleado_id''',(inicio,fin)).fetchall()}
     detalles=[]
     for empleado in empleados:
         salario=round(float(empleado['salario'] or 0)/2,2)
         comisiones_fijas=round(float(empleado['comisiones'] or 0)/2,2)
-        comisiones_registradas=round(comisiones.get(empleado['id'],0),2)
+        comisiones_registradas=round(variables.get(empleado['id'],{}).get('comisiones',0),2)
         total_comisiones=round(comisiones_fijas+comisiones_registradas,2)
-        bonos=round(float(empleado['bonos'] or 0)/2,2)
+        bonos_registrados=round(variables.get(empleado['id'],{}).get('bonos',0),2)
+        bonos=round(float(empleado['bonos'] or 0)/2+bonos_registrados,2)
         ihss=round(float(empleado['ihss'] or 0)/2,2)
         rap=round(float(empleado['rap'] or 0)/2,2)
         otras=round(float(empleado['otras_deducciones'] or 0)/2,2)
@@ -2800,7 +2809,7 @@ def calcular_planilla_quincenal(c, fecha_referencia):
             'departamento_id':empleado['departamento_id'],'cuenta_contable_id':empleado['cuenta_contable_id'],
             'departamento_nombre':empleado['departamento_nombre'],'cuenta_contable_nombre':f"{empleado['cuenta_codigo']} · {empleado['cuenta_nombre']}",
             'salario':salario,'comisiones_fijas':comisiones_fijas,'comisiones_registradas':comisiones_registradas,
-            'comisiones':total_comisiones,'bonos':bonos,'ihss':ihss,'rap':rap,'otras_deducciones':otras,
+            'comisiones':total_comisiones,'bonos_registrados':bonos_registrados,'bonos':bonos,'ihss':ihss,'rap':rap,'otras_deducciones':otras,
             'total_devengado':devengado,'total_deducciones':deducciones,'neto':round(devengado-deducciones,2)
         })
     totales={key:round(sum(detalle[key] for detalle in detalles),2) for key in
@@ -2830,8 +2839,8 @@ def crear_empleado_planilla():
             return jsonify(error='El departamento seleccionado no está activo.'),400
         if not c.execute('SELECT 1 FROM cuentas_contables WHERE id=? AND activo=1',(data['cuenta_contable_id'],)).fetchone():
             return jsonify(error='La cuenta contable seleccionada no está activa.'),400
-        cur=c.execute('''INSERT INTO empleados_planilla(nombre,numero_identidad,salario,comisiones,bonos,ihss,rap,otras_deducciones,departamento_id,cuenta_contable_id)
-            VALUES(:nombre,:numero_identidad,:salario,:comisiones,:bonos,:ihss,:rap,:otras_deducciones,:departamento_id,:cuenta_contable_id)''',data)
+        cur=c.execute('''INSERT INTO empleados_planilla(nombre,numero_identidad,fecha_ingreso,salario,comisiones,bonos,ihss,rap,otras_deducciones,departamento_id,cuenta_contable_id)
+            VALUES(:nombre,:numero_identidad,:fecha_ingreso,:salario,:comisiones,:bonos,:ihss,:rap,:otras_deducciones,:departamento_id,:cuenta_contable_id)''',data)
         c.commit(); employee=empleado_planilla_detalle(c,cur.lastrowid)
     except sqlite3.IntegrityError:
         c.rollback(); return jsonify(error='Ya existe un empleado de planilla con ese número de identidad.'),409
@@ -2876,18 +2885,18 @@ def get_comisiones_planilla():
 def crear_comision_planilla():
     data=request.get_json(silent=True) or {}
     try:
-        empleado_id=int(data.get('empleado_id') or 0); monto=round(float(data.get('monto') or 0),2)
+        empleado_id=int(data.get('empleado_id') or 0); monto=round(float(data.get('monto') or 0),2); bono=round(float(data.get('bono') or 0),2)
     except (TypeError,ValueError):
-        return jsonify(error='El empleado y el monto de la comisión son obligatorios.'),400
+        return jsonify(error='El empleado, la comisión y el bono deben ser valores válidos.'),400
     fecha=fecha_planilla(data.get('fecha'))
-    if not empleado_id or not fecha or monto<=0:
-        return jsonify(error='Indique un empleado activo, una fecha válida y un monto mayor que cero.'),400
+    if not empleado_id or not fecha or monto<=0 or bono<0:
+        return jsonify(error='Indique un empleado activo, una fecha válida, una comisión mayor que cero y un bono no negativo.'),400
     c=db()
     try:
         if not c.execute('SELECT 1 FROM empleados_planilla WHERE id=? AND activo=1',(empleado_id,)).fetchone():
             return jsonify(error='El empleado seleccionado no está activo.'),400
-        cur=c.execute('INSERT INTO comisiones_planilla(empleado_id,fecha,monto,descripcion) VALUES(?,?,?,?)',
-            (empleado_id,fecha.isoformat(),monto,(data.get('descripcion') or '').strip() or None))
+        cur=c.execute('INSERT INTO comisiones_planilla(empleado_id,fecha,monto,bono,descripcion) VALUES(?,?,?,?,?)',
+            (empleado_id,fecha.isoformat(),monto,bono,(data.get('descripcion') or '').strip() or None))
         c.commit()
         row=c.execute('''SELECT cp.*,ep.nombre empleado_nombre,ep.numero_identidad FROM comisiones_planilla cp
             JOIN empleados_planilla ep ON ep.id=cp.empleado_id WHERE cp.id=?''',(cur.lastrowid,)).fetchone()
@@ -3006,7 +3015,7 @@ def actualizar_empleado_planilla(employee_id):
             return jsonify(error='El departamento seleccionado no está activo.'),400
         if not c.execute('SELECT 1 FROM cuentas_contables WHERE id=? AND activo=1',(data['cuenta_contable_id'],)).fetchone():
             return jsonify(error='La cuenta contable seleccionada no está activa.'),400
-        c.execute('''UPDATE empleados_planilla SET nombre=:nombre,numero_identidad=:numero_identidad,salario=:salario,
+        c.execute('''UPDATE empleados_planilla SET nombre=:nombre,numero_identidad=:numero_identidad,fecha_ingreso=:fecha_ingreso,salario=:salario,
             comisiones=:comisiones,bonos=:bonos,ihss=:ihss,rap=:rap,otras_deducciones=:otras_deducciones,
             departamento_id=:departamento_id,cuenta_contable_id=:cuenta_contable_id,actualizado_en=CURRENT_TIMESTAMP WHERE id=:id''',
             dict(data,id=employee_id))
