@@ -40,7 +40,7 @@ ACCESS_MODULES=(
     ('proveedores','Proveedores'),('adquisiciones','Adquisiciones'),('taller','Taller'),('costeo','Costeo'),
     ('ventas','Ventas y cobros'),('vendedores','Vendedores'),('inventario','Consulta de inventario'),('conteo_inventario','Conteo físico de inventario'),
     ('catalogo','Catálogo contable'),('centros_costo','Centros de costo'),('cartera','Cuentas por cobrar y pagar'),('contabilidad','Contabilidad'),
-    ('caja_bancos','Caja y bancos'),('gastos','Registro de gastos'),('comisiones','Comisiones'),('planillas','Planillas'),
+    ('caja_bancos','Caja y bancos'),('gastos','Registro de gastos'),('comisiones','Comisiones'),('planillas','Planillas'),('contratos','Contratos'),
     ('planificacion_financiera','Planificación financiera'),('planificacion_compra','Planificación de compra'),('auditoria','Bitácora de auditoría'),
 )
 
@@ -145,6 +145,7 @@ def request_module(path):
     if path.startswith('/api/gastos') or path.startswith('/api/conceptos-gasto'): return 'gastos'
     if path.startswith('/api/comisiones'): return 'comisiones'
     if path.startswith('/api/planillas'): return 'planillas'
+    if path.startswith('/api/contratos'): return 'contratos'
     # Consultar el catálogo activo es parte del registro de una venta.  La
     # administración (crear, editar o desactivar) sigue protegida por el
     # permiso específico de Vendedores.
@@ -203,6 +204,7 @@ AUDIT_PREFIXES=(
     ('/api/areas', 'Centro de costo', None), ('/api/departamentos', 'Centro de costo', None),
     ('/api/comisiones', 'Comisión', None),
     ('/api/planillas', 'Empleado de planilla', 'empleados_planilla'),
+    ('/api/contratos', 'Contrato', 'contratos'),
 )
 
 def redact_auditoria(value):
@@ -323,6 +325,17 @@ def require_authenticated_user():
     if request.path.startswith('/api/'):
         return jsonify(error='Sesión requerida.'),401
     return redirect(url_for('login'))
+
+@app.before_request
+def actualizar_obligaciones_de_contratos():
+    """En cada ingreso autenticado revisa la ventana de diez días de contratos."""
+    if not session.get('user_id') or request.path.startswith('/static/'):
+        return None
+    try:
+        c=db(); generar_cxp_contratos_programadas(c); c.commit(); c.close()
+    except (sqlite3.Error, ValueError):
+        try: c.close()
+        except Exception: pass
 
 @app.get('/healthz')
 def healthcheck():
@@ -804,6 +817,40 @@ def init_db(sync_history=True):
         if name not in payroll_detail_columns:
             c.execute(f'ALTER TABLE planillas_quincenales_detalle ADD COLUMN {name} {definition}')
     c.execute('CREATE INDEX IF NOT EXISTS ix_planillas_quincenales_detalle_planilla ON planillas_quincenales_detalle(planilla_id)')
+    c.execute('''CREATE TABLE IF NOT EXISTS contratos(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        numero_contrato TEXT NOT NULL UNIQUE COLLATE NOCASE,
+        proveedor_id INTEGER NOT NULL REFERENCES proveedores(id),
+        fecha_inicio TEXT NOT NULL,
+        fecha_fin TEXT NOT NULL,
+        monto_mensual REAL NOT NULL CHECK(monto_mensual>0),
+        dia_pago INTEGER NOT NULL CHECK(dia_pago BETWEEN 1 AND 31),
+        cuenta_contable_id INTEGER NOT NULL REFERENCES cuentas_contables(id),
+        activo INTEGER NOT NULL DEFAULT 1,
+        creado_en TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        actualizado_en TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS contratos_depositos_garantia(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        contrato_id INTEGER NOT NULL REFERENCES contratos(id) ON DELETE CASCADE,
+        fecha TEXT NOT NULL,monto REAL NOT NULL CHECK(monto>0),
+        descripcion TEXT,creado_en TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS cuentas_por_pagar_contratos(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        contrato_id INTEGER NOT NULL REFERENCES contratos(id) ON DELETE CASCADE,
+        periodo TEXT NOT NULL,fecha TEXT NOT NULL,monto_original REAL NOT NULL,
+        saldo REAL NOT NULL,estado TEXT NOT NULL DEFAULT 'Pendiente',creado_en TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(contrato_id,periodo)
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS pagos_cuentas_por_pagar_contratos(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        cuenta_por_pagar_contrato_id INTEGER NOT NULL REFERENCES cuentas_por_pagar_contratos(id) ON DELETE CASCADE,
+        fecha TEXT NOT NULL,tipo_pago TEXT NOT NULL,banco TEXT,referencia TEXT,monto REAL NOT NULL,
+        creado_en TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )''')
+    c.execute('CREATE INDEX IF NOT EXISTS ix_contratos_vigencia ON contratos(activo,fecha_inicio,fecha_fin)')
+    c.execute('CREATE INDEX IF NOT EXISTS ix_cxp_contratos_estado ON cuentas_por_pagar_contratos(estado,fecha)')
     c.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_pagos_cxp_referencia ON pagos_cuentas_por_pagar(referencia) WHERE referencia IS NOT NULL AND referencia<>''")
     c.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_cobros_cxc_referencia ON cobros_cuentas_por_cobrar(referencia) WHERE referencia IS NOT NULL AND referencia<>''")
     c.execute('''CREATE TABLE IF NOT EXISTS conteos_inventario(
@@ -2427,6 +2474,26 @@ def registrar_pago_cxp(cid):
     registrar_asiento(c,fecha,descripcion,'pago_cxp',cur.lastrowid,lineas)
     c.commit(); c.close(); return jsonify(ok=True,saldo=max(saldo,0),estado=estado),201
 
+@app.post('/api/cuentas-por-pagar-contratos/<int:cid>/pagos')
+def registrar_pago_cxp_contrato(cid):
+    data=request.get_json(silent=True) or {}; c=db(); account=c.execute('''SELECT cp.*,co.numero_contrato,p.nombre proveedor_nombre
+        FROM cuentas_por_pagar_contratos cp JOIN contratos co ON co.id=cp.contrato_id JOIN proveedores p ON p.id=co.proveedor_id WHERE cp.id=?''',(cid,)).fetchone()
+    if not account: c.close(); return jsonify(error='Cuenta por pagar de contrato no encontrada'),404
+    values,error=validar_pago_cartera(data,account['saldo'])
+    if error: c.close(); return jsonify(error=error),400
+    monto,tipo,banco,referencia=values; fecha=data.get('fecha') or ahora_operacion().date().isoformat(); saldo=round(float(account['saldo'])-monto,2); estado='Pagada' if saldo<=0.01 else 'Pendiente'
+    if not referencia_pago_disponible(c,referencia): c.close(); return jsonify(error='El número de referencia ya fue utilizado'),409
+    try:
+        cur=c.execute('''INSERT INTO pagos_cuentas_por_pagar_contratos(cuenta_por_pagar_contrato_id,fecha,tipo_pago,banco,referencia,monto) VALUES(?,?,?,?,?,?)''',(cid,fecha,tipo,banco,referencia,monto))
+        c.execute('UPDATE cuentas_por_pagar_contratos SET saldo=?,estado=? WHERE id=?',(max(saldo,0),estado,cid))
+        descripcion=f"Pago de contrato {account['numero_contrato']} · {account['proveedor_nombre']}"
+        medio,banco_caja=medio_caja(tipo,banco); registrar_movimiento_caja(c,fecha,'Pago de contrato',medio,banco_caja,0,monto,descripcion,'pago_cxp_contrato',cur.lastrowid)
+        registrar_asiento(c,fecha,descripcion,'pago_cxp_contrato',cur.lastrowid,[{'cuenta_id':cuenta_contable_id(c,'cxp'),'debe':monto},{'cuenta_id':cuenta_contable_id(c,'caja_bancos'),'haber':monto}])
+        c.commit(); return jsonify(ok=True,saldo=max(saldo,0),estado=estado),201
+    except sqlite3.IntegrityError:
+        c.rollback(); return jsonify(error='El número de referencia ya fue utilizado'),409
+    finally:c.close()
+
 @app.post('/api/cuentas-por-pagar-taller/<int:cid>/pagos')
 def registrar_pago_cxp_taller(cid):
     data=request.get_json(silent=True) or {}; c=db(); account=c.execute('''SELECT cp.*,p.nombre proveedor_nombre,o.numero_ot,o.vehiculo_id
@@ -2568,6 +2635,94 @@ def datos_empleado_planilla(data):
         return None, 'Seleccione un departamento y una cuenta contable.'
     values.update(nombre=nombre,numero_identidad=identidad,departamento_id=departamento_id,cuenta_contable_id=cuenta_contable_id)
     return values, None
+
+def datos_contrato(data):
+    numero=(data.get('numero_contrato') or '').strip(); fecha_inicio=fecha_planilla(data.get('fecha_inicio')); fecha_fin=fecha_planilla(data.get('fecha_fin'))
+    try:
+        proveedor_id=int(data.get('proveedor_id') or 0); cuenta_id=int(data.get('cuenta_contable_id') or 0)
+        monto=round(float(data.get('monto_mensual') or 0),2); dia=int(data.get('dia_pago') or 0)
+    except (TypeError,ValueError):
+        return None,'Proveedor, cuenta, monto mensual y fecha de pago son obligatorios.'
+    if not numero or not fecha_inicio or not fecha_fin or fecha_fin<fecha_inicio or not proveedor_id or not cuenta_id or monto<=0 or not 1<=dia<=31:
+        return None,'Revise el número, la vigencia, el monto, el día de pago, el proveedor y la cuenta contable.'
+    return {'numero_contrato':numero,'proveedor_id':proveedor_id,'fecha_inicio':fecha_inicio.isoformat(),'fecha_fin':fecha_fin.isoformat(),
+            'monto_mensual':monto,'dia_pago':dia,'cuenta_contable_id':cuenta_id},None
+
+def fecha_vencimiento_contrato(year,month,day):
+    return datetime(year,month,min(day,calendar.monthrange(year,month)[1])).date()
+
+def generar_cxp_contratos_programadas(c, fecha=None):
+    """Genera una obligación mensual cuando faltan 10 días o menos para su pago."""
+    hoy=fecha or ahora_operacion().date()
+    contratos=c.execute('SELECT * FROM contratos WHERE activo=1').fetchall(); creadas=0
+    meses=[(hoy.year,hoy.month)]
+    siguiente=(hoy.replace(day=28)+timedelta(days=4)).replace(day=1)
+    meses.append((siguiente.year,siguiente.month))
+    for contrato in contratos:
+        inicio=fecha_planilla(contrato['fecha_inicio']); fin=fecha_planilla(contrato['fecha_fin'])
+        for year,month in meses:
+            vence=fecha_vencimiento_contrato(year,month,int(contrato['dia_pago']))
+            if not inicio<=vence<=fin or hoy<vence-timedelta(days=10): continue
+            periodo=f'{year:04d}-{month:02d}'
+            if c.execute('SELECT 1 FROM cuentas_por_pagar_contratos WHERE contrato_id=? AND periodo=?',(contrato['id'],periodo)).fetchone(): continue
+            cur=c.execute('''INSERT INTO cuentas_por_pagar_contratos(contrato_id,periodo,fecha,monto_original,saldo,estado)
+                VALUES(?,?,?,?,?,'Pendiente')''',(contrato['id'],periodo,vence.isoformat(),contrato['monto_mensual'],contrato['monto_mensual']))
+            descripcion=f"Contrato {contrato['numero_contrato']} · obligación {periodo}"
+            registrar_asiento(c,hoy.isoformat(),descripcion,'contrato_cxp',cur.lastrowid,[
+                {'cuenta_id':contrato['cuenta_contable_id'],'debe':contrato['monto_mensual']},
+                {'cuenta_id':cuenta_contable_id(c,'cxp'),'haber':contrato['monto_mensual']},
+            ])
+            creadas+=1
+    return creadas
+
+@app.get('/api/contratos')
+def get_contratos():
+    c=db()
+    try:
+        generar_cxp_contratos_programadas(c); c.commit()
+        rows=c.execute('''SELECT co.*,p.nombre proveedor_nombre,cc.codigo cuenta_codigo,cc.cuenta cuenta_nombre,
+            COALESCE((SELECT SUM(monto) FROM contratos_depositos_garantia dg WHERE dg.contrato_id=co.id),0) depositos_garantia
+            FROM contratos co JOIN proveedores p ON p.id=co.proveedor_id JOIN cuentas_contables cc ON cc.id=co.cuenta_contable_id
+            ORDER BY co.activo DESC,co.fecha_fin DESC,co.id DESC''').fetchall()
+        return jsonify([dict(row) for row in rows])
+    finally: c.close()
+
+@app.post('/api/contratos')
+def crear_contrato():
+    data,error=datos_contrato(request.get_json(silent=True) or {})
+    if error:return jsonify(error=error),400
+    c=db()
+    try:
+        if not c.execute('SELECT 1 FROM proveedores WHERE id=? AND activo=1',(data['proveedor_id'],)).fetchone(): return jsonify(error='Seleccione un proveedor activo.'),400
+        if not c.execute('SELECT 1 FROM cuentas_contables WHERE id=? AND activo=1 AND acepta_movimiento=1',(data['cuenta_contable_id'],)).fetchone(): return jsonify(error='Seleccione una cuenta contable activa que acepte movimientos.'),400
+        cur=c.execute('''INSERT INTO contratos(numero_contrato,proveedor_id,fecha_inicio,fecha_fin,monto_mensual,dia_pago,cuenta_contable_id)
+            VALUES(:numero_contrato,:proveedor_id,:fecha_inicio,:fecha_fin,:monto_mensual,:dia_pago,:cuenta_contable_id)''',data)
+        c.commit(); return jsonify(id=cur.lastrowid),201
+    except sqlite3.IntegrityError:
+        c.rollback(); return jsonify(error='Ya existe un contrato con ese número.'),409
+    finally:c.close()
+
+@app.post('/api/contratos/<int:contract_id>/depositos-garantia')
+def crear_deposito_garantia(contract_id):
+    data=request.get_json(silent=True) or {}; fecha=fecha_planilla(data.get('fecha'))
+    try:monto=round(float(data.get('monto') or 0),2)
+    except (TypeError,ValueError):monto=0
+    if not fecha or monto<=0:return jsonify(error='Indique una fecha y un monto de depósito válidos.'),400
+    c=db()
+    try:
+        if not c.execute('SELECT 1 FROM contratos WHERE id=?',(contract_id,)).fetchone():return jsonify(error='Contrato no encontrado.'),404
+        cur=c.execute('INSERT INTO contratos_depositos_garantia(contrato_id,fecha,monto,descripcion) VALUES(?,?,?,?)',(contract_id,fecha.isoformat(),monto,(data.get('descripcion') or '').strip() or None));c.commit();return jsonify(id=cur.lastrowid),201
+    finally:c.close()
+
+@app.get('/api/cuentas-por-pagar-contratos')
+def cuentas_por_pagar_contratos():
+    c=db()
+    try:
+        generar_cxp_contratos_programadas(c);c.commit()
+        rows=c.execute('''SELECT cp.*,co.numero_contrato,p.nombre proveedor_nombre FROM cuentas_por_pagar_contratos cp
+            JOIN contratos co ON co.id=cp.contrato_id JOIN proveedores p ON p.id=co.proveedor_id ORDER BY cp.fecha DESC,cp.id DESC''').fetchall()
+        return jsonify([dict(row) for row in rows])
+    finally:c.close()
 
 def empleado_planilla_detalle(c, employee_id):
     row=c.execute('''SELECT ep.*,d.codigo departamento_codigo,d.nombre departamento_nombre,

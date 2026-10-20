@@ -129,6 +129,33 @@ class CriticalFlowsTest(unittest.TestCase):
         all_employees = self.client.get('/api/planillas').get_json()
         self.assertTrue(any(row['id'] == employee['id'] and not row['activo'] for row in all_employees))
 
+    def test_contract_generates_payable_ten_days_before_due_date(self):
+        self.login_as_admin()
+        connection = self.server.db()
+        provider = connection.execute('SELECT id FROM proveedores WHERE activo=1 ORDER BY id LIMIT 1').fetchone()
+        account = connection.execute('SELECT id FROM cuentas_contables WHERE activo=1 AND acepta_movimiento=1 ORDER BY id LIMIT 1').fetchone()
+        connection.close()
+        response = self.client.post('/api/contratos', json={
+            'numero_contrato': 'QA-CONTRATO-001', 'proveedor_id': provider['id'],
+            'fecha_inicio': '2026-10-01', 'fecha_fin': '2026-12-31',
+            'monto_mensual': 1500, 'dia_pago': 25, 'cuenta_contable_id': account['id'],
+        })
+        self.assertEqual(response.status_code, 201)
+        contract_id = response.get_json()['id']
+        contracts = self.client.get('/api/contratos')
+        self.assertEqual(contracts.status_code, 200)
+        payable_rows = self.client.get('/api/cuentas-por-pagar-contratos').get_json()
+        payable = next(row for row in payable_rows if row['contrato_id'] == contract_id and row['periodo'] == '2026-10')
+        self.assertAlmostEqual(payable['saldo'], 1500)
+        connection = self.server.db()
+        entry = connection.execute("SELECT 1 FROM asientos_contables WHERE referencia_tipo='contrato_cxp' AND referencia_id=?", (payable['id'],)).fetchone()
+        connection.close()
+        self.assertIsNotNone(entry)
+        deposit = self.client.post(f'/api/contratos/{contract_id}/depositos-garantia', json={
+            'fecha': '2026-10-19', 'monto': 3000, 'descripcion': 'Garantía QA',
+        })
+        self.assertEqual(deposit.status_code, 201)
+
     def test_physical_inventory_count_compares_system_and_scanned_vins(self):
         self.login_as_admin()
         response = self.client.post('/api/conteos-inventario', json={
