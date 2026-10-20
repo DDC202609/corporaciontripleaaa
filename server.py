@@ -3745,6 +3745,11 @@ def get_adquisiciones():
 @app.get('/api/planificacion-financiera')
 def get_planificacion_financiera():
     """Compromisos proyectados; es una vista y no genera CxP ni asientos."""
+    mes=(request.args.get('mes') or ahora_operacion().strftime('%Y-%m')).strip()
+    try:
+        datetime.strptime(mes,'%Y-%m')
+    except ValueError:
+        return jsonify(error='El mes debe tener el formato AAAA-MM.'),400
     c=db()
     transit=c.execute('''SELECT a.id,a.fecha_llegada_estimada fecha_compromiso,a.fecha fecha_origen,
             COALESCE(cp.saldo,a.saldo) pendiente,COALESCE(cp.monto_original,a.costo_compra) monto_original,a.anticipo anticipos,
@@ -3799,7 +3804,33 @@ def get_planificacion_financiera():
                 })
             cursor=(cursor.replace(day=28)+timedelta(days=4)).replace(day=1)
     compromisos_usd.sort(key=lambda item:(item['fecha_compromiso'],item['id']))
-    c.close(); return jsonify(resumen=summary,compromisos=rows,compromisos_usd=compromisos_usd)
+    # El sugerido de compra es una proyección de caja, no una CxP ni un asiento.
+    # Se toma el faltante entero por modelo y se valora con el costo promedio
+    # histórico de adquisición de ese mismo modelo.
+    costos_promedio={}
+    for costo in c.execute('''SELECT v.modelo,
+            AVG(CASE WHEN COALESCE(a.costo_compra,0)>0 THEN a.costo_compra
+                     WHEN COALESCE(v.precio_compra,0)>0 THEN v.precio_compra END) costo_promedio
+        FROM vehiculos v
+        LEFT JOIN adquisiciones a ON a.vehiculo_id=v.id
+        WHERE COALESCE(a.costo_compra,v.precio_compra,0)>0
+        GROUP BY v.modelo''').fetchall():
+        costos_promedio[_modelo_planificacion(costo['modelo'])]=round(float(costo['costo_promedio'] or 0),2)
+    compras_planificadas=[]
+    for modelo in datos_planificacion_compra(c)['modelos']:
+        unidades=int(modelo.get('faltante_compra') or 0)
+        if unidades<=0: continue
+        costo_promedio=costos_promedio.get(modelo['modelo'],0)
+        compras_planificadas.append({
+            'fecha_compromiso':f'{mes}-01','modelo':modelo['modelo'],'unidades':unidades,
+            'costo_promedio':costo_promedio,'pendiente':round(unidades*costo_promedio,2),
+            'origen':'Compra planificada','etapa':'Compra planificada',
+        })
+    compras_planificadas.sort(key=lambda item:(-item['pendiente'],item['modelo']))
+    summary['compra_planificada']=round(sum(item['pendiente'] for item in compras_planificadas),2)
+    summary['total_con_compra_planificada']=round(summary['total']+summary['compra_planificada'],2)
+    c.close(); return jsonify(resumen=summary,compromisos=rows,compromisos_usd=compromisos_usd,
+                              compras_planificadas=compras_planificadas)
 
 def _modelo_planificacion(value):
     return ' '.join(str(value or '').strip().split()).upper()

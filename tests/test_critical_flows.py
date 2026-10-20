@@ -780,6 +780,17 @@ class CriticalFlowsTest(unittest.TestCase):
                           if row['origen'] == 'Adquisición' and row['id'] == purchase['id'])
         self.assertAlmostEqual(commitment['pendiente'], expected, places=2)
 
+    def test_financial_planning_values_planned_purchases_from_purchase_shortages(self):
+        self.login_as_admin()
+        self.client.post('/api/planificacion-compra/parametros/base')
+        response=self.client.get('/api/planificacion-financiera?mes=2026-10')
+        self.assertEqual(response.status_code,200)
+        planned=response.get_json()['compras_planificadas']
+        self.assertTrue(planned)
+        for row in planned:
+            self.assertEqual(row['origen'],'Compra planificada')
+            self.assertEqual(row['pendiente'],round(row['unidades']*row['costo_promedio'],2))
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

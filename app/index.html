@@ -1452,21 +1452,26 @@ contractOptions=function(){
   if(form&&!form.dataset.currencyBound){form.elements.contrato_id.addEventListener('change',actualizarMonedaDeposito);form.dataset.currencyBound='true'}
   actualizarMonedaDeposito();
 };
-let financialPlanningUsdRows=[];
+let financialPlanningUsdRows=[],financialPlanningPurchaseRows=[];
 function usdMoney(value){return `US$ ${Number(value||0).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})}`}
 const loadFinancialPlanningWithUsdContracts=loadFinancialPlanning;
 loadFinancialPlanning=async function(){
   try{
-    let data=await get('/api/planificacion-financiera');
-    financialPlanningRows=data.compromisos||[];financialPlanningUsdRows=data.compromisos_usd||[];
     let monthInput=$('financialPlanningMonth');if(!monthInput.value)monthInput.value=new Date().toISOString().slice(0,7);
+    let data=await get(`/api/planificacion-financiera?mes=${encodeURIComponent(monthInput.value)}`);
+    financialPlanningRows=data.compromisos||[];financialPlanningUsdRows=data.compromisos_usd||[];financialPlanningPurchaseRows=data.compras_planificadas||[];
     renderFinancialPlanning();
   }catch(error){$('financialPlanningTable').innerHTML='<div class="form-feedback error" style="display:block">No fue posible cargar la planificación financiera.</div>'}
 };
+$('financialPlanningMonth')?.addEventListener('change',()=>void loadFinancialPlanning());
 const renderFinancialPlanningWithUsdContracts=renderFinancialPlanning;
 renderFinancialPlanning=function(){
   renderFinancialPlanningWithUsdContracts();
   let month=$('financialPlanningMonth')?.value;if(!month)return;
+  let compras=financialPlanningPurchaseRows.filter(row=>String(row.fecha_compromiso||'').slice(0,7)===month),totalCompras=compras.reduce((sum,row)=>sum+Number(row.pendiente||0),0),baseTotal=financialPlanningRows.filter(row=>String(row.fecha_compromiso||'').slice(0,7)===month).reduce((sum,row)=>sum+Number(row.pendiente||0),0);
+  $('financialPlanningSummary')?.insertAdjacentHTML('beforeend',`<div class="kpi"><div class="label">Compra planificada · ${month}</div><b>${money(totalCompras)}</b><div class="sub">${compras.reduce((sum,row)=>sum+Number(row.unidades||0),0)} vehículos sugeridos.</div></div><div class="kpi"><div class="label">Total con compra planificada</div><b>${money(baseTotal+totalCompras)}</b></div>`);
+  $('financialPlanningPurchases')?.remove();
+  $('financialPlanningTable')?.closest('.panel')?.insertAdjacentHTML('afterend',`<div id="financialPlanningPurchases" class="panel wide-table"><div class="detailhead"><div><h2 style="margin:0">Compra planificada</h2><div class="sub">Proyección basada en el faltante por modelo × costo promedio de adquisición. No genera CxP ni contabilidad.</div></div><b>${money(totalCompras)}</b></div>${reportTable(compras,[{label:'Modelo',value:r=>`<b>${esc(r.modelo)}</b>`},{label:'Faltante',value:r=>`${Number(r.unidades||0)} vehículo${Number(r.unidades||0)===1?'':'s'}`},{label:'Costo promedio',value:r=>money(r.costo_promedio||0)},{label:'Compra planificada',value:r=>`<b>${money(r.pendiente||0)}</b>`}])}</div>`);
   let rows=financialPlanningUsdRows.filter(row=>String(row.fecha_compromiso||'').slice(0,7)===month);
   let total=rows.reduce((sum,row)=>sum+Number(row.pendiente||0),0);
   $('financialPlanningSummary')?.insertAdjacentHTML('beforeend',`<div class="kpi"><div class="label">Contratos USD · ${month}</div><b>${usdMoney(total)}</b><div class="sub">Solo proyección; sin CxP automática.</div></div>`);
