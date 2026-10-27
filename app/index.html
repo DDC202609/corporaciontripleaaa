@@ -1670,4 +1670,21 @@ function openTradeReplacement(){let d=currentVeh?.devolucion_cambio;if(!d)return
 async function submitTradeReplacement(event,id){event.preventDefault();let data=Object.fromEntries(new FormData(event.target).entries());data.costo_compra=Number(data.costo_compra);data.anio=Number(data.anio);data.kilometraje=data.kilometraje===''?null:Number(data.kilometraje);let r=await fetch(`/api/devoluciones-cambio/${id}/reemplazo`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)}),x=await r.json();if(!r.ok)return showNotice(x.error||'No fue posible registrar el reemplazo.','error');closeTradeReturnModal();showNotice(x.monto_cxp>0?`Reemplazo registrado. Se generó CxP por ${money(x.monto_cxp)}.`:`Reemplazo registrado. Saldo CxC: ${money(x.saldo_cxc)}.`);await Promise.all([loadVeh(),dash()]);openDetail(x.vehiculo_id)}
 const renderDetailWithTradeReturn=renderDetail;
 renderDetail=function(){renderDetailWithTradeReturn();let v=currentVeh,target=$('dtgeneral');if(!v||!target)return;let d=v.devolucion_cambio,esCambio=String(v.tipo_compra||'').trim().toLocaleLowerCase()==='cambio';if(d){target.insertAdjacentHTML('afterbegin',`<div class="panel"><div class="detailhead"><div><b>Devolución de cambio #${Number(d.id)}</b><div class="sub">CxC: ${money(d.saldo_cxc)} · Estado: ${esc(d.estado)}${d.vin_reemplazo?` · Reemplazo: ${esc(d.vin_reemplazo)}`:''}</div></div>${!d.vehiculo_reemplazo_id?'<button class="primary" type="button" onclick="openTradeReplacement()">Registrar vehículo de reemplazo</button>':''}</div></div>`)}else if(esCambio&&v.estado!=='Vendido'){target.insertAdjacentHTML('afterbegin',`<div class="panel"><div class="detailhead"><div><b>Vehículo recibido en cambio</b><div class="sub">Si la unidad debe devolverse, se creará una CxC al cliente y se conservará el historial de la venta.</div></div><button class="btn2" type="button" onclick="openTradeReturn()">Devolver vehículo</button></div></div>`)}};
+/* El formulario omite controles disabled de FormData. Para el permiso limitado
+   eso convertía importes históricos en cero dentro del guardado base, aunque
+   el usuario solo estuviera cambiando Nacionalización. Los incluimos con su
+   valor visible únicamente durante la serialización; el servidor sigue siendo
+   quien impide modificar un importe ya registrado. */
+const saveCosteoWithLockedAmounts=saveCosteo;
+saveCosteo=async function(event){
+  const form=event.target,locked=[];
+  if(costeoAccessCached?.()==='nacionalizacion'){
+    const amountNames=new Set(['ajuste_compra','grua','flete','isv_pagado','cl_std','almacenaje','gastos_aduaneros']);
+    form.querySelectorAll('[name]:disabled').forEach(field=>{
+      if(amountNames.has(field.name)){field.disabled=false;locked.push(field)}
+    });
+  }
+  try{return await saveCosteoWithLockedAmounts(event)}
+  finally{locked.forEach(field=>field.disabled=true)}
+};
 </script></body></html>

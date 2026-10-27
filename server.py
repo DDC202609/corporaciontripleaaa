@@ -2567,13 +2567,19 @@ def devolver_vehiculo_recibido_cambio(vid):
         if not vehicle: return jsonify(error='Vehículo no encontrado.'),404
         if vehicle['estado']=='Devuelto': return jsonify(error='Este vehículo ya fue dado de baja por devolución.'),409
         if vehicle['estado']=='Vendido': return jsonify(error='No se puede devolver un vehículo que ya fue vendido; primero debe resolver formalmente la venta posterior.'),409
-        link=c.execute('''SELECT pv.id pago_venta_id,pv.monto,ve.id venta_id,ve.numero_transaccion,ve.factura,
-                ve.cliente_id,cl.nombre cliente_nombre
-            FROM pagos_venta pv JOIN ventas ve ON ve.id=pv.venta_id
-            LEFT JOIN clientes cl ON cl.id=ve.cliente_id
-            WHERE pv.vehiculo_recibido_id=? AND pv.tipo_pago='Cambio'
-            ORDER BY pv.id DESC LIMIT 1''',(vid,)).fetchone()
+        link,regularizar_vinculo=buscar_vinculo_pago_cambio(c,vehicle)
         if not link: return jsonify(error='Este vehículo no está vinculado a un pago por cambio.'),409
+        # Las ventas históricas pueden tener el vehículo y el pago registrados,
+        # pero sin la llave que los relaciona. Solo se regulariza cuando la
+        # observación identifica una venta y hay exactamente un pago Cambio
+        # pendiente de enlazar en dicha venta; nunca se adivina ni se crea un
+        # pago nuevo desde esta pantalla.
+        if regularizar_vinculo:
+            updated=c.execute('''UPDATE pagos_venta SET vehiculo_recibido_id=?
+                WHERE id=? AND tipo_pago='Cambio' AND vehiculo_recibido_id IS NULL''',
+                (vid,link['pago_venta_id'])).rowcount
+            if updated!=1:
+                return jsonify(error='El vínculo histórico de cambio fue modificado por otro registro. Actualice la ficha e intente de nuevo.'),409
         if c.execute("SELECT 1 FROM ordenes_trabajo WHERE vehiculo_id=? AND estado='Pendiente'",(vid,)).fetchone():
             return jsonify(error='Finalice o cancele la OT pendiente antes de devolver este vehículo.'),409
         amount=round(float(link['monto'] or 0),2)
@@ -2584,8 +2590,8 @@ def devolver_vehiculo_recibido_cambio(vid):
         label=f"Cambio devuelto · {vehicle['vin']}"
         cur=c.execute('''INSERT INTO cuentas_por_cobrar
             (venta_id,financiera_nombre,fecha,monto_original,saldo,estado,cliente_id,fecha_vencimiento,tipo_cxc)
-            VALUES(?,?,?,?,?,'Pendiente',?,?,?,'Cambio devuelto')''',
-            (link['venta_id'],label,fecha,amount,amount,link['cliente_id'],fecha))
+            VALUES(?,?,?,?,?,?,?,?,?)''',
+            (link['venta_id'],label,fecha,amount,amount,'Pendiente',link['cliente_id'],fecha,'Cambio devuelto'))
         cxc_id=cur.lastrowid
         cur=c.execute('''INSERT INTO devoluciones_cambio
             (vehiculo_devuelto_id,venta_origen_id,pago_venta_id,cliente_id,proveedor_id,cuenta_por_cobrar_id,fecha,motivo,monto_original)
@@ -2606,6 +2612,39 @@ def devolver_vehiculo_recibido_cambio(vid):
     except Exception:
         c.rollback(); raise
     finally: c.close()
+
+def es_vehiculo_recibido_cambio(vehicle):
+    """Indica si la ficha corresponde a una unidad recibida como cambio."""
+    return (vehicle['tipo_compra'] or '').strip().casefold()=='cambio'
+
+def buscar_vinculo_pago_cambio(c, vehicle):
+    """Obtiene el pago Cambio asociado a una unidad, sin inventar documentos.
+
+    El segundo valor señala que el vínculo se puede regularizar de manera
+    determinista al confirmar la devolución. Se admite únicamente una venta
+    explícita en las observaciones y un único pago Cambio aún no vinculado.
+    """
+    direct=c.execute('''SELECT pv.id pago_venta_id,pv.monto,ve.id venta_id,ve.numero_transaccion,ve.factura,
+                ve.cliente_id,cl.nombre cliente_nombre
+            FROM pagos_venta pv JOIN ventas ve ON ve.id=pv.venta_id
+            LEFT JOIN clientes cl ON cl.id=ve.cliente_id
+            WHERE pv.vehiculo_recibido_id=? AND pv.tipo_pago='Cambio'
+            ORDER BY pv.id DESC LIMIT 1''',(vehicle['id'],)).fetchone()
+    if direct:
+        return direct,False
+    if not es_vehiculo_recibido_cambio(vehicle):
+        return None,False
+    reference=re.search(r'\bV-\d+\b',vehicle['observaciones'] or '',re.IGNORECASE)
+    if not reference:
+        return None,False
+    candidates=c.execute('''SELECT pv.id pago_venta_id,pv.monto,ve.id venta_id,ve.numero_transaccion,ve.factura,
+                ve.cliente_id,cl.nombre cliente_nombre
+            FROM pagos_venta pv JOIN ventas ve ON ve.id=pv.venta_id
+            LEFT JOIN clientes cl ON cl.id=ve.cliente_id
+            WHERE UPPER(COALESCE(ve.numero_transaccion,''))=?
+              AND pv.tipo_pago='Cambio' AND pv.vehiculo_recibido_id IS NULL
+            ORDER BY pv.id''',(reference.group(0).upper(),)).fetchall()
+    return (candidates[0],True) if len(candidates)==1 else (None,False)
 
 @app.post('/api/devoluciones-cambio/<int:return_id>/reemplazo')
 def registrar_reemplazo_devolucion_cambio(return_id):
@@ -4907,11 +4946,11 @@ def get_vehicle(vid):
         FROM devoluciones_cambio dc JOIN cuentas_por_cobrar cc ON cc.id=dc.cuenta_por_cobrar_id
         LEFT JOIN vehiculos vr ON vr.id=dc.vehiculo_reemplazo_id
         WHERE dc.vehiculo_devuelto_id=?''',(vid,)).fetchone()
-    # La pantalla no infiere el flujo por texto: el servidor determina si la
-    # unidad está realmente vinculada a un pago de venta recibido como cambio.
-    # Así solo se muestra la acción cuando el endpoint puede procesarla.
-    pago_cambio=c.execute('''SELECT 1 FROM pagos_venta
-        WHERE vehiculo_recibido_id=? AND tipo_pago='Cambio' LIMIT 1''',(vid,)).fetchone()
+    # Toda ficha de tipo Cambio elegible muestra el flujo de devolución. El
+    # endpoint valida el pago original antes de registrar cualquier efecto
+    # contable y, si es un registro histórico inequívoco, regulariza solo su
+    # vínculo técnico con el pago existente.
+    pago_cambio,_=buscar_vinculo_pago_cambio(c,v)
     acq=c.execute('SELECT * FROM costos_adquisicion WHERE vehiculo_id=?',(vid,)).fetchone()
     cost_total=c.execute('SELECT COALESCE(SUM(monto),0) FROM costos_vehiculo WHERE vehiculo_id=?',(vid,)).fetchone()[0]
     purchase=float(v['precio_compra'] or 0)
@@ -4936,7 +4975,7 @@ def get_vehicle(vid):
         compra['saldo_cxp']=float(payable_record['saldo'] or 0)
         compra['monto_cxp']=float(payable_record['monto_original'] or 0)
         compra['estado_cxp']=payable_record['estado']
-    out=dict(v); out['costos']= [dict(x) for x in costs]; out['movimientos']=[dict(x) for x in movements]; out['compra']=compra; out['ordenes_trabajo']=[dict(x) for x in work_orders]; out['devolucion_cambio']=dict(devolucion) if devolucion else None; out['puede_devolver_cambio']=bool(pago_cambio and not devolucion and v['estado'] not in ('Vendido','Devuelto')); out['adquisicion']=dict(acq) if acq else None; out['costeo']=costeo; out['costo_adquisicion']=base_cost; out['costo_adicional']=cost_total; out['costo_real']=real_cost; out['desglose_costos']=desglose_costo_consolidado(c,vid)
+    out=dict(v); out['costos']= [dict(x) for x in costs]; out['movimientos']=[dict(x) for x in movements]; out['compra']=compra; out['ordenes_trabajo']=[dict(x) for x in work_orders]; out['devolucion_cambio']=dict(devolucion) if devolucion else None; out['puede_devolver_cambio']=bool(es_vehiculo_recibido_cambio(v) and not devolucion and v['estado'] not in ('Vendido','Devuelto')); out['vinculo_cambio_detectado']=bool(pago_cambio); out['adquisicion']=dict(acq) if acq else None; out['costeo']=costeo; out['costo_adquisicion']=base_cost; out['costo_adicional']=cost_total; out['costo_real']=real_cost; out['desglose_costos']=desglose_costo_consolidado(c,vid)
     out['venta']=dict(sale) if sale else None; out['comisiones']=[dict(x) for x in comm]
     out['precio_venta_calculado']=sale_price; out['comision_total']=commission_total; out['utilidad_bruta']=gross; out['utilidad_real']=net
     out['margen_real']= (net/sale_price*100) if sale_price else 0

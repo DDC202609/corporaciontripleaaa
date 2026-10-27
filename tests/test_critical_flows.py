@@ -353,6 +353,61 @@ class CriticalFlowsTest(unittest.TestCase):
         self.assertIn('puede_devolver_cambio', response.get_json())
         self.assertIsInstance(response.get_json()['puede_devolver_cambio'], bool)
 
+    def test_trade_return_regularizes_one_unlinked_historical_change_payment(self):
+        """Una ficha histórica de Cambio debe poder recuperar solo su vínculo inequívoco."""
+        self.login_as_admin()
+        connection = self.server.db()
+        customer = connection.execute(
+            "SELECT id,nombre FROM clientes WHERE activo=1 AND tipo<>'Financiera' ORDER BY id LIMIT 1"
+        ).fetchone()
+        source_vehicle = connection.execute('SELECT id FROM vehiculos ORDER BY id LIMIT 1').fetchone()
+        self.assertIsNotNone(customer)
+        self.assertIsNotNone(source_vehicle)
+        sale = connection.execute('''INSERT INTO ventas
+            (vehiculo_id,cliente_id,fecha,precio,descuento,prima,saldo,estado,numero_transaccion,tipo_venta)
+            VALUES(?,?,?,?,?,?,?,?,?,?)''',
+            (source_vehicle['id'], customer['id'], '2026-10-01', 100000, 0, 100000, 0,
+             'Facturada', 'V-90991', 'Contado'))
+        sale_id = sale.lastrowid
+        payment = connection.execute('''INSERT INTO pagos_venta
+            (venta_id,tipo_pago,referencia,monto,fecha,vehiculo_recibido_id)
+            VALUES(?,?,?,?,?,NULL)''', (sale_id, 'Cambio', None, 80000, '2026-10-01'))
+        payment_id = payment.lastrowid
+        received = connection.execute('''INSERT INTO vehiculos
+            (vin,tipo_vehiculo,marca,modelo,anio,placa,estado,precio_compra,fecha_adquisicion,tipo_compra,observaciones)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?)''',
+            ('QA-RETURN-CAMBIO-001', 'SUV', 'QA', 'Cambio', 2020, 'QA-RET-001',
+             'En Tránsito', 80000, '2026-10-01', 'Cambio',
+             'Vehículo recibido como cambio. Venta V-90991.'))
+        vehicle_id = received.lastrowid
+        connection.commit()
+        connection.close()
+
+        detail = self.client.get(f'/api/vehiculos/{vehicle_id}')
+        self.assertEqual(detail.status_code, 200)
+        self.assertTrue(detail.get_json()['puede_devolver_cambio'])
+        self.assertTrue(detail.get_json()['vinculo_cambio_detectado'])
+        returned = self.client.post(f'/api/vehiculos/{vehicle_id}/devolucion-cambio', json={
+            'fecha': '2026-10-02', 'motivo': 'Prueba de devolución histórica',
+        })
+        self.assertEqual(returned.status_code, 201)
+        connection = self.server.db()
+        linked_payment = connection.execute(
+            'SELECT vehiculo_recibido_id FROM pagos_venta WHERE id=?', (payment_id,)
+        ).fetchone()
+        returned_vehicle = connection.execute(
+            'SELECT estado FROM vehiculos WHERE id=?', (vehicle_id,)
+        ).fetchone()
+        cxc = connection.execute(
+            'SELECT saldo,tipo_cxc FROM cuentas_por_cobrar WHERE id=?',
+            (returned.get_json()['cuenta_por_cobrar_id'],)
+        ).fetchone()
+        connection.close()
+        self.assertEqual(linked_payment['vehiculo_recibido_id'], vehicle_id)
+        self.assertEqual(returned_vehicle['estado'], 'Devuelto')
+        self.assertAlmostEqual(cxc['saldo'], 80000)
+        self.assertEqual(cxc['tipo_cxc'], 'Cambio devuelto')
+
     def test_only_authorized_account_can_update_costing(self):
         connection = self.server.db()
         profile = connection.execute('SELECT id FROM perfiles WHERE es_administrador=1 LIMIT 1').fetchone()
@@ -383,6 +438,34 @@ class CriticalFlowsTest(unittest.TestCase):
         response = self.client.get('/api/sesion')
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json()['costeo_acceso'], 'nacionalizacion')
+
+        connection = self.server.db()
+        provider = connection.execute(
+            'SELECT id FROM proveedores WHERE activo=1 ORDER BY id LIMIT 1'
+        ).fetchone()
+        created = connection.execute('''INSERT INTO vehiculos
+            (vin,tipo_vehiculo,marca,modelo,anio,estado,precio_compra,fecha_adquisicion,tipo_compra)
+            VALUES(?,?,?,?,?,?,?,?,?)''',
+            ('QA-LORENZO-NACIONAL-001', 'SUV', 'QA', 'Importación', 2020,
+             'En Tránsito', 100000, '2026-10-01', 'Importación'))
+        vehicle_id = created.lastrowid
+        connection.execute('''INSERT INTO adquisiciones
+            (vehiculo_id,proveedor_id,fecha,costo_compra,anticipo,metodo_pago,condicion_pago,dias_credito,saldo,tipo_compra)
+            VALUES(?,?,?,?,?,?,?,?,?,?)''',
+            (vehicle_id, provider['id'], '2026-10-01', 100000, 0, 'Crédito', 'Crédito', 30, 100000, 'Importación'))
+        connection.commit()
+        connection.close()
+        nationalized = self.client.put(f'/api/vehiculos/{vehicle_id}/adquisicion', json={
+            'estatus': 'Nacionalizado', 'placa_nacionalizacion': 'QA-NAC-001',
+        })
+        self.assertEqual(nationalized.status_code, 200)
+        connection = self.server.db()
+        costing = connection.execute('''SELECT estatus,placa_nacionalizacion,isv_pagado,cl_std,almacenaje,gastos_aduaneros
+            FROM costos_adquisicion WHERE vehiculo_id=?''', (vehicle_id,)).fetchone()
+        connection.close()
+        self.assertEqual(costing['estatus'], 'Nacionalizado')
+        self.assertEqual(costing['placa_nacionalizacion'], 'QA-NAC-001')
+        self.assertEqual(tuple(costing[key] for key in ('isv_pagado','cl_std','almacenaje','gastos_aduaneros')), (0,0,0,0))
 
     def test_continuing_workshop_does_not_create_a_new_order(self):
         self.login_as_admin()
