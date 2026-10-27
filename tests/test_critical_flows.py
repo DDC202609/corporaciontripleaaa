@@ -358,6 +358,22 @@ class CriticalFlowsTest(unittest.TestCase):
         response = self.client.put(f"/api/vehiculos/{vehicle['id']}/adquisicion", json={'ajuste_compra': 1})
         self.assertEqual(response.status_code, 403)
 
+    def test_anderson_lorenzo_alias_has_limited_costing_access(self):
+        """La cuenta productiva usa a.lorenzo, no el alias sin punto."""
+        connection = self.server.db()
+        profile = connection.execute('SELECT id FROM perfiles WHERE es_administrador=1 LIMIT 1').fetchone()
+        cursor = connection.execute('''INSERT INTO usuarios(username,password_hash,nombre,email,rol,activo,perfil_id)
+            VALUES(?,?,?,?,?,?,?)''', ('a.lorenzo', 'unused', 'Anderson Lorenzo', 'a.lorenzo@local', 'Usuario', 1, profile['id']))
+        user_id = cursor.lastrowid
+        connection.commit()
+        connection.close()
+        with self.client.session_transaction() as session:
+            session['user_id'] = user_id
+            session['sesion_version'] = 1
+        response = self.client.get('/api/sesion')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()['costeo_acceso'], 'nacionalizacion')
+
     def test_continuing_workshop_does_not_create_a_new_order(self):
         self.login_as_admin()
         connection = self.server.db()

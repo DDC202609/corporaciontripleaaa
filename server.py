@@ -131,11 +131,16 @@ def nivel_actualizacion_costeo():
     """Distingue el editor total del usuario limitado a nacionalización."""
     user=user_access(session.get('user_id')) if session.get('user_id') else None
     username=str(user.get('username') or '').strip().casefold() if user else ''
-    # En operación algunos usuarios ingresan con el alias corto y otros con
-    # su correo corporativo. Ambos representan la misma cuenta autorizada.
-    alias=username.split('@',1)[0]
-    editor_alias=COSTEO_EDITOR_USERNAME.split('@',1)[0]
-    nacionalizacion_alias=COSTEO_NACIONALIZACION_USERNAME.split('@',1)[0]
+    # La cuenta de Anderson está registrada como ``a.lorenzo``; según el
+    # origen también puede llegar como ``alorenzo`` o como correo. Para no
+    # depender de puntos, guiones o el dominio, comparamos el alias
+    # normalizado, conservando la autorización limitada a esa identidad.
+    def alias_normalizado(value):
+        alias=str(value or '').strip().casefold().split('@',1)[0]
+        return re.sub(r'[^a-z0-9]', '', alias)
+    alias=alias_normalizado(username)
+    editor_alias=alias_normalizado(COSTEO_EDITOR_USERNAME)
+    nacionalizacion_alias=alias_normalizado(COSTEO_NACIONALIZACION_USERNAME)
     if username==COSTEO_EDITOR_USERNAME or alias==editor_alias: return 'total'
     if username==COSTEO_NACIONALIZACION_USERNAME or alias==nacionalizacion_alias: return 'nacionalizacion'
     return 'ninguno'
