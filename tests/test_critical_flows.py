@@ -343,6 +343,16 @@ class CriticalFlowsTest(unittest.TestCase):
         self.assertTrue(all('vin' in row and 'costo_total' in row for row in rows))
         self.assertTrue(all(row['fecha_actualizacion'] for row in rows))
 
+    def test_vehicle_detail_exposes_server_validated_trade_return_action(self):
+        self.login_as_admin()
+        connection = self.server.db()
+        vehicle = connection.execute('SELECT id FROM vehiculos ORDER BY id LIMIT 1').fetchone()
+        connection.close()
+        response = self.client.get(f"/api/vehiculos/{vehicle['id']}")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('puede_devolver_cambio', response.get_json())
+        self.assertIsInstance(response.get_json()['puede_devolver_cambio'], bool)
+
     def test_only_authorized_account_can_update_costing(self):
         connection = self.server.db()
         profile = connection.execute('SELECT id FROM perfiles WHERE es_administrador=1 LIMIT 1').fetchone()
