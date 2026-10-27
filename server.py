@@ -25,7 +25,7 @@ else:
     with open(SECRET_FILE,'wb') as secret_file: secret_file.write(SECRET_KEY)
 app=Flask(__name__)
 app.config.update(SECRET_KEY=SECRET_KEY,SESSION_COOKIE_HTTPONLY=True,SESSION_COOKIE_SAMESITE='Lax',SESSION_COOKIE_SECURE=os.environ.get('SESSION_COOKIE_SECURE','').lower() in {'1','true','yes'})
-ESTADOS_VEHICULO=('En Tránsito','Nacionalizado','En Taller','DPV','Reservado','Vendido')
+ESTADOS_VEHICULO=('En Tránsito','Nacionalizado','En Taller','DPV','Reservado','Vendido','Devuelto')
 ZONA_HORARIA_OPERACION=ZoneInfo('America/Tegucigalpa')
 COSTEO_EDITOR_USERNAME=os.environ.get('COSTEO_EDITOR_USERNAME','erickmadrid.sabillon@gmail.com').strip().casefold()
 COSTEO_NACIONALIZACION_USERNAME=os.environ.get('COSTEO_NACIONALIZACION_USERNAME','alorenzo').strip().casefold()
@@ -131,8 +131,13 @@ def nivel_actualizacion_costeo():
     """Distingue el editor total del usuario limitado a nacionalización."""
     user=user_access(session.get('user_id')) if session.get('user_id') else None
     username=str(user.get('username') or '').strip().casefold() if user else ''
-    if username==COSTEO_EDITOR_USERNAME: return 'total'
-    if username==COSTEO_NACIONALIZACION_USERNAME: return 'nacionalizacion'
+    # En operación algunos usuarios ingresan con el alias corto y otros con
+    # su correo corporativo. Ambos representan la misma cuenta autorizada.
+    alias=username.split('@',1)[0]
+    editor_alias=COSTEO_EDITOR_USERNAME.split('@',1)[0]
+    nacionalizacion_alias=COSTEO_NACIONALIZACION_USERNAME.split('@',1)[0]
+    if username==COSTEO_EDITOR_USERNAME or alias==editor_alias: return 'total'
+    if username==COSTEO_NACIONALIZACION_USERNAME or alias==nacionalizacion_alias: return 'nacionalizacion'
     return 'ninguno'
 
 def puede_actualizar_costeo():
@@ -697,6 +702,30 @@ def init_db(sync_history=True):
         c.execute('ALTER TABLE cuentas_por_cobrar ADD COLUMN cliente_id INTEGER REFERENCES clientes(id)')
     if 'fecha_vencimiento' not in cxc_columns:
         c.execute('ALTER TABLE cuentas_por_cobrar ADD COLUMN fecha_vencimiento TEXT')
+    if 'tipo_cxc' not in cxc_columns:
+        c.execute("ALTER TABLE cuentas_por_cobrar ADD COLUMN tipo_cxc TEXT NOT NULL DEFAULT 'Financiada'")
+    # Aplicaciones no monetarias de una CxC.  En particular, una unidad de
+    # reemplazo recibida por un cambio devuelto reduce la deuda sin simular un
+    # cobro en caja o banco.
+    c.execute('''CREATE TABLE IF NOT EXISTS aplicaciones_cuentas_por_cobrar(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        cuenta_por_cobrar_id INTEGER NOT NULL REFERENCES cuentas_por_cobrar(id) ON DELETE CASCADE,
+        fecha TEXT NOT NULL,monto REAL NOT NULL,tipo TEXT NOT NULL,referencia TEXT,
+        creado_en TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS devoluciones_cambio(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        vehiculo_devuelto_id INTEGER NOT NULL UNIQUE REFERENCES vehiculos(id),
+        venta_origen_id INTEGER NOT NULL REFERENCES ventas(id),
+        pago_venta_id INTEGER NOT NULL REFERENCES pagos_venta(id),
+        cliente_id INTEGER REFERENCES clientes(id),proveedor_id INTEGER REFERENCES proveedores(id),
+        cuenta_por_cobrar_id INTEGER NOT NULL UNIQUE REFERENCES cuentas_por_cobrar(id),
+        vehiculo_reemplazo_id INTEGER UNIQUE REFERENCES vehiculos(id),
+        cuenta_por_pagar_id INTEGER REFERENCES cuentas_por_pagar(id),
+        fecha TEXT NOT NULL,motivo TEXT NOT NULL,monto_original REAL NOT NULL,
+        monto_reemplazo REAL,estado TEXT NOT NULL DEFAULT 'CxC pendiente',
+        creado_en TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )''')
     c.execute('''CREATE TABLE IF NOT EXISTS movimientos_caja(
         id INTEGER PRIMARY KEY AUTOINCREMENT,fecha TEXT NOT NULL,tipo TEXT NOT NULL,medio TEXT NOT NULL,banco TEXT,
         entrada REAL NOT NULL DEFAULT 0,salida REAL NOT NULL DEFAULT 0,descripcion TEXT,
@@ -951,7 +980,7 @@ def init_db(sync_history=True):
         VALUES('6103','Bonos al Personal','Gasto','Gasto de Venta','Deudora',1,0,0,1)''')
     sincronizar_anticipos_ot_en_kardex(c)
     reconciliar_auxiliar_cxc(c)
-    c.execute("UPDATE vehiculos SET estado='DPV' WHERE estado NOT IN ('En Tránsito','Nacionalizado','En Taller','DPV','Reservado','Vendido')")
+    c.execute("UPDATE vehiculos SET estado='DPV' WHERE estado NOT IN ('En Tránsito','Nacionalizado','En Taller','DPV','Reservado','Vendido','Devuelto')")
     if sync_history:
         sincronizar_contabilidad_historica(c)
     c.commit(); c.close()
@@ -1221,12 +1250,13 @@ def reconciliar_auxiliar_cxc(c):
     recalcula cada saldo únicamente a partir de los cobros ya persistidos.
     """
     rows=c.execute('''SELECT cc.id,cc.monto_original,cc.saldo,cc.estado,
-        COALESCE(SUM(co.monto),0) cobrado
-        FROM cuentas_por_cobrar cc
-        LEFT JOIN cobros_cuentas_por_cobrar co ON co.cuenta_por_cobrar_id=cc.id
-        GROUP BY cc.id''').fetchall()
+        COALESCE((SELECT SUM(co.monto) FROM cobros_cuentas_por_cobrar co
+                  WHERE co.cuenta_por_cobrar_id=cc.id),0) cobrado,
+        COALESCE((SELECT SUM(ap.monto) FROM aplicaciones_cuentas_por_cobrar ap
+                  WHERE ap.cuenta_por_cobrar_id=cc.id),0) aplicado
+        FROM cuentas_por_cobrar cc''').fetchall()
     for row in rows:
-        expected=max(round(float(row['monto_original'] or 0)-float(row['cobrado'] or 0),2),0)
+        expected=max(round(float(row['monto_original'] or 0)-float(row['cobrado'] or 0)-float(row['aplicado'] or 0),2),0)
         estado='Cobrada' if expected<=0.01 else 'Pendiente'
         if abs(float(row['saldo'] or 0)-expected)>0.01 or row['estado']!=estado:
             c.execute('UPDATE cuentas_por_cobrar SET saldo=?,estado=? WHERE id=?',
@@ -1559,6 +1589,10 @@ def recalcular_estado(c, vehiculo_id, motivo='Actualización automática de etap
     """Calcula las únicas etapas permitidas sin aceptar cambios manuales de estado."""
     vehicle=c.execute('SELECT estado,ubicacion FROM vehiculos WHERE id=?',(vehiculo_id,)).fetchone()
     if not vehicle: return None
+    # Una devolución de cambio es una baja formal; ningún cierre de OT o
+    # actualización posterior debe reingresar la unidad al inventario.
+    if vehicle['estado']=='Devuelto':
+        return 'Devuelto'
     sale=c.execute('SELECT * FROM ventas WHERE vehiculo_id=? ORDER BY id DESC LIMIT 1',(vehiculo_id,)).fetchone()
     purchase=c.execute('SELECT tipo_compra,contabilizada FROM adquisiciones WHERE vehiculo_id=?',(vehiculo_id,)).fetchone()
     pending=c.execute("SELECT COUNT(*) FROM ordenes_trabajo WHERE vehiculo_id=? AND estado='Pendiente'",(vehiculo_id,)).fetchone()[0]
@@ -1926,12 +1960,12 @@ def dashboard():
         'dpv':status_summary('DPV'),
         'transito':status_summary('En Tránsito'),
         'taller':status_summary('En Taller'),
-        'consignacion':{'cantidad':sum(1 for vehicle in vehicles if vehicle.get('tipo_compra')=='Consignación' and vehicle.get('estado')!='Vendido'),
-                        'costo':round(sum(float(vehicle.get('precio_compra') or 0) for vehicle in vehicles if vehicle.get('tipo_compra')=='Consignación' and vehicle.get('estado')!='Vendido'),2)}
+        'consignacion':{'cantidad':sum(1 for vehicle in vehicles if vehicle.get('tipo_compra')=='Consignación' and vehicle.get('estado') not in ('Vendido','Devuelto')),
+                        'costo':round(sum(float(vehicle.get('precio_compra') or 0) for vehicle in vehicles if vehicle.get('tipo_compra')=='Consignación' and vehicle.get('estado') not in ('Vendido','Devuelto')),2)}
     }
     inventory_by_type={}
     for vehicle in vehicles:
-        if vehicle.get('estado')=='Vendido' or vehicle.get('tipo_compra')=='Consignación':
+        if vehicle.get('estado') in ('Vendido','Devuelto') or vehicle.get('tipo_compra')=='Consignación':
             continue
         key=(vehicle.get('tipo_vehiculo') or 'Sin tipo').strip() or 'Sin tipo'
         entry=inventory_by_type.setdefault(key,{'tipo_vehiculo':key,'cantidad':0,'costo':0.0})
@@ -1986,7 +2020,7 @@ def dashboard():
         'ventas_por_marca':sorted(summarize(list(brands.values())),key=lambda row:row['venta'],reverse=True),
         'ventas_por_vendedor':sorted(summarize(list(sellers.values())),key=lambda row:row['venta'],reverse=True),
         # Se mantienen estas claves para consumidores existentes de la API.
-        'total':len(vehicles),'disponibles':statuses['dpv']['cantidad'],'inventario':round(sum(costo_consolidado(c,row['id']) for row in vehicles if row.get('estado')!='Vendido' and row.get('tipo_compra')!='Consignación'),2),
+        'total':sum(1 for row in vehicles if row.get('estado') not in ('Vendido','Devuelto')),'disponibles':statuses['dpv']['cantidad'],'inventario':round(sum(costo_consolidado(c,row['id']) for row in vehicles if row.get('estado') not in ('Vendido','Devuelto') and row.get('tipo_compra')!='Consignación'),2),
         'comisiones_pendientes':0
     }
     c.close(); return jsonify(out)
@@ -2313,7 +2347,7 @@ def conciliacion_inventario():
     cuenta_ids={key:cuenta_contable_id(c,key) for key in cuentas}
     por_id={account_id:key for key,account_id in cuenta_ids.items()}
     vehicles=[dict(row) for row in c.execute('''SELECT *
-        FROM vehiculos WHERE estado<>'Vendido' AND COALESCE(tipo_compra,'')<>'Consignación' ''').fetchall()]
+        FROM vehiculos WHERE estado NOT IN ('Vendido','Devuelto') AND COALESCE(tipo_compra,'')<>'Consignación' ''').fetchall()]
     operativo={key:0.0 for key in cuentas}
     esperado={}
     detalle_dashboard=[]
@@ -2486,7 +2520,7 @@ def cuentas_por_pagar_repuestos():
 @app.get('/api/cuentas-por-cobrar')
 def cuentas_por_cobrar():
     c=db(); rows=c.execute('''SELECT cc.*,COALESCE(cl.nombre,fc.nombre,cc.financiera_nombre) tercero_nombre,
-        CASE WHEN cc.cliente_id IS NOT NULL THEN 'Pagaré' ELSE 'Financiada' END tipo_cxc,
+        COALESCE(NULLIF(cc.tipo_cxc,''),CASE WHEN cc.cliente_id IS NOT NULL THEN 'Pagaré' ELSE 'Financiada' END) tipo_cxc,
         ve.numero_transaccion,ve.factura,ve.precio,v.vin,v.marca,v.modelo
         FROM cuentas_por_cobrar cc JOIN ventas ve ON ve.id=cc.venta_id JOIN vehiculos v ON v.id=ve.vehiculo_id
         LEFT JOIN clientes cl ON cl.id=cc.cliente_id LEFT JOIN clientes fc ON fc.id=cc.financiera_cliente_id
@@ -2507,6 +2541,121 @@ def validar_pago_cartera(data, saldo):
     if tipo!='Efectivo' and not referencia:
         return None,'Ingrese el número de referencia'
     return (monto,tipo,banco or None,referencia or None),None
+
+@app.post('/api/vehiculos/<int:vid>/devolucion-cambio')
+def devolver_vehiculo_recibido_cambio(vid):
+    """Da de baja una unidad recibida en cambio y abre la CxC al cliente.
+
+    La venta original nunca se modifica: la devolución es un documento nuevo,
+    con su propio asiento, para conservar la auditoría de ambos vehículos.
+    """
+    data=request.get_json(silent=True) or {}
+    fecha=(data.get('fecha') or ahora_operacion().date().isoformat()).strip()
+    motivo=(data.get('motivo') or '').strip()
+    if not motivo:
+        return jsonify(error='Indique el motivo de la devolución.'),400
+    try: datetime.strptime(fecha,'%Y-%m-%d')
+    except ValueError: return jsonify(error='La fecha debe tener formato AAAA-MM-DD.'),400
+    c=db()
+    try:
+        vehicle=c.execute('SELECT * FROM vehiculos WHERE id=?',(vid,)).fetchone()
+        if not vehicle: return jsonify(error='Vehículo no encontrado.'),404
+        if vehicle['estado']=='Devuelto': return jsonify(error='Este vehículo ya fue dado de baja por devolución.'),409
+        if vehicle['estado']=='Vendido': return jsonify(error='No se puede devolver un vehículo que ya fue vendido; primero debe resolver formalmente la venta posterior.'),409
+        link=c.execute('''SELECT pv.id pago_venta_id,pv.monto,ve.id venta_id,ve.numero_transaccion,ve.factura,
+                ve.cliente_id,cl.nombre cliente_nombre
+            FROM pagos_venta pv JOIN ventas ve ON ve.id=pv.venta_id
+            LEFT JOIN clientes cl ON cl.id=ve.cliente_id
+            WHERE pv.vehiculo_recibido_id=? AND pv.tipo_pago='Cambio'
+            ORDER BY pv.id DESC LIMIT 1''',(vid,)).fetchone()
+        if not link: return jsonify(error='Este vehículo no está vinculado a un pago por cambio.'),409
+        if c.execute("SELECT 1 FROM ordenes_trabajo WHERE vehiculo_id=? AND estado='Pendiente'",(vid,)).fetchone():
+            return jsonify(error='Finalice o cancele la OT pendiente antes de devolver este vehículo.'),409
+        amount=round(float(link['monto'] or 0),2)
+        consolidated=round(costo_consolidado(c,vid),2)
+        if abs(consolidated-amount)>0.01:
+            return jsonify(error=f'El vehículo tiene un costo consolidado de L {consolidated:,.2f}, distinto al cambio original de L {amount:,.2f}. Primero regularice los costos adicionales para poder devolverlo.'),409
+        provider_id=asegurar_proveedor_desde_cliente(c,{'nombre':link['cliente_nombre'] or 'Cliente de cambio'})
+        label=f"Cambio devuelto · {vehicle['vin']}"
+        cur=c.execute('''INSERT INTO cuentas_por_cobrar
+            (venta_id,financiera_nombre,fecha,monto_original,saldo,estado,cliente_id,fecha_vencimiento,tipo_cxc)
+            VALUES(?,?,?,?,?,'Pendiente',?,?,?,'Cambio devuelto')''',
+            (link['venta_id'],label,fecha,amount,amount,link['cliente_id'],fecha))
+        cxc_id=cur.lastrowid
+        cur=c.execute('''INSERT INTO devoluciones_cambio
+            (vehiculo_devuelto_id,venta_origen_id,pago_venta_id,cliente_id,proveedor_id,cuenta_por_cobrar_id,fecha,motivo,monto_original)
+            VALUES(?,?,?,?,?,?,?,?,?)''',(vid,link['venta_id'],link['pago_venta_id'],link['cliente_id'],provider_id,cxc_id,fecha,motivo,amount))
+        return_id=cur.lastrowid
+        old_state=vehicle['estado']
+        c.execute("UPDATE vehiculos SET estado='Devuelto' WHERE id=?",(vid,))
+        add_movimiento(c,vid,fecha,'Devolución de vehículo recibido en cambio',old_state,'Devuelto',vehicle['ubicacion'],vehicle['ubicacion'],
+            referencia=f"Devolución #{return_id}",observaciones=f'{motivo}. Se generó CxC #{cxc_id} por L {amount:,.2f}.')
+        registrar_asiento(c,fecha,f"Devolución de cambio · {vehicle['vin']}",'devolucion_cambio',return_id,[
+            {'cuenta_id':cuenta_contable_id(c,'cxc'),'debe':amount},
+            {'cuenta_id':cuenta_contable_id(c,cuenta_inventario_por_estado(old_state)),'haber':amount},
+        ],vid)
+        c.commit()
+        return jsonify(ok=True,devolucion_id=return_id,cuenta_por_cobrar_id=cxc_id,monto=amount,estado='CxC pendiente'),201
+    except sqlite3.IntegrityError:
+        c.rollback(); return jsonify(error='Ya existe una devolución registrada para este vehículo.'),409
+    except Exception:
+        c.rollback(); raise
+    finally: c.close()
+
+@app.post('/api/devoluciones-cambio/<int:return_id>/reemplazo')
+def registrar_reemplazo_devolucion_cambio(return_id):
+    """Recibe el reemplazo y lo compensa contra la CxC de la devolución."""
+    data=request.get_json(silent=True) or {}
+    fecha=(data.get('fecha') or ahora_operacion().date().isoformat()).strip()
+    try: datetime.strptime(fecha,'%Y-%m-%d')
+    except ValueError: return jsonify(error='La fecha debe tener formato AAAA-MM-DD.'),400
+    c=db()
+    try:
+        change=c.execute('''SELECT dc.*,cc.saldo cxc_saldo,cc.estado cxc_estado,cl.nombre cliente_nombre,
+                ve.numero_transaccion FROM devoluciones_cambio dc
+            JOIN cuentas_por_cobrar cc ON cc.id=dc.cuenta_por_cobrar_id
+            LEFT JOIN clientes cl ON cl.id=dc.cliente_id
+            JOIN ventas ve ON ve.id=dc.venta_origen_id WHERE dc.id=?''',(return_id,)).fetchone()
+        if not change: return jsonify(error='Devolución de cambio no encontrada.'),404
+        if change['vehiculo_reemplazo_id']: return jsonify(error='Esta devolución ya tiene un vehículo de reemplazo registrado.'),409
+        if float(change['cxc_saldo'] or 0)<=0.01: return jsonify(error='La CxC de esta devolución no tiene saldo disponible.'),409
+        customer={'nombre':change['cliente_nombre'] or 'Cliente de cambio'}
+        new_vehicle_id,acquisition_id,value=registrar_vehiculo_recibido_cambio(c,data,fecha,customer,change['numero_transaccion'] or f'Devolución #{return_id}')
+        applied=min(round(float(change['cxc_saldo']),2),value)
+        excess=round(max(value-applied,0),2)
+        c.execute('''UPDATE adquisiciones SET anticipo=?,saldo=?,condicion_pago=?,observaciones=? WHERE id=?''',
+            (applied,excess,'Crédito' if excess else 'Contado',
+             f"Vehículo de reemplazo de devolución #{return_id}; CxC aplicada: {applied:.2f}.",acquisition_id))
+        cxp_id=None
+        if applied:
+            cur=c.execute('''INSERT INTO aplicaciones_cuentas_por_cobrar(cuenta_por_cobrar_id,fecha,monto,tipo,referencia)
+                VALUES(?,?,?,?,?)''',(change['cuenta_por_cobrar_id'],fecha,applied,'Vehículo de reemplazo',data.get('vin','').strip().upper()))
+        cxc_remaining=round(max(float(change['cxc_saldo'])-applied,0),2)
+        cxc_state='Cobrada' if cxc_remaining<=0.01 else 'Pendiente'
+        c.execute('UPDATE cuentas_por_cobrar SET saldo=?,estado=? WHERE id=?',(cxc_remaining,cxc_state,change['cuenta_por_cobrar_id']))
+        if excess:
+            cur=c.execute('''INSERT INTO cuentas_por_pagar(adquisicion_id,proveedor_id,fecha,monto_original,saldo,estado)
+                VALUES(?,?,?,?,?,'Pendiente')''',(acquisition_id,change['proveedor_id'],fecha,excess,excess))
+            cxp_id=cur.lastrowid
+        change_state='CxP pendiente' if excess else ('Compensada' if cxc_remaining<=0.01 else 'CxC pendiente')
+        c.execute('''UPDATE devoluciones_cambio SET vehiculo_reemplazo_id=?,cuenta_por_pagar_id=?,monto_reemplazo=?,estado=? WHERE id=?''',
+            (new_vehicle_id,cxp_id,value,change_state,return_id))
+        lines=[{'cuenta_id':cuenta_contable_id(c,'inventario_transito'),'debe':value}]
+        if applied: lines.append({'cuenta_id':cuenta_contable_id(c,'cxc'),'haber':applied})
+        if excess: lines.append({'cuenta_id':cuenta_contable_id(c,'cxp'),'haber':excess})
+        registrar_asiento(c,fecha,f"Vehículo de reemplazo · devolución #{return_id}",'reemplazo_devolucion_cambio',return_id,lines,new_vehicle_id)
+        add_movimiento(c,new_vehicle_id,fecha,'Ingreso como reemplazo de cambio',None,'En Tránsito',None,None,
+            referencia=f"Devolución #{return_id}",observaciones=f'CxC aplicada: {applied:.2f}; CxP generada: {excess:.2f}.')
+        c.commit()
+        return jsonify(ok=True,vehiculo_id=new_vehicle_id,adquisicion_id=acquisition_id,cuenta_por_cobrar_id=change['cuenta_por_cobrar_id'],
+                       saldo_cxc=cxc_remaining,cuenta_por_pagar_id=cxp_id,monto_cxp=excess,estado=change_state),201
+    except ValueError as error:
+        c.rollback(); return jsonify(error=str(error)),400
+    except sqlite3.IntegrityError:
+        c.rollback(); return jsonify(error='No fue posible registrar el reemplazo; verifique VIN, placa y documentos relacionados.'),409
+    except Exception:
+        c.rollback(); raise
+    finally: c.close()
 
 def referencia_pago_disponible(c, referencia):
     if not referencia:
@@ -4748,6 +4897,11 @@ def get_vehicle(vid):
     payable_record=c.execute('SELECT monto_original,saldo,estado FROM cuentas_por_pagar WHERE adquisicion_id=?',
         (purchase_record['id'],)).fetchone() if purchase_record else None
     work_orders=c.execute('SELECT * FROM ordenes_trabajo WHERE vehiculo_id=? ORDER BY fecha DESC,id DESC',(vid,)).fetchall()
+    devolucion=c.execute('''SELECT dc.*,cc.saldo saldo_cxc,cc.estado estado_cxc,
+            vr.vin vin_reemplazo,vr.marca marca_reemplazo,vr.modelo modelo_reemplazo
+        FROM devoluciones_cambio dc JOIN cuentas_por_cobrar cc ON cc.id=dc.cuenta_por_cobrar_id
+        LEFT JOIN vehiculos vr ON vr.id=dc.vehiculo_reemplazo_id
+        WHERE dc.vehiculo_devuelto_id=?''',(vid,)).fetchone()
     acq=c.execute('SELECT * FROM costos_adquisicion WHERE vehiculo_id=?',(vid,)).fetchone()
     cost_total=c.execute('SELECT COALESCE(SUM(monto),0) FROM costos_vehiculo WHERE vehiculo_id=?',(vid,)).fetchone()[0]
     purchase=float(v['precio_compra'] or 0)
@@ -4772,7 +4926,7 @@ def get_vehicle(vid):
         compra['saldo_cxp']=float(payable_record['saldo'] or 0)
         compra['monto_cxp']=float(payable_record['monto_original'] or 0)
         compra['estado_cxp']=payable_record['estado']
-    out=dict(v); out['costos']= [dict(x) for x in costs]; out['movimientos']=[dict(x) for x in movements]; out['compra']=compra; out['ordenes_trabajo']=[dict(x) for x in work_orders]; out['adquisicion']=dict(acq) if acq else None; out['costeo']=costeo; out['costo_adquisicion']=base_cost; out['costo_adicional']=cost_total; out['costo_real']=real_cost; out['desglose_costos']=desglose_costo_consolidado(c,vid)
+    out=dict(v); out['costos']= [dict(x) for x in costs]; out['movimientos']=[dict(x) for x in movements]; out['compra']=compra; out['ordenes_trabajo']=[dict(x) for x in work_orders]; out['devolucion_cambio']=dict(devolucion) if devolucion else None; out['adquisicion']=dict(acq) if acq else None; out['costeo']=costeo; out['costo_adquisicion']=base_cost; out['costo_adicional']=cost_total; out['costo_real']=real_cost; out['desglose_costos']=desglose_costo_consolidado(c,vid)
     out['venta']=dict(sale) if sale else None; out['comisiones']=[dict(x) for x in comm]
     out['precio_venta_calculado']=sale_price; out['comision_total']=commission_total; out['utilidad_bruta']=gross; out['utilidad_real']=net
     out['margen_real']= (net/sale_price*100) if sale_price else 0
