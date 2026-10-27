@@ -65,7 +65,8 @@ $('dtrent').innerHTML=`<div class="formgrid"><div class="kpi"><div class="label"
    indicador y vuelve a validar la relación de pago antes de registrar nada. */
 function closeTradeReturnSafe(){document.getElementById('tradeReturnSafeModal')?.remove()}
 function openTradeReturnSafe(){
-  let vehicle=currentVeh;if(!vehicle||!vehicle.puede_devolver_cambio)return;
+  let vehicle=currentVeh,isChange=String(vehicle?.tipo_compra||'').trim().toLocaleLowerCase()==='cambio';
+  if(!vehicle||!isChange||['Vendido','Devuelto'].includes(vehicle.estado))return;
   closeTradeReturnSafe();
   document.body.insertAdjacentHTML('beforeend',`<div id="tradeReturnSafeModal" class="modal"><div class="modalbox" style="max-width:720px"><div class="modalhead"><div><h2 style="margin:0">Devolver vehículo recibido en cambio</h2><div class="sub">Se dará de baja ${esc(vehicle.vin)} y se creará una CxC por ${money(vehicle.precio_compra||0)}. La venta original no se modifica.</div></div><button class="close" type="button" onclick="closeTradeReturnSafe()">×</button></div><form onsubmit="submitTradeReturnSafe(event)"><div class="formgrid" style="margin-top:16px"><div class="field"><label>Fecha *</label><input name="fecha" type="date" required value="${new Date().toISOString().slice(0,10)}"></div><div class="field span2"><label>Motivo de devolución *</label><input name="motivo" maxlength="500" required placeholder="Ej. Falla detectada al revisar la unidad"></div></div><div class="actions"><button class="btn2" type="button" onclick="closeTradeReturnSafe()">Cancelar</button><button class="primary">Dar de baja y generar CxC</button></div></form></div></div>`);
 }
@@ -96,7 +97,7 @@ renderDetail=function(){
   if(!target||target.querySelector('#tradeReturnSafeAction'))return;
   if(vehicle?.devolucion_cambio&&!vehicle.devolucion_cambio.vehiculo_reemplazo_id){
     target.insertAdjacentHTML('afterbegin',`<div id="tradeReturnSafeAction" class="panel"><div class="detailhead"><div><b>Devolución de cambio #${Number(vehicle.devolucion_cambio.id)}</b><div class="sub">CxC pendiente: ${money(vehicle.devolucion_cambio.saldo_cxc)}.</div></div><button class="primary" type="button" onclick="openTradeReplacementSafe()">Registrar vehículo de reemplazo</button></div></div>`);
-  }else if(vehicle?.puede_devolver_cambio){
+  }else if(String(vehicle?.tipo_compra||'').trim().toLocaleLowerCase()==='cambio'&&!['Vendido','Devuelto'].includes(vehicle.estado)){
     target.insertAdjacentHTML('afterbegin',`<div id="tradeReturnSafeAction" class="panel"><div class="detailhead"><div><b>Vehículo recibido en cambio</b><div class="sub">Registre la devolución formal para darlo de baja y generar la CxC correspondiente.</div></div><button class="btn2" type="button" onclick="openTradeReturnSafe()">Devolver vehículo</button></div></div>`);
   }
 };
