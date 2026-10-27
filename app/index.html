@@ -51,6 +51,17 @@ function closeModal(){clearFormFeedback();if(returnToDetail&&currentVeh){openDet
 function validateVehicleForm(d){if(!String(d.vin||'').trim())return 'Ingrese el VIN del vehículo.';let year=d.anio===''?null:Number(d.anio);if(year!==null&&(!Number.isInteger(year)||year<1886||year>new Date().getFullYear()+1))return 'Ingrese un año válido.';for(let [key,label] of [['kilometraje','Millaje'],['precio_compra','Costo de compra'],['precio_venta','Precio de venta']])if(d[key]!==''&&(!Number.isFinite(Number(d[key]))||Number(d[key])<0))return label+' debe ser un número igual o mayor que cero.';return null}
 async function saveVeh(e){e.preventDefault();let d=Object.fromEntries(new FormData(e.target).entries());let validation=validateVehicleForm(d);if(validation){showFormFeedback(validation);return}['anio','kilometraje','precio_compra','precio_venta'].forEach(k=>{if(d[k]!=='')d[k]=Number(d[k]);else d[k]=null});clearFormFeedback();try{let r=await fetch(editingId?'/api/vehiculos/'+editingId:'/api/vehiculos',{method:editingId?'PUT':'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)});let x=await r.json();if(!r.ok){showFormFeedback(x.error||'No se pudo guardar el vehículo.');return}let savedId=editingId||x.id;await Promise.all([loadVeh(),dash()]);showNotice(editingId?'Vehículo actualizado correctamente.':'Vehículo guardado correctamente.');openDetail(savedId)}catch(error){showFormFeedback('No fue posible comunicarse con el servidor. Verifique que la aplicación esté iniciada.')}}
 async function openDetail(id){currentVeh=await get('/api/vehiculos/'+id);if(currentVeh.error)return alert(currentVeh.error);document.querySelectorAll('main section').forEach(s=>s.classList.add('hidden'));$('detail').classList.remove('hidden');$('dvtitle').textContent=(currentVeh.marca||'')+' '+(currentVeh.modelo||'');$('dvsub').textContent=currentVeh.vin+' · '+(currentVeh.version||'')+' · '+(currentVeh.anio||'');$('dkCompra').textContent=money(currentVeh.precio_compra);$('dkCostos').textContent=money(currentVeh.costo_adicional);$('dkReal').textContent=money(currentVeh.costo_real);$('dkUtil').textContent=money(currentVeh.utilidad_real);renderDetail()}
+/* Punto único de entrada a la ficha: no depende de las extensiones que luego
+   personalizan renderDetail. Así la acción de devolución se presenta siempre
+   que la propia ficha esté clasificada como Cambio. */
+function renderTradeReturnEntry(){
+  let vehicle=currentVeh,target=$('dtgeneral');
+  let isChange=String(vehicle?.tipo_compra||'').trim().toLocaleLowerCase()==='cambio';
+  if(!target||!isChange||['Vendido','Devuelto'].includes(vehicle.estado)||target.querySelector('#tradeReturnEntry'))return;
+  target.insertAdjacentHTML('afterbegin',`<div id="tradeReturnEntry" class="panel"><div class="detailhead"><div><b>Vehículo recibido en cambio</b><div class="sub">Registre la devolución formal para darlo de baja y generar la CxC correspondiente.</div></div><button class="primary" type="button" onclick="openTradeReturnSafe()">Devolver vehículo</button></div></div>`);
+}
+const openDetailWithTradeReturnEntry=openDetail;
+openDetail=async function(id){await openDetailWithTradeReturnEntry(id);renderTradeReturnEntry()};
 function goBackVeh(){go('veh',document.querySelector('nav button:nth-child(2)'))}
 function editCurrentVeh(){void openVehModal(currentVeh)}
 function detailTab(t,b){['general','adq','costos','kardex','venta','rent'].forEach(x=>$('dt'+x).classList.toggle('hidden',x!==t));document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));b.classList.add('active')}
