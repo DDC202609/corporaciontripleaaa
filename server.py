@@ -2600,6 +2600,66 @@ def asignar_conciliacion_migraciones():
     finally:
         c.close()
 
+@app.get('/api/contabilidad/conciliacion-inventario/diagnostico-migraciones')
+def diagnostico_conciliacion_migraciones():
+    """Expone, sin modificar datos, por qué una migración puede no asignarse.
+
+    La conciliación histórica proviene de una póliza global; este diagnóstico
+    permite validar sus candidatos antes de volver a ejecutar una asignación.
+    """
+    user=user_access(session.get('user_id')) if session.get('user_id') else None
+    if not user or not user.get('es_administrador'):
+        return jsonify(error='Solo un administrador puede consultar el diagnóstico de migraciones.'),403
+    c=db()
+    cuentas={'inventario_dpv':'DPV','inventario_taller':'En Taller','inventario_transito':'En Tránsito'}
+    try:
+        historical=c.execute('''SELECT id,fecha,descripcion FROM asientos_contables
+            WHERE referencia_tipo='conciliacion_inventario_historico'
+            ORDER BY id DESC LIMIT 1''').fetchone()
+        if not historical:
+            return jsonify(error='No existe una conciliación histórica de inventario.'),404
+        cuenta_ids={key:cuenta_contable_id(c,key) for key in cuentas}
+        por_id={account_id:key for key,account_id in cuenta_ids.items()}
+        source={row['cuenta_id']:round(float(row['saldo'] or 0),2) for row in c.execute('''SELECT cuenta_id,
+            SUM(debe-haber) saldo FROM partidas WHERE asiento_id=? AND cuenta_id IN (?,?,?) GROUP BY cuenta_id''',
+            (historical['id'],*cuenta_ids.values())).fetchall()}
+        used={row['cuenta_id']:round(float(row['monto'] or 0),2) for row in c.execute('''SELECT cuenta_id,
+            SUM(monto) monto FROM asignaciones_conciliacion_inventario WHERE asiento_id=? GROUP BY cuenta_id''',
+            (historical['id'],)).fetchall()}
+        rows=[]
+        vehicles=c.execute('''SELECT * FROM vehiculos
+            WHERE estado IN ('DPV','En Taller','En Tránsito')
+              AND COALESCE(tipo_compra,'')<>'Consignación' ORDER BY vin''').fetchall()
+        for vehicle in vehicles:
+            acquisitions=c.execute('SELECT observaciones FROM adquisiciones WHERE vehiculo_id=?',(vehicle['id'],)).fetchall()
+            notes=' '.join(str(row['observaciones'] or '') for row in acquisitions).casefold()
+            marked='migración histórica' in notes or 'migracion historica' in notes
+            if not marked:
+                continue
+            assigned=c.execute('SELECT COUNT(*) FROM asignaciones_conciliacion_inventario WHERE asiento_id=? AND vehiculo_id=?',
+                (historical['id'],vehicle['id'])).fetchone()[0]
+            balances={key:0.0 for key in cuentas}
+            for row in c.execute('''SELECT cuenta_id,COALESCE(SUM(debe-haber),0) saldo FROM partidas
+                WHERE vehiculo_id=? AND cuenta_id IN (?,?,?) GROUP BY cuenta_id''',
+                (vehicle['id'],*cuenta_ids.values())).fetchall():
+                balances[por_id[row['cuenta_id']]]=round(float(row['saldo'] or 0),2)
+            expected_key=cuenta_inventario_por_estado(vehicle['estado'])
+            expected_cost=round(costo_consolidado(c,vehicle['id']),2)
+            difference=round(expected_cost-sum(balances.values()),2)
+            rows.append({'vin':vehicle['vin'],'etapa':vehicle['estado'],'costo':expected_cost,
+                         'contable_vinculado':round(sum(balances.values()),2),'diferencia':difference,
+                         'asignado':bool(assigned)})
+        disponibilidad={key:{'poliza_historica':source.get(account_id,0.0),'asignado':used.get(account_id,0.0),
+                             'disponible':round(source.get(account_id,0.0)-used.get(account_id,0.0),2)}
+                        for key,account_id in cuenta_ids.items()}
+        return jsonify(asiento_historico=dict(historical),migraciones=rows,
+                       resumen={'migraciones_detectadas':len(rows),'ya_asignadas':sum(1 for row in rows if row['asignado']),
+                                'pendientes_con_diferencia':sum(1 for row in rows if not row['asignado'] and abs(row['diferencia'])>0.01),
+                                'pendientes_que_ya_cuadran':sum(1 for row in rows if not row['asignado'] and abs(row['diferencia'])<=0.01)},
+                       disponibilidad=disponibilidad)
+    finally:
+        c.close()
+
 @app.get('/api/cuentas-por-pagar')
 def cuentas_por_pagar():
     c=db(); rows=c.execute('''SELECT cp.*,p.nombre proveedor_nombre,a.costo_compra,a.anticipo,a.metodo_pago,v.vin,v.marca,v.modelo
