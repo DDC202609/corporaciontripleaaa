@@ -591,6 +591,20 @@ def init_db(sync_history=True):
         id INTEGER PRIMARY KEY AUTOINCREMENT,vehiculo_id INTEGER NOT NULL REFERENCES vehiculos(id),fecha TEXT NOT NULL,
         concepto TEXT NOT NULL,categoria TEXT,monto REAL NOT NULL DEFAULT 0,proveedor TEXT,documento TEXT,observaciones TEXT
     )''')
+    # Una conciliación histórica puede haber quedado en una sola póliza sin
+    # VIN. Esta tabla distribuye esa póliza entre vehículos sin modificar sus
+    # partidas ni crear dinero, bancos o cuentas por pagar nuevos.
+    c.execute('''CREATE TABLE IF NOT EXISTS asignaciones_conciliacion_inventario(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        asiento_id INTEGER NOT NULL REFERENCES asientos_contables(id) ON DELETE CASCADE,
+        vehiculo_id INTEGER NOT NULL REFERENCES vehiculos(id) ON DELETE CASCADE,
+        cuenta_id INTEGER NOT NULL REFERENCES cuentas_contables(id),
+        monto REAL NOT NULL,
+        motivo TEXT NOT NULL,
+        creado_en TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(asiento_id,vehiculo_id,cuenta_id)
+    )''')
+    c.execute('CREATE INDEX IF NOT EXISTS ix_asignaciones_conciliacion_vehiculo ON asignaciones_conciliacion_inventario(vehiculo_id,cuenta_id)')
     c.execute('''CREATE TABLE IF NOT EXISTS gastos_ot(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         orden_trabajo_id INTEGER NOT NULL REFERENCES ordenes_trabajo(id) ON DELETE CASCADE,
@@ -2406,6 +2420,15 @@ def conciliacion_inventario():
         if line['vehiculo_id'] in registrado:
             registrado[line['vehiculo_id']][key]+=value
 
+    # Las migraciones antiguas se conciliaron inicialmente en una póliza
+    # global. Las asignaciones preservan ese asiento y solo dan trazabilidad
+    # por VIN a la porción que le corresponde a cada vehículo.
+    for allocation in c.execute('''SELECT vehiculo_id,cuenta_id,COALESCE(SUM(monto),0) monto
+        FROM asignaciones_conciliacion_inventario
+        WHERE cuenta_id IN (?,?,?) GROUP BY vehiculo_id,cuenta_id''',tuple(cuenta_ids.values())).fetchall():
+        if allocation['vehiculo_id'] in registrado and allocation['cuenta_id'] in por_id:
+            registrado[allocation['vehiculo_id']][por_id[allocation['cuenta_id']]]+=round(float(allocation['monto'] or 0),2)
+
     # El ingreso de una venta con cambio debita inventario pero, por diseño del
     # asiento de venta, lleva inicialmente el ID de la unidad vendida. Para la
     # conciliación se atribuye al VIN realmente recibido como parte de pago.
@@ -2499,6 +2522,83 @@ def conciliacion_inventario():
         trazabilidad_resumen=trazabilidad_resumen,
         diferencia_total=round(sum(item['diferencia'] for item in resumen),2),
     )
+
+@app.post('/api/contabilidad/conciliacion-inventario/asignar-migraciones')
+def asignar_conciliacion_migraciones():
+    """Asigna por VIN la póliza global de conciliación histórica.
+
+    No crea asientos ni modifica las cuentas 1103, 1104, 1105, banco o CxP.
+    Solamente distribuye la trazabilidad disponible de la póliza histórica a
+    las unidades que fueron identificadas expresamente como migración.
+    """
+    user=user_access(session.get('user_id')) if session.get('user_id') else None
+    if not user or not user.get('es_administrador'):
+        return jsonify(error='Solo un administrador puede asignar la conciliación histórica por VIN.'),403
+    c=db()
+    cuentas={'inventario_dpv':'DPV','inventario_taller':'En Taller','inventario_transito':'En Tránsito'}
+    try:
+        historical=c.execute('''SELECT id FROM asientos_contables
+            WHERE referencia_tipo='conciliacion_inventario_historico'
+            ORDER BY id DESC LIMIT 1''').fetchone()
+        if not historical:
+            return jsonify(error='No existe una conciliación histórica de inventario pendiente de asignar.'),404
+        cuenta_ids={key:cuenta_contable_id(c,key) for key in cuentas}
+        por_id={account_id:key for key,account_id in cuenta_ids.items()}
+        source={row['cuenta_id']:round(float(row['saldo'] or 0),2) for row in c.execute('''SELECT cuenta_id,
+            SUM(debe-haber) saldo FROM partidas WHERE asiento_id=? AND cuenta_id IN (?,?,?) GROUP BY cuenta_id''',
+            (historical['id'],*cuenta_ids.values())).fetchall()}
+        used={row['cuenta_id']:round(float(row['monto'] or 0),2) for row in c.execute('''SELECT cuenta_id,
+            SUM(monto) monto FROM asignaciones_conciliacion_inventario WHERE asiento_id=? GROUP BY cuenta_id''',
+            (historical['id'],)).fetchall()}
+        corrected=[]; omitted=[]
+        vehicles=c.execute('''SELECT * FROM vehiculos
+            WHERE estado IN ('DPV','En Taller','En Tránsito')
+              AND COALESCE(tipo_compra,'')<>'Consignación' ORDER BY id''').fetchall()
+        for vehicle in vehicles:
+            acquisitions=c.execute('SELECT observaciones FROM adquisiciones WHERE vehiculo_id=?',(vehicle['id'],)).fetchall()
+            notes=' '.join(str(row['observaciones'] or '') for row in acquisitions).casefold()
+            if 'migración histórica' not in notes and 'migracion historica' not in notes:
+                continue
+            already=c.execute('SELECT 1 FROM asignaciones_conciliacion_inventario WHERE asiento_id=? AND vehiculo_id=? LIMIT 1',
+                (historical['id'],vehicle['id'])).fetchone()
+            if already:
+                omitted.append({'vin':vehicle['vin'],'motivo':'Ya tiene una asignación histórica.'})
+                continue
+            balances={key:0.0 for key in cuentas}
+            for row in c.execute('''SELECT cuenta_id,COALESCE(SUM(debe-haber),0) saldo FROM partidas
+                WHERE vehiculo_id=? AND cuenta_id IN (?,?,?) GROUP BY cuenta_id''',
+                (vehicle['id'],*cuenta_ids.values())).fetchall():
+                balances[por_id[row['cuenta_id']]]=round(float(row['saldo'] or 0),2)
+            expected_key=cuenta_inventario_por_estado(vehicle['estado'])
+            expected={key:(round(costo_consolidado(c,vehicle['id']),2) if key==expected_key else 0.0) for key in cuentas}
+            allocations={key:round(expected[key]-balances[key],2) for key in cuentas}
+            if all(abs(amount)<=0.005 for amount in allocations.values()):
+                omitted.append({'vin':vehicle['vin'],'motivo':'Ya cuadra con el saldo contable vinculado al VIN.'})
+                continue
+            projected={account_id:round(used.get(account_id,0)+allocations[key],2) for key,account_id in cuenta_ids.items()}
+            valid=True
+            for account_id,amount in projected.items():
+                original=source.get(account_id,0.0)
+                if (original>=0 and (amount < -0.01 or amount-original > 0.01)) or (original<0 and (amount > 0.01 or amount-original < -0.01)):
+                    valid=False; break
+            if not valid:
+                omitted.append({'vin':vehicle['vin'],'motivo':'La asignación excede la póliza histórica disponible para esa cuenta.'})
+                continue
+            for key,amount in allocations.items():
+                if abs(amount)>0.005:
+                    account_id=cuenta_ids[key]
+                    c.execute('''INSERT INTO asignaciones_conciliacion_inventario
+                        (asiento_id,vehiculo_id,cuenta_id,monto,motivo) VALUES(?,?,?,?,?)''',
+                        (historical['id'],vehicle['id'],account_id,amount,'Asignación por VIN de conciliación histórica de inventario'))
+                    used[account_id]=round(used.get(account_id,0)+amount,2)
+            corrected.append({'vin':vehicle['vin'],'etapa':vehicle['estado'],'costo':expected[expected_key]})
+        c.commit()
+        return jsonify(ok=True,asiento_historico_id=historical['id'],asignadas=corrected,omitidas=omitted)
+    except Exception:
+        c.rollback()
+        raise
+    finally:
+        c.close()
 
 @app.get('/api/cuentas-por-pagar')
 def cuentas_por_pagar():

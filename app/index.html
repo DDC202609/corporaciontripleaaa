@@ -242,6 +242,17 @@ renderAccounting=function(){
 // Conciliación de lectura: muestra qué VIN explica cada diferencia entre el
 // inventario físico-operativo y las cuentas 1103, 1104 y 1105. No crea asientos.
 if(accountingToolbar&&!$('inventoryReconciliationButton'))accountingToolbar.insertAdjacentHTML('beforeend','<button id="inventoryReconciliationButton" class="btn2" type="button" onclick="showInventoryReconciliation()">Conciliar inventario</button>');
+if(accountingToolbar&&!$('inventoryMigrationAssignmentButton'))accountingToolbar.insertAdjacentHTML('beforeend','<button id="inventoryMigrationAssignmentButton" class="btn2" type="button" onclick="assignHistoricalInventoryMigration()">Asignar migración por VIN</button>');
+async function assignHistoricalInventoryMigration(){
+  if(!confirm('Asignará por VIN la conciliación histórica de las unidades de migración. No cambiará los saldos de Inventario, Banco ni CxP. Los seis casos fuera de migración quedarán excluidos. ¿Continuar?'))return;
+  let response=await fetch('/api/contabilidad/conciliacion-inventario/asignar-migraciones',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}),result;
+  try{result=await response.json()}catch(_){result={}}
+  if(!response.ok)return showNotice(result.error||'No fue posible asignar la conciliación histórica.','error');
+  let assigned=result.asignadas||[];
+  showNotice(assigned.length?`${assigned.length} vehículo(s) de migración quedaron conciliados por VIN. No se modificó Banco, CxP ni el saldo de las cuentas de inventario.`:'No había migraciones nuevas pendientes de asignar.');
+  await loadAccounting();
+  showInventoryReconciliation();
+}
 async function showInventoryReconciliation(){
   try{
     let data=await get('/api/contabilidad/conciliacion-inventario'),summary=data.resumen||[],rows=data.inconsistencias||[],dashboard=data.detalle_dashboard||[],alerts=data.alertas_dashboard||[],validation=data.validacion_dashboard||{},trace=data.trazabilidad||[],traceSummary=data.trazabilidad_resumen||{};
