@@ -291,6 +291,21 @@ class CriticalFlowsTest(unittest.TestCase):
         self.assertEqual(vehicle['vin'], 'TEST-CRITICAL-FLOW-0001')
         self.assertIsNotNone(master)
 
+    def test_create_vehicle_information_master_record(self):
+        self.login_as_admin()
+        response = self.client.post('/api/informacion-vehiculo', json={
+            'tipo_vehiculo': 'Camioneta',
+            'marca': 'QA MARCA',
+            'modelo': 'QA MODELO',
+            'version': 'QA VERSION',
+        })
+        self.assertEqual(response.status_code, 201)
+        item_id = response.get_json()['id']
+        rows = self.client.get('/api/informacion-vehiculo?marca=QA%20MARCA').get_json()
+        item = next(row for row in rows if row['id'] == item_id)
+        self.assertEqual(item['modelo'], 'QA MODELO')
+        self.assertEqual(item['version'], 'QA VERSION')
+
     def test_duplicate_vin_returns_a_controlled_error(self):
         self.login_as_admin()
         self.client.post('/api/vehiculos', json=self.vehicle_payload('TEST-DUPLICATE-VIN-0001'))
