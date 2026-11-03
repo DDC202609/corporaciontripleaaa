@@ -2016,14 +2016,16 @@ def dashboard():
         # Las ventas históricas no tenían vendedor; se mantienen claramente
         # separadas de las nuevas ventas que sí lo requieren.
         seller=sale.get('vendedor_nombre') or 'Sin vendedor asignado'
-        seller_entry=sellers.setdefault(seller,{'vendedor':seller,'cantidad':0,'costo':0.0,'venta':0.0})
+        seller_entry=sellers.setdefault(seller,{'vendedor':seller,'cantidad':0,'costo':0.0,'venta':0.0,'descuentos':0.0})
         for entry in (model_entry,brand_entry,seller_entry):
             entry['cantidad']+=1; entry['costo']+=cost; entry['venta']+=value
+        seller_entry['descuentos']+=float(sale.get('descuento') or 0)
 
     def summarize(rows):
         result=[]
         for row in rows:
             row['costo']=round(row['costo'],2); row['venta']=round(row['venta'],2)
+            if 'descuentos' in row: row['descuentos']=round(row['descuentos'],2)
             row['margen']=round(row['venta']-row['costo'],2)
             row['margen_pct']=round((row['margen']/row['venta']*100) if row['venta'] else 0,2)
             result.append(row)
