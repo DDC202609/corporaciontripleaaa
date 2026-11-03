@@ -4387,23 +4387,25 @@ def datos_planificacion_compra(c, semanas=12):
         }
     inventory={}
     models=set(parameters)
+    # La planificación usa únicamente las cuatro etapas operativas: DPV, En
+    # Taller, En Tránsito y Consignación. Ningún vehículo vendido, devuelto,
+    # reservado u otra etapa puede alimentar estos conteos.
     for row in c.execute("""SELECT modelo,anio,estado,COALESCE(tipo_compra,'') tipo_compra,COUNT(*) cantidad
         FROM vehiculos
-        WHERE estado IN ('DPV','En Taller','En Tránsito','Consignación') AND TRIM(COALESCE(modelo,''))<>''
+        WHERE (estado IN ('DPV','En Taller','En Tránsito','Consignación')
+               OR COALESCE(tipo_compra,'')='Consignación')
+          AND TRIM(COALESCE(modelo,''))<>''
         GROUP BY modelo,anio,estado,COALESCE(tipo_compra,'')"""):
         model=_modelo_planificacion(row['modelo']); models.add(model)
         item=inventory.setdefault(model,{'DPV':0,'En Taller':0,'En Tránsito':0,'Consignación':0,'anios':{}})
         state=row['estado'] or ''
         quantity=int(row['cantidad'] or 0)
-        # La consignación puede tener una etapa operativa (por ejemplo DPV),
-        # pero debe verse separada y no cubrir la meta de compra propia.
         is_consignment=(row['tipo_compra'] or '').strip().casefold()=='consignación' or state=='Consignación'
         if is_consignment: item['Consignación']+=quantity
         elif state in item: item[state]+=quantity
-        # La distribución por año debe representar el inventario propio que
-        # cubre la meta de compra; una unidad en consignación se muestra en su
-        # columna, pero no se mezcla con DPV/Taller/Tránsito.
-        if row['anio'] and not is_consignment:
+        # La distribución anual utiliza exactamente el mismo conjunto de
+        # unidades que el total: las cuatro etapas operativas permitidas.
+        if row['anio']:
             year=str(int(row['anio'])); year_values.add(int(year))
             item['anios'][year]=item['anios'].get(year,0)+quantity
     start_month=(today.replace(day=1)-timedelta(days=335)).isoformat()
@@ -4459,11 +4461,10 @@ def datos_planificacion_compra(c, semanas=12):
         param=parameters.get(model,{'dpv':0,'taller':0,'transito':0,'distribucion':{}})
         average=round(sales.get(model,0)/12,2)
         target_total=param['dpv']+param['taller']+param['transito']
-        # El faltante de compra solo considera inventario propio: DPV,
-        # Taller y Tránsito. La consignación sí se informa como existencia
-        # física, pero no se utiliza para reducir una compra planificada.
-        current_total=current['DPV']+current['En Taller']+current['En Tránsito']
-        physical_total=current_total+current['Consignación']
+        # El total y el faltante consideran las cuatro etapas operativas.
+        # Quedan excluidos Vendido, Devuelto, Reservado y cualquier otra etapa.
+        current_total=current['DPV']+current['En Taller']+current['En Tránsito']+current['Consignación']
+        physical_total=current_total
         arrivals=0; deliveries=0; demand_total=0.0; projection=[]
         for index,week in enumerate(weeks):
             arrivals+=transit_by_model.get(model,[0]*semanas)[index]
