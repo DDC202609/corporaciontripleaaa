@@ -838,7 +838,13 @@ def init_db(sync_history=True):
     payroll_commission_columns={row['name'] for row in c.execute('PRAGMA table_info(comisiones_planilla)')}
     if 'bono' not in payroll_commission_columns:
         c.execute('ALTER TABLE comisiones_planilla ADD COLUMN bono REAL NOT NULL DEFAULT 0')
+    # Desde aquí las comisiones variables pertenecen a una quincena concreta.
+    # Los registros históricos sin planilla conservan su comportamiento previo
+    # hasta que se usen al generar la quincena correspondiente.
+    if 'planilla_id' not in payroll_commission_columns:
+        c.execute('ALTER TABLE comisiones_planilla ADD COLUMN planilla_id INTEGER REFERENCES planillas_quincenales(id)')
     c.execute('CREATE INDEX IF NOT EXISTS ix_comisiones_planilla_empleado_fecha ON comisiones_planilla(empleado_id,fecha)')
+    c.execute('CREATE INDEX IF NOT EXISTS ix_comisiones_planilla_planilla ON comisiones_planilla(planilla_id)')
     c.execute('''CREATE TABLE IF NOT EXISTS planillas_quincenales(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         periodo_inicio TEXT NOT NULL,
@@ -885,7 +891,7 @@ def init_db(sync_history=True):
         neto REAL NOT NULL DEFAULT 0
     )''')
     payroll_detail_columns={row['name'] for row in c.execute('PRAGMA table_info(planillas_quincenales_detalle)')}
-    for name, definition in [('departamento_id','INTEGER'),('cuenta_contable_id','INTEGER')]:
+    for name, definition in [('departamento_id','INTEGER'),('cuenta_contable_id','INTEGER'),('bonos_fijos','REAL')]:
         if name not in payroll_detail_columns:
             c.execute(f'ALTER TABLE planillas_quincenales_detalle ADD COLUMN {name} {definition}')
     c.execute('CREATE INDEX IF NOT EXISTS ix_planillas_quincenales_detalle_planilla ON planillas_quincenales_detalle(planilla_id)')
@@ -3226,6 +3232,64 @@ def calcular_planilla_quincenal(c, fecha_referencia):
         ('salario','comisiones','bonos','total_deducciones','neto')}
     return {'periodo_inicio':inicio,'periodo_fin':fin,'empleados':detalles,'totales':totales},None
 
+def actualizar_variables_planilla(c, payroll_id):
+    """Recalcula detalle y encabezado a partir de los registros variables.
+
+    Una planilla en estado Generada todavía es una propuesta revisable.  Por
+    eso la comisión/bono se conserva como línea auditable y el total del
+    detalle se vuelve a calcular cada vez que se agrega o edita una línea.
+    """
+    planilla=c.execute('SELECT * FROM planillas_quincenales WHERE id=?',(payroll_id,)).fetchone()
+    if not planilla:
+        raise ValueError('Planilla no encontrada.')
+    if planilla['estado']!='Generada':
+        raise ValueError('La planilla ya está contabilizada y no admite cambios.')
+    detalles=[dict(row) for row in c.execute('SELECT * FROM planillas_quincenales_detalle WHERE planilla_id=?',(payroll_id,)).fetchall()]
+    for detalle in detalles:
+        variables=c.execute('''SELECT COALESCE(SUM(monto),0) comisiones,COALESCE(SUM(bono),0) bonos
+            FROM comisiones_planilla WHERE planilla_id=? AND empleado_id=?''',(payroll_id,detalle['empleado_id'])).fetchone()
+        if detalle.get('bonos_fijos') is None:
+            # Planillas creadas antes de la mejora: se conserva su parte fija
+            # restando los bonos variables ya incorporados a la quincena.
+            bonos_fijos=round(float(detalle['bonos'] or 0)-float(variables['bonos'] or 0),2)
+            c.execute('UPDATE planillas_quincenales_detalle SET bonos_fijos=? WHERE id=?',(max(0,bonos_fijos),detalle['id']))
+        else:
+            bonos_fijos=round(float(detalle['bonos_fijos'] or 0),2)
+        comisiones_registradas=round(float(variables['comisiones'] or 0),2)
+        comisiones=round(float(detalle['comisiones_fijas'] or 0)+comisiones_registradas,2)
+        bonos=round(bonos_fijos+float(variables['bonos'] or 0),2)
+        devengado=round(float(detalle['salario'] or 0)+comisiones+bonos,2)
+        deducciones=round(float(detalle['ihss'] or 0)+float(detalle['rap'] or 0)+float(detalle['otras_deducciones'] or 0),2)
+        c.execute('''UPDATE planillas_quincenales_detalle
+            SET comisiones_registradas=?,comisiones=?,bonos=?,total_devengado=?,neto=? WHERE id=?''',
+            (comisiones_registradas,comisiones,bonos,devengado,round(devengado-deducciones,2),detalle['id']))
+    totals=c.execute('''SELECT COALESCE(SUM(salario),0) salarios,COALESCE(SUM(comisiones),0) comisiones,
+        COALESCE(SUM(bonos),0) bonos,COALESCE(SUM(ihss+rap+otras_deducciones),0) deducciones,
+        COALESCE(SUM(neto),0) neto FROM planillas_quincenales_detalle WHERE planilla_id=?''',(payroll_id,)).fetchone()
+    c.execute('''UPDATE planillas_quincenales SET total_salarios=?,total_comisiones=?,total_bonos=?,
+        total_deducciones=?,total_neto=? WHERE id=?''',
+        (round(float(totals['salarios']),2),round(float(totals['comisiones']),2),round(float(totals['bonos']),2),
+         round(float(totals['deducciones']),2),round(float(totals['neto']),2),payroll_id))
+
+def vincular_comisiones_historicas_planilla(c, payroll_id):
+    """Asigna a la nueva planilla los registros libres de su período."""
+    planilla=c.execute('SELECT periodo_inicio,periodo_fin FROM planillas_quincenales WHERE id=?',(payroll_id,)).fetchone()
+    if not planilla:
+        return
+    c.execute('''UPDATE comisiones_planilla SET planilla_id=?
+        WHERE planilla_id IS NULL AND fecha BETWEEN ? AND ? AND empleado_id IN
+        (SELECT empleado_id FROM planillas_quincenales_detalle WHERE planilla_id=?)''',
+        (payroll_id,planilla['periodo_inicio'],planilla['periodo_fin'],payroll_id))
+
+def inicializar_bonos_fijos_planilla(c, payroll_id):
+    """Fija la parte no variable de planillas creadas antes de esta mejora."""
+    for detalle in c.execute('SELECT id,empleado_id,bonos,bonos_fijos FROM planillas_quincenales_detalle WHERE planilla_id=?',(payroll_id,)).fetchall():
+        if detalle['bonos_fijos'] is not None:
+            continue
+        variables=c.execute('SELECT COALESCE(SUM(bono),0) bono FROM comisiones_planilla WHERE planilla_id=? AND empleado_id=?',(payroll_id,detalle['empleado_id'])).fetchone()
+        c.execute('UPDATE planillas_quincenales_detalle SET bonos_fijos=? WHERE id=?',
+            (max(0,round(float(detalle['bonos'] or 0)-float(variables['bono'] or 0),2)),detalle['id']))
+
 @app.get('/api/planillas')
 def get_planillas():
     c=db()
@@ -3342,8 +3406,70 @@ def get_planilla_quincenal(payroll_id):
         header=c.execute('SELECT * FROM planillas_quincenales WHERE id=?',(payroll_id,)).fetchone()
         if not header: return jsonify(error='Planilla no encontrada.'),404
         details=c.execute('SELECT * FROM planillas_quincenales_detalle WHERE planilla_id=? ORDER BY empleado_nombre COLLATE NOCASE,id',(payroll_id,)).fetchall()
+        variables=c.execute('''SELECT cp.*,ep.nombre empleado_nombre,ep.numero_identidad
+            FROM comisiones_planilla cp JOIN empleados_planilla ep ON ep.id=cp.empleado_id
+            WHERE cp.planilla_id=? ORDER BY cp.id DESC''',(payroll_id,)).fetchall()
         result=dict(header); result['empleados']=[dict(row) for row in details]
+        result['comisiones_variables']=[dict(row) for row in variables]
         return jsonify(result)
+    finally:
+        c.close()
+
+@app.post('/api/planillas/quincenas/<int:payroll_id>/comisiones')
+def registrar_comision_en_planilla(payroll_id):
+    data=request.get_json(silent=True) or {}
+    try:
+        empleado_id=int(data.get('empleado_id') or 0)
+        monto=round(float(data.get('monto') or 0),2)
+        bono=round(float(data.get('bono') or 0),2)
+    except (TypeError,ValueError):
+        return jsonify(error='El empleado, la comisión y el bono deben ser valores válidos.'),400
+    if not empleado_id or monto<0 or bono<0 or not (monto or bono):
+        return jsonify(error='Indique un empleado y una comisión o bono mayor que cero.'),400
+    c=db()
+    try:
+        planilla=c.execute('SELECT * FROM planillas_quincenales WHERE id=?',(payroll_id,)).fetchone()
+        if not planilla: return jsonify(error='Planilla no encontrada.'),404
+        if planilla['estado']!='Generada': return jsonify(error='La planilla ya está contabilizada y no admite cambios.'),409
+        if not c.execute('SELECT 1 FROM planillas_quincenales_detalle WHERE planilla_id=? AND empleado_id=?',(payroll_id,empleado_id)).fetchone():
+            return jsonify(error='El empleado no forma parte de esta planilla.'),400
+        vincular_comisiones_historicas_planilla(c,payroll_id)
+        inicializar_bonos_fijos_planilla(c,payroll_id)
+        cur=c.execute('''INSERT INTO comisiones_planilla(empleado_id,fecha,monto,bono,descripcion,planilla_id)
+            VALUES(?,?,?,?,?,?)''',(empleado_id,planilla['periodo_fin'],monto,bono,(data.get('descripcion') or '').strip() or None,payroll_id))
+        actualizar_variables_planilla(c,payroll_id)
+        c.commit()
+        row=c.execute('''SELECT cp.*,ep.nombre empleado_nombre,ep.numero_identidad FROM comisiones_planilla cp
+            JOIN empleados_planilla ep ON ep.id=cp.empleado_id WHERE cp.id=?''',(cur.lastrowid,)).fetchone()
+        return jsonify(dict(row)),201
+    except ValueError as error:
+        c.rollback(); return jsonify(error=str(error)),400
+    finally:
+        c.close()
+
+@app.put('/api/planillas/quincenas/<int:payroll_id>/comisiones/<int:commission_id>')
+def actualizar_comision_en_planilla(payroll_id, commission_id):
+    data=request.get_json(silent=True) or {}
+    try:
+        monto=round(float(data.get('monto') or 0),2)
+        bono=round(float(data.get('bono') or 0),2)
+    except (TypeError,ValueError):
+        return jsonify(error='La comisión y el bono deben ser valores válidos.'),400
+    if monto<0 or bono<0 or not (monto or bono):
+        return jsonify(error='Indique una comisión o bono mayor que cero.'),400
+    c=db()
+    try:
+        planilla=c.execute('SELECT estado FROM planillas_quincenales WHERE id=?',(payroll_id,)).fetchone()
+        if not planilla: return jsonify(error='Planilla no encontrada.'),404
+        if planilla['estado']!='Generada': return jsonify(error='La planilla ya está contabilizada y no admite cambios.'),409
+        if not c.execute('SELECT 1 FROM comisiones_planilla WHERE id=? AND planilla_id=?',(commission_id,payroll_id)).fetchone():
+            return jsonify(error='Registro de comisión no encontrado en esta planilla.'),404
+        c.execute('UPDATE comisiones_planilla SET monto=?,bono=?,descripcion=? WHERE id=?',(monto,bono,(data.get('descripcion') or '').strip() or None,commission_id))
+        actualizar_variables_planilla(c,payroll_id)
+        c.commit()
+        return jsonify(ok=True)
+    except ValueError as error:
+        c.rollback(); return jsonify(error=str(error)),400
     finally:
         c.close()
 
@@ -3477,9 +3603,11 @@ def generar_planilla_quincenal():
             totals['salario'],totals['comisiones'],totals['bonos'],totals['total_deducciones'],totals['neto']))
         for detail in calculo['empleados']:
             c.execute('''INSERT INTO planillas_quincenales_detalle(planilla_id,empleado_id,empleado_nombre,numero_identidad,departamento_id,cuenta_contable_id,departamento_nombre,cuenta_contable_nombre,
-                salario,comisiones_fijas,comisiones_registradas,comisiones,bonos,ihss,rap,otras_deducciones,total_devengado,neto)
+                salario,comisiones_fijas,comisiones_registradas,comisiones,bonos,bonos_fijos,ihss,rap,otras_deducciones,total_devengado,neto)
                 VALUES(:planilla_id,:empleado_id,:empleado_nombre,:numero_identidad,:departamento_id,:cuenta_contable_id,:departamento_nombre,:cuenta_contable_nombre,:salario,:comisiones_fijas,
-                :comisiones_registradas,:comisiones,:bonos,:ihss,:rap,:otras_deducciones,:total_devengado,:neto)''',dict(detail,planilla_id=cur.lastrowid))
+                :comisiones_registradas,:comisiones,:bonos,:bonos_fijos,:ihss,:rap,:otras_deducciones,:total_devengado,:neto)''',dict(detail,planilla_id=cur.lastrowid,bonos_fijos=round(float(detail['bonos'] or 0)-float(detail.get('bonos_registrados') or 0),2)))
+        vincular_comisiones_historicas_planilla(c,cur.lastrowid)
+        actualizar_variables_planilla(c,cur.lastrowid)
         c.commit()
         return jsonify(id=cur.lastrowid,**calculo),201
     finally:
