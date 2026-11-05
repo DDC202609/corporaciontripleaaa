@@ -2,6 +2,7 @@ from flask import Flask, request, jsonify, send_from_directory, send_file, sessi
 from werkzeug.exceptions import HTTPException
 from werkzeug.security import check_password_hash, generate_password_hash
 import sqlite3, os, shutil, uuid, hmac, io, json, tempfile, zipfile, re, csv, calendar
+from xml.sax.saxutils import escape as xml_escape
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 ROOT=os.path.dirname(os.path.abspath(__file__))
@@ -3902,24 +3903,28 @@ def get_ventas():
         result.append(sale)
     c.close(); return jsonify(result)
 
-@app.get('/api/reportes/ventas')
-def reporte_ventas_por_fechas():
-    """Reporte comercial de solo lectura, separado de la boleta de ventas."""
+def validar_acceso_reporte_ventas():
     def alias_normalizado(value):
         return re.sub(r'[^a-z0-9]', '',str(value or '').strip().casefold().split('@',1)[0])
     # Es una restricción personal adicional al permiso del módulo: aunque el
     # perfil de a.lorenzo cambie posteriormente, este reporte no se expone.
     if alias_normalizado(session.get('username'))==alias_normalizado(COSTEO_NACIONALIZACION_USERNAME):
-        return jsonify(error='No tiene acceso al reporte de ventas.'),403
+        return 'No tiene acceso al reporte de ventas.'
+    return None
+
+def parametros_reporte_ventas():
     desde=(request.args.get('desde') or '').strip()
     hasta=(request.args.get('hasta') or '').strip()
     try:
         if desde: datetime.strptime(desde,'%Y-%m-%d')
         if hasta: datetime.strptime(hasta,'%Y-%m-%d')
     except ValueError:
-        return jsonify(error='El rango de fechas no es válido.'),400
+        return None,None,'El rango de fechas no es válido.'
     if desde and hasta and desde>hasta:
-        return jsonify(error='La fecha Desde no puede ser posterior a Hasta.'),400
+        return None,None,'La fecha Desde no puede ser posterior a Hasta.'
+    return desde,hasta,None
+
+def filas_reporte_ventas(desde,hasta):
     c=db()
     try:
         sql='''SELECT ve.id,ve.vehiculo_id,ve.numero_transaccion,ve.correlativo,ve.fecha,
@@ -3938,9 +3943,63 @@ def reporte_ventas_por_fechas():
             venta=round(float(sale['precio'] or 0),2)
             sale.update(costo=costo,venta=venta,margen_bruto=round(venta-costo,2),margen_bruto_pct=round((venta-costo)/venta*100,2) if venta else 0)
             rows.append(sale)
-        return jsonify(rows)
+        return rows
     finally:
         c.close()
+
+def archivo_excel_ventas(rows):
+    """Genera un XLSX ligero sin depender de paquetes externos en Render."""
+    headers=['No. transacción','Fecha','Marca','Versión','Modelo','VIN','Año vehículo','Costo','Precio lista','Venta','MB %','Vendedor']
+    columns=['numero_transaccion','fecha','marca','version','modelo','vin','anio','costo','precio_lista','venta','margen_bruto_pct','vendedor_nombre']
+    def col(index):
+        text=''
+        while index:
+            index,remainder=divmod(index-1,26); text=chr(65+remainder)+text
+        return text
+    def cell(reference,value,style=None,numeric=False):
+        style_attr=f' s="{style}"' if style is not None else ''
+        if numeric:
+            return f'<c r="{reference}"{style_attr}><v>{float(value or 0)}</v></c>'
+        safe=xml_escape(str(value if value not in (None,'') else '—'))
+        return f'<c r="{reference}"{style_attr} t="inlineStr"><is><t>{safe}</t></is></c>'
+    lines=['<row r="1">'+''.join(cell(f'{col(index)}1',value,1) for index,value in enumerate(headers,1))+'</row>']
+    numeric={'anio','costo','precio_lista','venta','margen_bruto_pct'}
+    styles={'costo':2,'precio_lista':2,'venta':2,'margen_bruto_pct':3}
+    for row_number,row in enumerate(rows,2):
+        values=[]
+        for index,key in enumerate(columns,1):
+            value=row.get(key)
+            if key=='margen_bruto_pct': value=float(value or 0)/100
+            values.append(cell(f'{col(index)}{row_number}',value,styles.get(key),key in numeric))
+        lines.append(f'<row r="{row_number}">'+''.join(values)+'</row>')
+    sheet='<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews><sheetFormatPr defaultRowHeight="15"/><cols>'+''.join(f'<col min="{index}" max="{index}" width="{width}" customWidth="1"/>' for index,width in enumerate((18,13,15,16,18,22,14,16,16,16,11,24),1))+'</cols><sheetData>'+''.join(lines)+'</sheetData><autoFilter ref="A1:L'+str(max(1,len(rows)+1))+'"/></worksheet>'
+    styles_xml='<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><numFmts count="2"><numFmt numFmtId="164" formatCode="&quot;L&quot; #,##0.00"/><numFmt numFmtId="165" formatCode="0.00%"/></numFmts><fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><color rgb="FFFFFFFF"/><sz val="11"/><name val="Calibri"/></font></fonts><fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FF175CD3"/><bgColor indexed="64"/></patternFill></fill></fills><borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellXfs count="4"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/><xf numFmtId="0" fontId="1" fillId="1" borderId="0" applyFont="1" applyFill="1"/><xf numFmtId="164" fontId="0" fillId="0" borderId="0" applyNumberFormat="1"/><xf numFmtId="165" fontId="0" fillId="0" borderId="0" applyNumberFormat="1"/></cellXfs></styleSheet>'
+    output=io.BytesIO()
+    with zipfile.ZipFile(output,'w',zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr('[Content_Types].xml','<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>')
+        archive.writestr('_rels/.rels','<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>')
+        archive.writestr('xl/workbook.xml','<?xml version="1.0" encoding="UTF-8"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Ventas" sheetId="1" r:id="rId1"/></sheets></workbook>')
+        archive.writestr('xl/_rels/workbook.xml.rels','<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>')
+        archive.writestr('xl/styles.xml',styles_xml); archive.writestr('xl/worksheets/sheet1.xml',sheet)
+    output.seek(0); return output
+
+@app.get('/api/reportes/ventas')
+def reporte_ventas_por_fechas():
+    error=validar_acceso_reporte_ventas()
+    if error: return jsonify(error=error),403
+    desde,hasta,error=parametros_reporte_ventas()
+    if error: return jsonify(error=error),400
+    return jsonify(filas_reporte_ventas(desde,hasta))
+
+@app.get('/api/reportes/ventas/exportar')
+def exportar_reporte_ventas_excel():
+    error=validar_acceso_reporte_ventas()
+    if error: return jsonify(error=error),403
+    desde,hasta,error=parametros_reporte_ventas()
+    if error: return jsonify(error=error),400
+    suffix=f'{desde or "inicio"}_a_{hasta or "hoy"}'
+    return send_file(archivo_excel_ventas(filas_reporte_ventas(desde,hasta)),as_attachment=True,
+        download_name=f'reporte_ventas_{suffix}.xlsx',mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
 
 @app.get('/api/ventas/<int:sid>')
 def get_venta(sid):
