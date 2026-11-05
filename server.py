@@ -42,7 +42,7 @@ ACCESS_MODULES=(
     ('ventas','Ventas y cobros'),('vendedores','Vendedores'),('inventario','Consulta de inventario'),('conteo_inventario','Conteo físico de inventario'),
     ('catalogo','Catálogo contable'),('centros_costo','Centros de costo'),('cartera','Cuentas por cobrar y pagar'),('contabilidad','Contabilidad'),
     ('caja_bancos','Caja y bancos'),('gastos','Registro de gastos'),('comisiones','Comisiones'),('planillas','Planillas'),('contratos','Contratos'),
-    ('planificacion_financiera','Planificación financiera'),('planificacion_compra','Planificación de compra'),('auditoria','Bitácora de auditoría'),
+    ('planificacion_financiera','Planificación financiera'),('planificacion_compra','Planificación de compra'),('reporte_ventas','Reporte de ventas'),('auditoria','Bitácora de auditoría'),
 )
 
 def init_access_control_schema():
@@ -84,9 +84,9 @@ def init_access_control_schema():
                   (name,description,is_admin,is_system))
     profiles={row['nombre']:row['id'] for row in c.execute('SELECT id,nombre FROM perfiles')}
     all_modules={key for key,_ in ACCESS_MODULES}
-    operational={'dashboard','vehiculos','informacion_vehiculo','proveedores','adquisiciones','taller','costeo','ventas','inventario','conteo_inventario','catalogo','centros_costo','vendedores','gastos','cartera','planificacion_compra','planillas'}
+    operational={'dashboard','vehiculos','informacion_vehiculo','proveedores','adquisiciones','taller','costeo','ventas','inventario','conteo_inventario','catalogo','centros_costo','vendedores','gastos','cartera','planificacion_compra','planillas','reporte_ventas'}
     sales={'dashboard','vehiculos','ventas','vendedores','inventario','caja_bancos','comisiones'}
-    consultation={'dashboard','vehiculos','inventario','conteo_inventario','contabilidad','caja_bancos','ventas'}
+    consultation={'dashboard','vehiculos','inventario','conteo_inventario','contabilidad','caja_bancos','ventas','reporte_ventas'}
     for profile_name,allowed in (('Administrador',all_modules),('Operaciones',operational),('Ventas',sales),('Consulta',consultation)):
         profile_id=profiles.get(profile_name)
         if not profile_id: continue
@@ -155,6 +155,7 @@ def request_module(path):
     if path.startswith('/api/dashboard'): return 'dashboard'
     if path.startswith('/api/planificacion-financiera'): return 'planificacion_financiera'
     if path.startswith('/api/planificacion-compra'): return 'planificacion_compra'
+    if path.startswith('/api/reportes/ventas'): return 'reporte_ventas'
     if path.startswith('/api/conteos-inventario'): return 'conteo_inventario'
     if path.startswith('/api/contabilidad'): return 'contabilidad'
     if path.startswith('/api/cuentas-por-'): return 'cartera'
@@ -633,6 +634,11 @@ def init_db(sync_history=True):
     sale_columns={row['name'] for row in c.execute('PRAGMA table_info(ventas)')}
     if 'factura' not in sale_columns:
         c.execute('ALTER TABLE ventas ADD COLUMN factura TEXT')
+    if 'precio_lista' not in sale_columns:
+        c.execute('ALTER TABLE ventas ADD COLUMN precio_lista REAL')
+        # Antes se guardaban el precio final y el descuento. Su suma recupera
+        # el precio de lista histórico sin alterar ninguna venta facturada.
+        c.execute('UPDATE ventas SET precio_lista=COALESCE(precio,0)+COALESCE(descuento,0) WHERE precio_lista IS NULL')
     for name, definition in [('correlativo','INTEGER'),('numero_transaccion','TEXT'),('tipo_venta','TEXT'),('forma_pago','TEXT'),('financiera_banco','TEXT'),('monto_financiado','REAL NOT NULL DEFAULT 0'),('transferencia','REAL NOT NULL DEFAULT 0'),('observaciones','TEXT')]:
         if name not in sale_columns:
             c.execute(f'ALTER TABLE ventas ADD COLUMN {name} {definition}')
@@ -3896,6 +3902,46 @@ def get_ventas():
         result.append(sale)
     c.close(); return jsonify(result)
 
+@app.get('/api/reportes/ventas')
+def reporte_ventas_por_fechas():
+    """Reporte comercial de solo lectura, separado de la boleta de ventas."""
+    def alias_normalizado(value):
+        return re.sub(r'[^a-z0-9]', '',str(value or '').strip().casefold().split('@',1)[0])
+    # Es una restricción personal adicional al permiso del módulo: aunque el
+    # perfil de a.lorenzo cambie posteriormente, este reporte no se expone.
+    if alias_normalizado(session.get('username'))==alias_normalizado(COSTEO_NACIONALIZACION_USERNAME):
+        return jsonify(error='No tiene acceso al reporte de ventas.'),403
+    desde=(request.args.get('desde') or '').strip()
+    hasta=(request.args.get('hasta') or '').strip()
+    try:
+        if desde: datetime.strptime(desde,'%Y-%m-%d')
+        if hasta: datetime.strptime(hasta,'%Y-%m-%d')
+    except ValueError:
+        return jsonify(error='El rango de fechas no es válido.'),400
+    if desde and hasta and desde>hasta:
+        return jsonify(error='La fecha Desde no puede ser posterior a Hasta.'),400
+    c=db()
+    try:
+        sql='''SELECT ve.id,ve.vehiculo_id,ve.numero_transaccion,ve.correlativo,ve.fecha,
+            COALESCE(ve.precio_lista,COALESCE(ve.precio,0)+COALESCE(ve.descuento,0)) precio_lista,ve.precio,ve.descuento,
+            v.vin,v.marca,v.version,v.modelo,v.anio,ven.nombre vendedor_nombre
+            FROM ventas ve JOIN vehiculos v ON v.id=ve.vehiculo_id
+            LEFT JOIN vendedores ven ON ven.id=ve.vendedor_id WHERE 1=1'''
+        args=[]
+        if desde:
+            sql+=' AND ve.fecha>=?'; args.append(desde)
+        if hasta:
+            sql+=' AND ve.fecha<=?'; args.append(hasta)
+        rows=[]
+        for row in c.execute(sql+' ORDER BY COALESCE(ve.correlativo,0) DESC,ve.id DESC',args).fetchall():
+            sale=dict(row); costo=round(float(costo_consolidado(c,sale['vehiculo_id']) or 0),2)
+            venta=round(float(sale['precio'] or 0),2)
+            sale.update(costo=costo,venta=venta,margen_bruto=round(venta-costo,2),margen_bruto_pct=round((venta-costo)/venta*100,2) if venta else 0)
+            rows.append(sale)
+        return jsonify(rows)
+    finally:
+        c.close()
+
 @app.get('/api/ventas/<int:sid>')
 def get_venta(sid):
     c=db(); sale=c.execute('''SELECT ve.*,v.vin,v.placa,v.marca,v.modelo,v.version,v.anio,v.color,v.ubicacion,
@@ -4076,8 +4122,8 @@ def post_venta():
     for pago in pagos_limpios:
         if pago['tipo_pago']=='Financiado': pago['referencia']=factura
     try:
-        cur=c.execute('''INSERT INTO ventas(vehiculo_id,cliente_id,vendedor_id,fecha,precio,descuento,prima,saldo,estado,factura,correlativo,numero_transaccion,tipo_venta,forma_pago,financiera_banco,monto_financiado,transferencia,observaciones,garantia_dias,fee_administrativo_pct,fee_administrativo_monto)
-            VALUES(?,?,?,?,?,?,?,?,'Facturada',?,?,?,?,?,?,?,?,?,?,?,?)''',(vid,client_id,vendedor_id,d.get('fecha') or datetime.now().strftime('%Y-%m-%d'),precio,descuento,prima,saldo,factura,correlativo,numero,d.get('tipo_venta'),'Registro de pagos',d.get('financiera_banco'),financiado,transferencia,d.get('observaciones'),garantia_dias,fee_pct,fee_monto))
+        cur=c.execute('''INSERT INTO ventas(vehiculo_id,cliente_id,vendedor_id,fecha,precio_lista,precio,descuento,prima,saldo,estado,factura,correlativo,numero_transaccion,tipo_venta,forma_pago,financiera_banco,monto_financiado,transferencia,observaciones,garantia_dias,fee_administrativo_pct,fee_administrativo_monto)
+            VALUES(?,?,?,?,?,?,?,?,?,'Facturada',?,?,?,?,?,?,?,?,?,?,?,?)''',(vid,client_id,vendedor_id,d.get('fecha') or datetime.now().strftime('%Y-%m-%d'),lista,precio,descuento,prima,saldo,factura,correlativo,numero,d.get('tipo_venta'),'Registro de pagos',d.get('financiera_banco'),financiado,transferencia,d.get('observaciones'),garantia_dias,fee_pct,fee_monto))
         for pago in pagos_limpios:
             financiera=c.execute("SELECT nombre FROM clientes WHERE id=? AND tipo='Financiera' AND activo=1",(pago['financiera_cliente_id'],)).fetchone() if pago['financiera_cliente_id'] else None
             if pago['tipo_pago']=='Financiado' and not financiera:
