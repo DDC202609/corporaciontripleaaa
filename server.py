@@ -3422,6 +3422,24 @@ def get_planilla_quincenal(payroll_id):
     finally:
         c.close()
 
+@app.put('/api/planillas/quincenas/<int:payroll_id>/fecha-generacion')
+def actualizar_fecha_generacion_planilla(payroll_id):
+    """Corrige la fecha administrativa de generación sin tocar pago ni pólizas."""
+    data=request.get_json(silent=True) or {}
+    fecha=fecha_planilla(data.get('fecha_generacion'))
+    if not fecha:
+        return jsonify(error='Indique una fecha de generación válida.'),400
+    c=db()
+    try:
+        planilla=c.execute('SELECT id FROM planillas_quincenales WHERE id=?',(payroll_id,)).fetchone()
+        if not planilla:
+            return jsonify(error='Planilla no encontrada.'),404
+        c.execute('UPDATE planillas_quincenales SET fecha_generacion=? WHERE id=?',(fecha.isoformat(),payroll_id))
+        c.commit()
+        return jsonify(ok=True,id=payroll_id,fecha_generacion=fecha.isoformat())
+    finally:
+        c.close()
+
 @app.post('/api/planillas/quincenas/<int:payroll_id>/comisiones')
 def registrar_comision_en_planilla(payroll_id):
     data=request.get_json(silent=True) or {}
