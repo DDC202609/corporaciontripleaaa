@@ -1736,12 +1736,18 @@ async function savePayrollRunCommission(event){
   closePayrollRunCommission();showNotice(commissionId?'Comisión actualizada en la planilla.':'Comisión agregada a la planilla.');
   await loadPayroll();await viewPayrollRun(id);
 }
+async function deletePayrollRunCommission(payrollId,commissionId){
+  if(!confirm('¿Eliminar este registro de comisión o bono? La planilla se recalculará.'))return;
+  let response=await fetch(`/api/planillas/quincenas/${Number(payrollId)}/comisiones/${Number(commissionId)}`,{method:'DELETE'}),result=await response.json();
+  if(!response.ok)return showNotice(result.error||'No se pudo eliminar el registro.','error');
+  showNotice('Registro de comisión eliminado.');await loadPayroll();await viewPayrollRun(payrollId);
+}
 viewPayrollRun=async function(id){
   let response=await fetch(`/api/planillas/quincenas/${id}`),run=await response.json();
   if(!response.ok)return showNotice(run.error||'No se pudo consultar la planilla.','error');
   selectedPayrollRun=run;
   let editable=run.estado==='Generada',variables=run.comisiones_variables||[];
-  let records=variables.map(row=>`<tr><td>${esc(row.empleado_nombre)}</td><td>${esc(row.descripcion||'—')}</td><td>${money(row.monto)}</td><td>${money(row.bono)}</td><td>${editable?`<button class="btn2" type="button" onclick="payrollRunCommissionModal(selectedPayrollRun,selectedPayrollRun.comisiones_variables.find(item=>Number(item.id)===${Number(row.id)}))">Editar</button>`:'—'}</td></tr>`).join('')||'<tr><td colspan="5" class="sub">No hay comisiones o bonos variables registrados en esta planilla.</td></tr>';
+  let records=variables.map(row=>`<tr><td>${esc(row.empleado_nombre)}</td><td>${esc(row.descripcion||'—')}</td><td>${money(row.monto)}</td><td>${money(row.bono)}</td><td>${editable?`<button class="btn2" type="button" onclick="payrollRunCommissionModal(selectedPayrollRun,selectedPayrollRun.comisiones_variables.find(item=>Number(item.id)===${Number(row.id)}))">Editar</button> <button class="danger" type="button" onclick="deletePayrollRunCommission(${Number(run.id)},${Number(row.id)})">Eliminar</button>`:'—'}</td></tr>`).join('')||'<tr><td colspan="5" class="sub">No hay comisiones o bonos variables registrados en esta planilla.</td></tr>';
   $('payrollRunDetail').innerHTML=`<div class="panel wide-table"><div class="detailhead"><div><h2 style="margin:0">Detalle · ${payrollDate(run.periodo_inicio)} – ${payrollDate(run.periodo_fin)}</h2><div class="sub">${editable?'Planilla generada, pendiente de contabilizar.':'Planilla contabilizada y pagada; solo consulta.'}</div></div>${editable?'<button class="primary" type="button" onclick="payrollRunCommissionModal(selectedPayrollRun)">+ Registrar comisión</button>':''}</div><table><thead><tr><th>Empleado</th><th>Salario</th><th>Comisiones</th><th>Bonos</th><th>IHSS</th><th>RAP</th><th>Otras ded.</th><th>Neto</th></tr></thead><tbody>${run.empleados.map(row=>`<tr><td><b>${esc(row.empleado_nombre)}</b><br><span class="sub">${esc(row.numero_identidad)}</span></td><td>${money(row.salario)}</td><td>${money(row.comisiones)}</td><td>${money(row.bonos)}</td><td>${money(row.ihss)}</td><td>${money(row.rap)}</td><td>${money(row.otras_deducciones)}</td><td><b>${money(row.neto)}</b></td></tr>`).join('')}</tbody></table><div style="margin-top:22px"><h3 style="margin:0 0 8px">Comisiones y bonos registrados</h3><table><thead><tr><th>Empleado</th><th>Descripción</th><th>Comisión</th><th>Bono</th><th></th></tr></thead><tbody>${records}</tbody></table></div></div>`;
   $('payrollRunDetail').scrollIntoView({behavior:'smooth',block:'nearest'});
 };

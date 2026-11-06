@@ -3480,6 +3480,25 @@ def actualizar_comision_en_planilla(payroll_id, commission_id):
     finally:
         c.close()
 
+@app.delete('/api/planillas/quincenas/<int:payroll_id>/comisiones/<int:commission_id>')
+def eliminar_comision_en_planilla(payroll_id, commission_id):
+    """Elimina una línea variable solo antes de contabilizar la planilla."""
+    c=db()
+    try:
+        planilla=c.execute('SELECT estado FROM planillas_quincenales WHERE id=?',(payroll_id,)).fetchone()
+        if not planilla: return jsonify(error='Planilla no encontrada.'),404
+        if planilla['estado']!='Generada': return jsonify(error='La planilla ya está contabilizada y no admite cambios.'),409
+        registro=c.execute('SELECT id FROM comisiones_planilla WHERE id=? AND planilla_id=?',(commission_id,payroll_id)).fetchone()
+        if not registro: return jsonify(error='Registro de comisión no encontrado en esta planilla.'),404
+        c.execute('DELETE FROM comisiones_planilla WHERE id=?',(commission_id,))
+        actualizar_variables_planilla(c,payroll_id)
+        c.commit()
+        return jsonify(ok=True)
+    except ValueError as error:
+        c.rollback(); return jsonify(error=str(error)),400
+    finally:
+        c.close()
+
 def lineas_reclasificacion_planilla(c, payroll_id):
     """Devuelve el ajuste que reclasifica el gasto ya pagado, sin tocar banco."""
     detalles=[dict(row) for row in c.execute('SELECT * FROM planillas_quincenales_detalle WHERE planilla_id=?',(payroll_id,)).fetchall()]
