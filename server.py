@@ -775,7 +775,7 @@ def init_db(sync_history=True):
         origen_clave TEXT UNIQUE NOT NULL, creado_en TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     )''')
     gasto_columns={row['name'] for row in c.execute('PRAGMA table_info(gastos_operativos)')}
-    for name, definition in [('concepto_id','INTEGER REFERENCES conceptos_gasto(id)'),('proveedor_id','INTEGER REFERENCES proveedores(id)'),('referencia','TEXT'),('observaciones','TEXT')]:
+    for name, definition in [('concepto_id','INTEGER REFERENCES conceptos_gasto(id)'),('proveedor_id','INTEGER REFERENCES proveedores(id)'),('vehiculo_id','INTEGER REFERENCES vehiculos(id) ON DELETE SET NULL'),('referencia','TEXT'),('observaciones','TEXT')]:
         if name not in gasto_columns:
             c.execute(f'ALTER TABLE gastos_operativos ADD COLUMN {name} {definition}')
     c.execute('CREATE INDEX IF NOT EXISTS ix_gastos_operativos_fecha ON gastos_operativos(fecha DESC,id DESC)')
@@ -2177,13 +2177,24 @@ def get_gastos_operativos():
     desde,hasta=rango_reporte(); where,args=filtro_fechas('go.fecha',desde,hasta)
     c=db(); sql='''SELECT go.*,go.fecha fecha_pago,go.proveedor proveedor_nombre,COALESCE(cg.nombre,go.categoria) concepto,
         cc.codigo cuenta_codigo,cc.cuenta cuenta_nombre,
-        p.nombre proveedor_maestro
+        p.nombre proveedor_maestro,v.vin vehiculo_vin,v.marca vehiculo_marca,v.modelo vehiculo_modelo,v.placa vehiculo_placa
         FROM gastos_operativos go
         LEFT JOIN conceptos_gasto cg ON cg.id=go.concepto_id
         LEFT JOIN cuentas_contables cc ON cc.id=cg.cuenta_id
-        LEFT JOIN proveedores p ON p.id=go.proveedor_id'''
+        LEFT JOIN proveedores p ON p.id=go.proveedor_id
+        LEFT JOIN vehiculos v ON v.id=go.vehiculo_id'''
     if where: sql+=' WHERE '+' AND '.join(where)
     rows=[dict(row) for row in c.execute(sql+' ORDER BY go.fecha DESC,go.id DESC',args).fetchall()]
+    c.close(); return jsonify(rows)
+
+@app.get('/api/gastos-operativos/vehiculos')
+def get_vehiculos_para_combustible():
+    """Un combustible debe identificar una unidad que siga disponible internamente."""
+    c=db()
+    rows=[dict(row) for row in c.execute('''SELECT id,vin,marca,modelo,placa,estado
+        FROM vehiculos
+        WHERE estado NOT IN ('En Tránsito','Vendido')
+        ORDER BY vin COLLATE NOCASE''').fetchall()]
     c.close(); return jsonify(rows)
 
 @app.post('/api/gastos-operativos')
@@ -2219,16 +2230,30 @@ def post_gasto_operativo():
         WHERE cg.id=? AND cg.activo=1''',(concepto_id,)).fetchone()
     if not concepto or not concepto['activo'] or not concepto['acepta_movimiento']:
         c.close(); return jsonify(error='El concepto o su cuenta contable no está disponible.'),400
+    vehiculo_id=data.get('vehiculo_id')
+    try:
+        vehiculo_id=int(vehiculo_id) if vehiculo_id not in (None,'') else None
+    except (TypeError,ValueError):
+        c.close(); return jsonify(error='El vehículo seleccionado no es válido.'),400
+    es_combustible=(concepto['nombre'] or '').strip().casefold()=='combustibles'
+    if es_combustible:
+        if not vehiculo_id:
+            c.close(); return jsonify(error='Para registrar Combustibles debe seleccionar el VIN del vehículo.'),400
+        vehiculo=c.execute('SELECT id,estado FROM vehiculos WHERE id=?',(vehiculo_id,)).fetchone()
+        if not vehiculo or vehiculo['estado'] in {'En Tránsito','Vendido'}:
+            c.close(); return jsonify(error='El vehículo seleccionado no está disponible para registrar combustible.'),400
+    else:
+        vehiculo_id=None
     proveedor=c.execute('SELECT id FROM proveedores WHERE nombre=?',(proveedor_nombre,)).fetchone()
     isv_cuenta=c.execute("SELECT id FROM cuentas_contables WHERE codigo='1106' AND activo=1 AND acepta_movimiento=1").fetchone()
     try:
         caja_id=cuenta_contable_id(c,'caja_bancos')
         if isv and not isv_cuenta:
             raise ValueError('No existe la cuenta activa 1106 · ISV Acreditable.')
-        cur=c.execute('''INSERT INTO gastos_operativos(concepto_id,proveedor_id,fecha,categoria,clasificacion,proveedor,
+        cur=c.execute('''INSERT INTO gastos_operativos(concepto_id,proveedor_id,vehiculo_id,fecha,categoria,clasificacion,proveedor,
             documento,subtotal,isv,total,forma_pago,banco,origen_clave,referencia,observaciones)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
-            (concepto_id,proveedor['id'] if proveedor else None,fecha,concepto['nombre'],'Gasto operativo',proveedor_nombre,
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+            (concepto_id,proveedor['id'] if proveedor else None,vehiculo_id,fecha,concepto['nombre'],'Gasto operativo',proveedor_nombre,
              (data.get('documento') or '').strip() or None,subtotal,isv,total,forma_pago,banco or None,
              f'gasto_operativo:{uuid.uuid4().hex}',referencia or None,(data.get('observaciones') or '').strip() or None))
         gasto_id=cur.lastrowid
@@ -2236,7 +2261,7 @@ def post_gasto_operativo():
         if isv: lineas.append({'cuenta_id':isv_cuenta['id'],'debe':isv,'haber':0})
         lineas.append({'cuenta_id':caja_id,'debe':0,'haber':total})
         descripcion=f"Pago de gasto · {concepto['nombre']} · {proveedor_nombre}"
-        registrar_asiento(c,fecha,descripcion,'gasto_operativo',gasto_id,lineas)
+        registrar_asiento(c,fecha,descripcion,'gasto_operativo',gasto_id,lineas,vehiculo_id)
         medio,banco_movimiento=medio_caja(forma_pago,banco)
         registrar_movimiento_caja(c,fecha,'Pago de gasto',medio,banco_movimiento,0,total,descripcion,'gasto_operativo',gasto_id)
         c.commit()

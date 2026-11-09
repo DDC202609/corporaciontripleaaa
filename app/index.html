@@ -480,6 +480,36 @@ function openExpenseConceptModal(id=null){let form=$('expenseConceptForm');form.
 function closeExpenseConceptModal(){$('expenseConceptModal').classList.add('hidden')}
 async function saveExpenseConcept(event){event.preventDefault();let form=event.target,data=Object.fromEntries(new FormData(form).entries());data.cuenta_id=Number(data.cuenta_id);data.activo=form.elements.activo.checked;let id=form.elements.id.value,method=id?'PUT':'POST',url=id?'/api/conceptos-gasto/'+id:'/api/conceptos-gasto',response=await fetch(url,{method,headers:{'Content-Type':'application/json'},body:JSON.stringify(data)}),result=await response.json();if(!response.ok)return showNotice(result.error||'No se pudo guardar el concepto.','error');closeExpenseConceptModal();showNotice('Concepto de gasto actualizado.');await loadExpenses()}
 $('expenseForm')?.elements.concepto_id.addEventListener('change',updateExpenseAccountHint);
+/* Combustibles siempre identifica el vehículo atendido. La validación del
+   formulario complementa (no sustituye) la validación del servidor. */
+let expenseVehicles=[];
+const expenseVehicleField=document.createElement('div');
+expenseVehicleField.id='expenseVehicleField';
+expenseVehicleField.className='field hidden';
+expenseVehicleField.innerHTML='<label>Vehículo / VIN *</label><select name="vehiculo_id"><option value="">Seleccione vehículo</option></select><div class="sub">Para Combustibles, seleccione la unidad. No se muestran vehículos en tránsito ni vendidos.</div>';
+$('expenseForm')?.elements.concepto_id.closest('.field')?.insertAdjacentElement('afterend',expenseVehicleField);
+function refreshExpenseVehicleRequirement(){
+  const form=$('expenseForm'),field=$('expenseVehicleField');
+  if(!form||!field)return;
+  const concept=expenseConcepts.find(item=>String(item.id)===String(form.elements.concepto_id.value));
+  const isFuel=(concept?.nombre||'').trim().toLocaleLowerCase()==='combustibles';
+  field.classList.toggle('hidden',!isFuel);
+  form.elements.vehiculo_id.required=isFuel;
+  if(!isFuel)form.elements.vehiculo_id.value='';
+}
+const updateExpenseAccountHintWithVehicle=updateExpenseAccountHint;
+updateExpenseAccountHint=function(){updateExpenseAccountHintWithVehicle();refreshExpenseVehicleRequirement()};
+$('expenseForm')?.elements.concepto_id.addEventListener('change',refreshExpenseVehicleRequirement);
+const resetExpenseFormWithVehicle=resetExpenseForm;
+resetExpenseForm=function(){resetExpenseFormWithVehicle();setTimeout(refreshExpenseVehicleRequirement,0)};
+const loadExpensesWithVehicleSelector=loadExpenses;
+loadExpenses=async function(){
+  await loadExpensesWithVehicleSelector();
+  expenseVehicles=await get('/api/gastos-operativos/vehiculos');
+  const select=$('expenseForm')?.elements.vehiculo_id;
+  if(select)select.innerHTML='<option value="">Seleccione vehículo</option>'+expenseVehicles.map(row=>`<option value="${Number(row.id)}">${esc(row.vin)} · ${esc(row.marca)} ${esc(row.modelo)}${row.placa?` · ${esc(row.placa)}`:''}</option>`).join('');
+  refreshExpenseVehicleRequirement();
+};
 /* El contenido de los indicadores debe caber y quedar centrado dentro de su tarjeta. */
 document.head.insertAdjacentHTML('beforeend',`<style>
 .dashboard-status{display:flex;flex-direction:column;justify-content:center;padding:10px 32px}
