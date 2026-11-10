@@ -717,8 +717,24 @@ def init_db(sync_history=True):
         referencia TEXT,
         creado_en TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     )''')
+    payment_costing_columns={row['name'] for row in c.execute('PRAGMA table_info(pagos_costeo_adquisicion)')}
+    if 'proveedor_id' not in payment_costing_columns:
+        c.execute('ALTER TABLE pagos_costeo_adquisicion ADD COLUMN proveedor_id INTEGER REFERENCES proveedores(id)')
     c.execute("""CREATE UNIQUE INDEX IF NOT EXISTS ux_pagos_costeo_adquisicion_referencia
         ON pagos_costeo_adquisicion(referencia) WHERE referencia IS NOT NULL AND referencia<>''""")
+    c.execute('''CREATE TABLE IF NOT EXISTS cuentas_por_pagar_costeo(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        pago_costeo_id INTEGER NOT NULL UNIQUE REFERENCES pagos_costeo_adquisicion(id) ON DELETE CASCADE,
+        proveedor_id INTEGER NOT NULL REFERENCES proveedores(id),
+        fecha TEXT NOT NULL,monto_original REAL NOT NULL,saldo REAL NOT NULL,
+        estado TEXT NOT NULL DEFAULT 'Pendiente',creado_en TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS pagos_cuentas_por_pagar_costeo(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        cuenta_por_pagar_costeo_id INTEGER NOT NULL REFERENCES cuentas_por_pagar_costeo(id) ON DELETE CASCADE,
+        fecha TEXT NOT NULL,tipo_pago TEXT NOT NULL,banco TEXT,referencia TEXT,monto REAL NOT NULL,
+        creado_en TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )''')
     # Las CxP de taller se conservan separadas de las adquisiciones para no
     # alterar la relación histórica obligatoria adquisicion_id de la tabla
     # original. Ambas aparecen unificadas en la cartera.
@@ -1573,29 +1589,25 @@ def pagos_costeo_desde_solicitud(data, previous, proposed):
         metodo=(pago.get('metodo_pago') or '').strip()
         banco=(pago.get('banco') or '').strip()
         referencia=(pago.get('referencia') or '').strip()
+        proveedor_id=pago.get('proveedor_id')
         if metodo not in ('Efectivo','Transferencia','Crédito'):
             raise ValueError(f'Seleccione Efectivo, Transferencia o Crédito para {etiqueta}.')
         if metodo=='Transferencia' and not banco:
             raise ValueError(f'Seleccione el banco para {etiqueta}.')
         if metodo=='Transferencia' and not referencia:
             raise ValueError(f'Ingrese la referencia bancaria para {etiqueta}.')
-        pagos.append((campo,etiqueta,diferencia,metodo,banco or None,referencia or None))
+        if metodo=='Crédito':
+            try: proveedor_id=int(proveedor_id)
+            except (TypeError,ValueError):
+                raise ValueError(f'Seleccione el proveedor al cual quedará la CxP de {etiqueta}.')
+            if proveedor_id<=0:
+                raise ValueError(f'Seleccione el proveedor al cual quedará la CxP de {etiqueta}.')
+        else:
+            proveedor_id=None
+        pagos.append((campo,etiqueta,diferencia,metodo,banco or None,referencia or None,proveedor_id))
     return pagos
 
-def aumentar_cxp_adquisicion(c, acquisition, monto, fecha):
-    """Aumenta la CxP de la compra original sin tocar pagos ya aplicados."""
-    cuenta=c.execute('SELECT * FROM cuentas_por_pagar WHERE adquisicion_id=?',(acquisition['id'],)).fetchone()
-    if cuenta:
-        monto_original=round(float(cuenta['monto_original'] or 0)+monto,2)
-        saldo=round(float(cuenta['saldo'] or 0)+monto,2)
-        c.execute('UPDATE cuentas_por_pagar SET monto_original=?,saldo=?,estado=? WHERE id=?',
-            (monto_original,saldo,'Pendiente',cuenta['id']))
-        return cuenta['id']
-    cur=c.execute('''INSERT INTO cuentas_por_pagar(adquisicion_id,proveedor_id,fecha,monto_original,saldo,estado)
-        VALUES(?,?,?,?,?,'Pendiente')''',(acquisition['id'],acquisition['proveedor_id'],fecha,monto,monto))
-    return cur.lastrowid
-
-def contabilizar_pago_costeo_adquisicion(c, vehicle, acquisition, campo, etiqueta, monto, metodo, banco, referencia, fecha):
+def contabilizar_pago_costeo_adquisicion(c, vehicle, acquisition, campo, etiqueta, monto, metodo, banco, referencia, proveedor_id, fecha):
     """Capitaliza un costo directo y registra su contrapartida real."""
     if not acquisition:
         raise ValueError('El vehículo no tiene una adquisición para registrar el costo.')
@@ -1605,16 +1617,21 @@ def contabilizar_pago_costeo_adquisicion(c, vehicle, acquisition, campo, etiquet
         raise ValueError('No se puede agregar costo a un vehículo vendido.')
     if referencia and not referencia_pago_disponible(c,referencia):
         raise ValueError('El número de referencia ya fue utilizado.')
-    cur=c.execute('''INSERT INTO pagos_costeo_adquisicion(vehiculo_id,campo,fecha,monto,metodo_pago,banco,referencia)
-        VALUES(?,?,?,?,?,?,?)''',(vehicle['id'],campo,fecha,monto,metodo,banco,referencia))
+    proveedor=None
+    if metodo=='Crédito':
+        proveedor=c.execute('SELECT id,nombre FROM proveedores WHERE id=? AND activo=1',(proveedor_id,)).fetchone()
+        if not proveedor:
+            raise ValueError(f'Seleccione un proveedor activo para la CxP de {etiqueta}.')
+    cur=c.execute('''INSERT INTO pagos_costeo_adquisicion(vehiculo_id,campo,fecha,monto,metodo_pago,banco,referencia,proveedor_id)
+        VALUES(?,?,?,?,?,?,?,?)''',(vehicle['id'],campo,fecha,monto,metodo,banco,referencia,proveedor_id))
     pago_id=cur.lastrowid
     inventory=cuenta_inventario_por_estado(vehicle['estado'])
-    proveedor=c.execute('SELECT nombre FROM proveedores WHERE id=?',(acquisition['proveedor_id'],)).fetchone()
-    proveedor_nombre=(proveedor['nombre'] if proveedor else 'Proveedor')
+    proveedor_nombre=(proveedor['nombre'] if proveedor else 'Pago inmediato')
     descripcion=f'Costeo · {etiqueta} · {proveedor_nombre}'
     lineas=[{'cuenta_id':cuenta_contable_id(c,inventory),'debe':monto}]
     if metodo=='Crédito':
-        aumentar_cxp_adquisicion(c,acquisition,monto,fecha)
+        c.execute('''INSERT INTO cuentas_por_pagar_costeo(pago_costeo_id,proveedor_id,fecha,monto_original,saldo,estado)
+            VALUES(?,?,?,?,?,'Pendiente')''',(pago_id,proveedor_id,fecha,monto,monto))
         lineas.append({'cuenta_id':cuenta_contable_id(c,'cxp'),'haber':monto})
     else:
         lineas.append({'cuenta_id':cuenta_contable_id(c,'caja_bancos'),'haber':monto})
@@ -2913,6 +2930,16 @@ def cuentas_por_pagar_repuestos():
         JOIN repuestos_ot r ON r.id=cp.repuesto_ot_id JOIN ordenes_trabajo o ON o.id=r.orden_trabajo_id
         JOIN vehiculos v ON v.id=o.vehiculo_id ORDER BY cp.fecha DESC,cp.id DESC''').fetchall(); c.close(); return jsonify([dict(row) for row in rows])
 
+@app.get('/api/cuentas-por-pagar-costeo')
+def cuentas_por_pagar_costeo():
+    c=db(); rows=c.execute('''SELECT cp.*,p.nombre proveedor_nombre,pc.campo,v.vin,v.marca,v.modelo
+        FROM cuentas_por_pagar_costeo cp
+        JOIN pagos_costeo_adquisicion pc ON pc.id=cp.pago_costeo_id
+        JOIN proveedores p ON p.id=cp.proveedor_id
+        JOIN vehiculos v ON v.id=pc.vehiculo_id
+        ORDER BY cp.fecha DESC,cp.id DESC''').fetchall()
+    c.close(); return jsonify([dict(row) for row in rows])
+
 @app.get('/api/cuentas-por-cobrar')
 def cuentas_por_cobrar():
     c=db(); rows=c.execute('''SELECT cc.*,COALESCE(cl.nombre,fc.nombre,cc.financiera_nombre) tercero_nombre,
@@ -3095,7 +3122,7 @@ def registrar_reemplazo_devolucion_cambio(return_id):
 def referencia_pago_disponible(c, referencia):
     if not referencia:
         return True
-    for table in ('pagos_venta','pagos_cuentas_por_pagar','cobros_cuentas_por_cobrar','pagos_costeo_adquisicion'):
+    for table in ('pagos_venta','pagos_cuentas_por_pagar','cobros_cuentas_por_cobrar','pagos_costeo_adquisicion','pagos_cuentas_por_pagar_costeo'):
         if c.execute(f"SELECT 1 FROM {table} WHERE referencia=? LIMIT 1",(referencia,)).fetchone():
             return False
     return True
@@ -3118,6 +3145,33 @@ def registrar_pago_cxp(cid):
     lineas=[{'cuenta_id':cuenta_contable_id(c,'cxp'),'debe':monto},{'cuenta_id':cuenta_contable_id(c,'caja_bancos'),'haber':monto}]
     registrar_asiento(c,fecha,descripcion,'pago_cxp',cur.lastrowid,lineas)
     c.commit(); c.close(); return jsonify(ok=True,saldo=max(saldo,0),estado=estado),201
+
+@app.post('/api/cuentas-por-pagar-costeo/<int:cid>/pagos')
+def registrar_pago_cxp_costeo(cid):
+    data=request.get_json(silent=True) or {}; c=db(); account=c.execute('''SELECT cp.*,p.nombre proveedor_nombre,pc.campo,pc.vehiculo_id,v.vin
+        FROM cuentas_por_pagar_costeo cp JOIN proveedores p ON p.id=cp.proveedor_id
+        JOIN pagos_costeo_adquisicion pc ON pc.id=cp.pago_costeo_id JOIN vehiculos v ON v.id=pc.vehiculo_id
+        WHERE cp.id=?''',(cid,)).fetchone()
+    if not account: c.close(); return jsonify(error='Cuenta por pagar de costeo no encontrada'),404
+    values,error=validar_pago_cartera(data,account['saldo'])
+    if error: c.close(); return jsonify(error=error),400
+    monto,tipo,banco,referencia=values; fecha=data.get('fecha') or ahora_operacion().date().isoformat(); saldo=round(float(account['saldo'])-monto,2); estado='Pagada' if saldo<=0.01 else 'Pendiente'
+    if not referencia_pago_disponible(c,referencia): c.close(); return jsonify(error='El número de referencia ya fue utilizado'),409
+    try:
+        cur=c.execute('''INSERT INTO pagos_cuentas_por_pagar_costeo(cuenta_por_pagar_costeo_id,fecha,tipo_pago,banco,referencia,monto)
+            VALUES(?,?,?,?,?,?)''',(cid,fecha,tipo,banco,referencia,monto))
+        c.execute('UPDATE cuentas_por_pagar_costeo SET saldo=?,estado=? WHERE id=?',(max(saldo,0),estado,cid))
+        descripcion=f"Pago de costeo · {account['campo']} · {account['proveedor_nombre']}"
+        medio,banco_caja=medio_caja(tipo,banco)
+        registrar_movimiento_caja(c,fecha,'Pago de CxP de costeo',medio,banco_caja,0,monto,descripcion,'pago_cxp_costeo',cur.lastrowid)
+        registrar_asiento(c,fecha,descripcion,'pago_cxp_costeo',cur.lastrowid,[
+            {'cuenta_id':cuenta_contable_id(c,'cxp'),'debe':monto},
+            {'cuenta_id':cuenta_contable_id(c,'caja_bancos'),'haber':monto},
+        ],account['vehiculo_id'])
+        c.commit(); return jsonify(ok=True,saldo=max(saldo,0),estado=estado),201
+    except sqlite3.IntegrityError:
+        c.rollback(); return jsonify(error='El número de referencia ya fue utilizado'),409
+    finally: c.close()
 
 @app.post('/api/cuentas-por-pagar-contratos/<int:cid>/pagos')
 def registrar_pago_cxp_contrato(cid):
@@ -5889,8 +5943,8 @@ def put_adquisicion(vid):
         if acquisition:
             contabilizar_ajuste_compra(c,acquisition,vehicle,ajuste,previous.get('ajuste_cxp_contabilizado') or 0,
                 datetime.now().strftime('%Y-%m-%d'))
-        for campo,etiqueta,monto,metodo,banco,referencia in pagos_costeo:
-            contabilizar_pago_costeo_adquisicion(c,vehicle,acquisition,campo,etiqueta,monto,metodo,banco,referencia,fecha_costeo)
+        for campo,etiqueta,monto,metodo,banco,referencia,proveedor_id in pagos_costeo:
+            contabilizar_pago_costeo_adquisicion(c,vehicle,acquisition,campo,etiqueta,monto,metodo,banco,referencia,proveedor_id,fecha_costeo)
     except ValueError as error:
         c.rollback(); c.close(); return jsonify(error=str(error)),400
     c.execute('''INSERT INTO costos_adquisicion(vehiculo_id,costo_exw,grua,flete,costo_estimado,ajuste_cif,isv_pagado,cl_std,almacenaje,gastos_aduaneros,estatus,ajuste_compra,placa_nacionalizacion,fecha_actualizacion)
