@@ -1805,4 +1805,67 @@ const applyAccessUIWithSalesReport=applyAccessUI;
 applyAccessUI=function(){applyAccessUIWithSalesReport();let alias=String(accessSession?.usuario||'').toLowerCase().split('@')[0].replace(/[^a-z0-9]/g,''),limited='alorenzo';$('salesReportNavigation')?.classList.toggle('hidden',alias===limited)};
 const goWithSalesReport=go;
 go=function(id,button){goWithSalesReport(id,button);if(id==='salesReport')void loadSalesReport()};
+/* Pagos de costeo: Grúa, Flete e impuestos no pueden aumentar el inventario
+   sin dejar documentada la contrapartida. Ajuste de compra conserva su flujo
+   propio contra CxP y deliberadamente no aparece en este bloque. */
+const COSTEO_PAYMENT_FIELDS={
+  grua:'Grúa',flete:'Flete',isv_pagado:'ISV pagado',cl_std:'STD',
+  almacenaje:'Almacenaje',gastos_aduaneros:'Gasto aduanero'
+};
+const COSTEO_BANKS=['BAC Credomatic','Banco Atlántida','Banco de Occidente','Banpaís','Davivienda','Ficohsa','LAFISE','Promerica','Otro banco'];
+function costeoPaymentSnapshot(){
+  let form=$('costForm');if(!form)return {};
+  try{return JSON.parse(form.dataset.costeoPaymentBase||'{}')}catch{return {}}
+}
+function costeoPaymentChanges(){
+  let form=$('costForm'),base=costeoPaymentSnapshot();if(!form)return [];
+  return Object.entries(COSTEO_PAYMENT_FIELDS).map(([field,label])=>({field,label,current:Number(form.elements[field]?.value||0),base:Number(base[field]||0)})).filter(row=>Math.abs(row.current-row.base)>0.005)
+}
+function toggleCosteoPaymentFields(field){
+  let panel=document.querySelector(`[data-costeo-payment="${field}"]`);if(!panel)return;
+  let isTransfer=panel.querySelector(`[data-costeo-method="${field}"]`)?.value==='Transferencia';
+  panel.querySelectorAll('[data-costeo-transfer]').forEach(node=>node.classList.toggle('hidden',!isTransfer));
+}
+function renderCosteoPaymentPanels(){
+  let form=$('costForm');if(!form)return;
+  let holder=$('costeoPaymentPanels');
+  if(!holder){form.querySelector('.actions')?.insertAdjacentHTML('beforebegin','<div id="costeoPaymentPanels"></div>');holder=$('costeoPaymentPanels')}
+  let existing={};holder.querySelectorAll('[data-costeo-payment]').forEach(panel=>{existing[panel.dataset.costeoPayment]={metodo:panel.querySelector('[data-costeo-method]')?.value||'',banco:panel.querySelector('[data-costeo-bank]')?.value||'',referencia:panel.querySelector('[data-costeo-reference]')?.value||''}});
+  let changes=costeoPaymentChanges();
+  holder.innerHTML=changes.map(row=>{
+    let delta=Number((row.current-row.base).toFixed(2)),saved=existing[row.field]||{};
+    if(delta<0)return `<div class="form-section" data-costeo-payment="${row.field}"><div class="sub" style="color:#b54708"><b>${esc(row.label)}:</b> no se puede disminuir desde esta pantalla porque el importe ya fue capitalizado. Registre una reversión contable.</div></div>`;
+    return `<div class="form-section" data-costeo-payment="${row.field}"><h2>PAGO DE ${esc(row.label).toUpperCase()} · ${money(delta)}</h2><div class="sub" style="margin:-5px 0 14px">El incremento se registrará contra inventario y contra caja/bancos o CxP.</div><div class="formgrid"><div class="field"><label>Método de pago *</label><select data-costeo-method="${row.field}" onchange="toggleCosteoPaymentFields('${row.field}')"><option value="">Seleccione método</option>${['Efectivo','Transferencia','Crédito'].map(method=>`<option value="${method}" ${saved.metodo===method?'selected':''}>${method}</option>`).join('')}</select></div><div class="field ${saved.metodo==='Transferencia'?'':'hidden'}" data-costeo-transfer><label>Banco *</label><select data-costeo-bank="${row.field}"><option value="">Seleccione banco</option>${COSTEO_BANKS.map(bank=>`<option value="${esc(bank)}" ${saved.banco===bank?'selected':''}>${esc(bank)}</option>`).join('')}</select></div><div class="field ${saved.metodo==='Transferencia'?'':'hidden'}" data-costeo-transfer><label>Referencia bancaria *</label><input data-costeo-reference="${row.field}" maxlength="100" value="${esc(saved.referencia)}" placeholder="No. de transferencia"></div></div></div>`;
+  }).join('');
+}
+function collectCosteoPayments(){
+  let payments={};
+  for(let row of costeoPaymentChanges()){
+    let delta=Number((row.current-row.base).toFixed(2));
+    if(delta<0)return {error:`No puede disminuir ${row.label} desde Costeo porque ya fue capitalizado.`};
+    let panel=document.querySelector(`[data-costeo-payment="${row.field}"]`),method=panel?.querySelector(`[data-costeo-method="${row.field}"]`)?.value||'',bank=panel?.querySelector(`[data-costeo-bank="${row.field}"]`)?.value||'',reference=panel?.querySelector(`[data-costeo-reference="${row.field}"]`)?.value.trim()||'';
+    if(!method)return {error:`Seleccione el método de pago para ${row.label}.`};
+    if(method==='Transferencia'&&!bank)return {error:`Seleccione el banco para ${row.label}.`};
+    if(method==='Transferencia'&&!reference)return {error:`Ingrese la referencia bancaria para ${row.label}.`};
+    payments[row.field]={metodo_pago:method,banco:bank,referencia:reference};
+  }
+  return {payments};
+}
+const loadCostVehicleWithPaymentRequirements=loadCostVehicle;
+loadCostVehicle=async function(){
+  await loadCostVehicleWithPaymentRequirements();
+  let form=$('costForm');if(!currentCostVehicle||!form)return;
+  let values={};Object.keys(COSTEO_PAYMENT_FIELDS).forEach(field=>values[field]=Number(form.elements[field]?.value||0));
+  form.dataset.costeoPaymentBase=JSON.stringify(values);
+  renderCosteoPaymentPanels();
+};
+$('costForm')?.addEventListener('input',event=>{if(Object.prototype.hasOwnProperty.call(COSTEO_PAYMENT_FIELDS,event.target?.name))renderCosteoPaymentPanels()});
+const saveCosteoWithPaymentRequirements=saveCosteo;
+saveCosteo=async function(event){
+  let result=collectCosteoPayments();if(result.error){event.preventDefault();return showNotice(result.error,'error')}
+  let form=event.target,hidden=form.querySelector('[name="pagos_costeo_json"]');
+  if(!hidden){hidden=document.createElement('input');hidden.type='hidden';hidden.name='pagos_costeo_json';form.appendChild(hidden)}
+  hidden.value=JSON.stringify(result.payments);
+  return saveCosteoWithPaymentRequirements(event);
+};
 </script></body></html>

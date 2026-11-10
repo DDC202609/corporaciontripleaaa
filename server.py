@@ -703,6 +703,22 @@ def init_db(sync_history=True):
         adquisicion_id INTEGER NOT NULL REFERENCES adquisiciones(id) ON DELETE CASCADE,
         fecha TEXT NOT NULL,monto REAL NOT NULL,creado_en TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     )''')
+    # Cada importe complementario del costeo debe conservar el comprobante que
+    # explica su contrapartida.  No se mezcla con ajuste_compra: ese concepto
+    # tiene su propio flujo histórico contra la CxP de la adquisición.
+    c.execute('''CREATE TABLE IF NOT EXISTS pagos_costeo_adquisicion(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        vehiculo_id INTEGER NOT NULL REFERENCES vehiculos(id) ON DELETE CASCADE,
+        campo TEXT NOT NULL,
+        fecha TEXT NOT NULL,
+        monto REAL NOT NULL,
+        metodo_pago TEXT NOT NULL,
+        banco TEXT,
+        referencia TEXT,
+        creado_en TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )''')
+    c.execute("""CREATE UNIQUE INDEX IF NOT EXISTS ux_pagos_costeo_adquisicion_referencia
+        ON pagos_costeo_adquisicion(referencia) WHERE referencia IS NOT NULL AND referencia<>''""")
     # Las CxP de taller se conservan separadas de las adquisiciones para no
     # alterar la relación histórica obligatoria adquisicion_id de la tabla
     # original. Ambas aparecen unificadas en la cartera.
@@ -1514,6 +1530,99 @@ def contabilizar_ajuste_compra(c, acquisition, vehicle, ajuste_actual, ajuste_co
         lineas=[{'cuenta_id':cuenta_contable_id(c,'cxp'),'debe':importe},
                 {'cuenta_id':cuenta_contable_id(c,inventory),'haber':importe}]
     registrar_asiento(c,fecha,description,'ajuste_compra_cxp',cur.lastrowid,lineas,vehicle['id'])
+
+# Estos conceptos se capitalizan directamente desde la ficha de Costeo. A
+# diferencia del ajuste de compra, cada incremento requiere su propio medio
+# de pago para que el costo del vehículo y la salida de dinero/CxP nazcan en
+# la misma transacción.
+CAMPOS_COSTEO_CON_PAGO={
+    'grua':'Grúa',
+    'flete':'Flete',
+    'isv_pagado':'ISV pagado',
+    'cl_std':'STD',
+    'almacenaje':'Almacenaje',
+    'gastos_aduaneros':'Gasto aduanero',
+}
+
+def pagos_costeo_desde_solicitud(data, previous, proposed):
+    """Valida los pagos de los nuevos costos directos de adquisición.
+
+    El formulario envía un objeto por concepto. Solo se exige para el aumento
+    que se está registrando ahora; el historial existente no se inventa ni se
+    vuelve a contabilizar al desplegar esta mejora.
+    """
+    raw=data.get('pagos_costeo') or data.get('pagos_costeo_json') or {}
+    if isinstance(raw,str):
+        try: raw=json.loads(raw or '{}')
+        except (TypeError,ValueError,json.JSONDecodeError):
+            raise ValueError('La información de pago del costeo no es válida.')
+    if not isinstance(raw,dict):
+        raise ValueError('La información de pago del costeo no es válida.')
+    pagos=[]
+    for campo,etiqueta in CAMPOS_COSTEO_CON_PAGO.items():
+        anterior=round(float(previous.get(campo) or 0),2)
+        nuevo=round(float(proposed[campo] or 0),2)
+        diferencia=round(nuevo-anterior,2)
+        if diferencia < -0.005:
+            raise ValueError(f'No puede disminuir {etiqueta} desde Costeo porque ya es un importe capitalizado. Registre una reversión contable.')
+        if diferencia <= 0.005:
+            continue
+        pago=raw.get(campo) or {}
+        if not isinstance(pago,dict):
+            raise ValueError(f'Ingrese el método de pago de {etiqueta}.')
+        metodo=(pago.get('metodo_pago') or '').strip()
+        banco=(pago.get('banco') or '').strip()
+        referencia=(pago.get('referencia') or '').strip()
+        if metodo not in ('Efectivo','Transferencia','Crédito'):
+            raise ValueError(f'Seleccione Efectivo, Transferencia o Crédito para {etiqueta}.')
+        if metodo=='Transferencia' and not banco:
+            raise ValueError(f'Seleccione el banco para {etiqueta}.')
+        if metodo=='Transferencia' and not referencia:
+            raise ValueError(f'Ingrese la referencia bancaria para {etiqueta}.')
+        pagos.append((campo,etiqueta,diferencia,metodo,banco or None,referencia or None))
+    return pagos
+
+def aumentar_cxp_adquisicion(c, acquisition, monto, fecha):
+    """Aumenta la CxP de la compra original sin tocar pagos ya aplicados."""
+    cuenta=c.execute('SELECT * FROM cuentas_por_pagar WHERE adquisicion_id=?',(acquisition['id'],)).fetchone()
+    if cuenta:
+        monto_original=round(float(cuenta['monto_original'] or 0)+monto,2)
+        saldo=round(float(cuenta['saldo'] or 0)+monto,2)
+        c.execute('UPDATE cuentas_por_pagar SET monto_original=?,saldo=?,estado=? WHERE id=?',
+            (monto_original,saldo,'Pendiente',cuenta['id']))
+        return cuenta['id']
+    cur=c.execute('''INSERT INTO cuentas_por_pagar(adquisicion_id,proveedor_id,fecha,monto_original,saldo,estado)
+        VALUES(?,?,?,?,?,'Pendiente')''',(acquisition['id'],acquisition['proveedor_id'],fecha,monto,monto))
+    return cur.lastrowid
+
+def contabilizar_pago_costeo_adquisicion(c, vehicle, acquisition, campo, etiqueta, monto, metodo, banco, referencia, fecha):
+    """Capitaliza un costo directo y registra su contrapartida real."""
+    if not acquisition:
+        raise ValueError('El vehículo no tiene una adquisición para registrar el costo.')
+    if acquisition['tipo_compra']=='Consignación' and not int(acquisition['contabilizada'] or 0):
+        raise ValueError('La consignación no puede capitalizar costos hasta convertirse en compra.')
+    if vehicle['estado']=='Vendido':
+        raise ValueError('No se puede agregar costo a un vehículo vendido.')
+    if referencia and not referencia_pago_disponible(c,referencia):
+        raise ValueError('El número de referencia ya fue utilizado.')
+    cur=c.execute('''INSERT INTO pagos_costeo_adquisicion(vehiculo_id,campo,fecha,monto,metodo_pago,banco,referencia)
+        VALUES(?,?,?,?,?,?,?)''',(vehicle['id'],campo,fecha,monto,metodo,banco,referencia))
+    pago_id=cur.lastrowid
+    inventory=cuenta_inventario_por_estado(vehicle['estado'])
+    proveedor=c.execute('SELECT nombre FROM proveedores WHERE id=?',(acquisition['proveedor_id'],)).fetchone()
+    proveedor_nombre=(proveedor['nombre'] if proveedor else 'Proveedor')
+    descripcion=f'Costeo · {etiqueta} · {proveedor_nombre}'
+    lineas=[{'cuenta_id':cuenta_contable_id(c,inventory),'debe':monto}]
+    if metodo=='Crédito':
+        aumentar_cxp_adquisicion(c,acquisition,monto,fecha)
+        lineas.append({'cuenta_id':cuenta_contable_id(c,'cxp'),'haber':monto})
+    else:
+        lineas.append({'cuenta_id':cuenta_contable_id(c,'caja_bancos'),'haber':monto})
+        medio,banco_caja=medio_caja(metodo,banco)
+        registrar_movimiento_caja(c,fecha,f'Pago de costeo · {etiqueta}',medio,banco_caja,0,monto,
+                                  descripcion,'pago_costeo_adquisicion',pago_id)
+    registrar_asiento(c,fecha,descripcion,'pago_costeo_adquisicion',pago_id,lineas,vehicle['id'])
+    return pago_id
 
 def contabilizar_venta(c, venta_id, inventario_origen=None):
     sale=c.execute('''SELECT ve.*,cl.nombre cliente_nombre,v.estado vehiculo_estado FROM ventas ve
@@ -2986,7 +3095,7 @@ def registrar_reemplazo_devolucion_cambio(return_id):
 def referencia_pago_disponible(c, referencia):
     if not referencia:
         return True
-    for table in ('pagos_venta','pagos_cuentas_por_pagar','cobros_cuentas_por_cobrar'):
+    for table in ('pagos_venta','pagos_cuentas_por_pagar','cobros_cuentas_por_cobrar','pagos_costeo_adquisicion'):
         if c.execute(f"SELECT 1 FROM {table} WHERE referencia=? LIMIT 1",(referencia,)).fetchone():
             return False
     return True
@@ -5766,11 +5875,22 @@ def put_adquisicion(vid):
         c.close(); return jsonify(error='Ingrese la placa del vehículo al nacionalizar la importación'),400
     if estatus=='Nacionalizado' and placa and not placa_disponible(c,placa,vid):
         c.close(); return jsonify(error='La placa ya está registrada en otro vehículo'),409
+    proposed={
+        'grua':grua,'flete':flete,'isv_pagado':isv,'cl_std':std,
+        'almacenaje':almacenaje,'gastos_aduaneros':gastos,
+    }
+    try:
+        pagos_costeo=pagos_costeo_desde_solicitud(d,previous,proposed)
+    except ValueError as error:
+        c.close(); return jsonify(error=str(error)),400
     fob=float(vehicle['precio_compra'] or 0)+ajuste; cif=fob+grua+flete; total=cif+isv+std+almacenaje+gastos
+    fecha_costeo=ahora_operacion().strftime('%Y-%m-%d')
     try:
         if acquisition:
             contabilizar_ajuste_compra(c,acquisition,vehicle,ajuste,previous.get('ajuste_cxp_contabilizado') or 0,
                 datetime.now().strftime('%Y-%m-%d'))
+        for campo,etiqueta,monto,metodo,banco,referencia in pagos_costeo:
+            contabilizar_pago_costeo_adquisicion(c,vehicle,acquisition,campo,etiqueta,monto,metodo,banco,referencia,fecha_costeo)
     except ValueError as error:
         c.rollback(); c.close(); return jsonify(error=str(error)),400
     c.execute('''INSERT INTO costos_adquisicion(vehiculo_id,costo_exw,grua,flete,costo_estimado,ajuste_cif,isv_pagado,cl_std,almacenaje,gastos_aduaneros,estatus,ajuste_compra,placa_nacionalizacion,fecha_actualizacion)
