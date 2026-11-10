@@ -4127,6 +4127,79 @@ def archivo_excel_ventas(rows):
         archive.writestr('xl/styles.xml',styles_xml); archive.writestr('xl/worksheets/sheet1.xml',sheet)
     output.seek(0); return output
 
+def filas_reporte_componentes_costo():
+    """Desglose de costo consolidado por vehículo y sus gastos documentados.
+
+    El reporte conserva los vehículos vendidos y devueltos para que sirva de
+    auditoría histórica, no solamente como listado de inventario vigente.
+    """
+    c=db()
+    try:
+        rows=c.execute('''SELECT v.id vehiculo_id,v.vin,v.marca,v.modelo,v.version,v.anio,v.estado,
+                   v.fecha_adquisicion,v.precio_compra,
+                   COALESCE(ca.ajuste_compra,0) ajuste_compra,
+                   COALESCE(ca.grua,0) grua,COALESCE(ca.flete,0) flete,
+                   COALESCE(ca.isv_pagado,0) isv_pagado,COALESCE(ca.cl_std,0) std,
+                   COALESCE(ca.almacenaje,0) almacenaje,
+                   COALESCE(ca.gastos_aduaneros,0) gasto_aduanero,
+                   COALESCE((SELECT SUM(cv.monto) FROM costos_vehiculo cv WHERE cv.vehiculo_id=v.id),0) costos_adicionales
+              FROM vehiculos v
+              LEFT JOIN costos_adquisicion ca ON ca.vehiculo_id=v.id
+             WHERE COALESCE(v.precio_compra,0)<>0 OR ca.vehiculo_id IS NOT NULL
+                OR EXISTS(SELECT 1 FROM costos_vehiculo cv WHERE cv.vehiculo_id=v.id AND COALESCE(cv.monto,0)<>0)
+             ORDER BY COALESCE(v.fecha_adquisicion,'') DESC,v.vin''').fetchall()
+        resumen=[]
+        for row in rows:
+            item=dict(row)
+            item['costo_total']=round(costo_consolidado(c,item['vehiculo_id']),2)
+            resumen.append(item)
+        detalle=[dict(row) for row in c.execute('''SELECT cv.fecha,v.vin,v.marca,v.modelo,v.estado,
+                   cv.categoria,cv.concepto,cv.proveedor,cv.documento,cv.monto,cv.observaciones
+              FROM costos_vehiculo cv JOIN vehiculos v ON v.id=cv.vehiculo_id
+             ORDER BY cv.fecha DESC,cv.id DESC''').fetchall()]
+        return resumen,detalle
+    finally:
+        c.close()
+
+def archivo_excel_componentes_costo(resumen,detalle):
+    """Genera un XLSX de auditoría de costos sin dependencias externas."""
+    def col(index):
+        text=''
+        while index:
+            index,remainder=divmod(index-1,26); text=chr(65+remainder)+text
+        return text
+    def cell(reference,value,style=None,numeric=False):
+        style_attr=f' s="{style}"' if style is not None else ''
+        if numeric:
+            return f'<c r="{reference}"{style_attr}><v>{float(value or 0)}</v></c>'
+        safe=xml_escape(str(value if value not in (None,'') else '—'))
+        return f'<c r="{reference}"{style_attr} t="inlineStr"><is><t>{safe}</t></is></c>'
+    def sheet_xml(headers,columns,rows,widths,numeric_keys,currency_keys):
+        lines=['<row r="1">'+''.join(cell(f'{col(index)}1',value,1) for index,value in enumerate(headers,1))+'</row>']
+        for row_number,row in enumerate(rows,2):
+            values=[]
+            for index,key in enumerate(columns,1):
+                values.append(cell(f'{col(index)}{row_number}',row.get(key),2 if key in currency_keys else None,key in numeric_keys))
+            lines.append(f'<row r="{row_number}">'+''.join(values)+'</row>')
+        last_column=col(len(columns)); last_row=max(1,len(rows)+1)
+        return '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews><sheetFormatPr defaultRowHeight="15"/><cols>'+''.join(f'<col min="{index}" max="{index}" width="{width}" customWidth="1"/>' for index,width in enumerate(widths,1))+'</cols><sheetData>'+''.join(lines)+f'</sheetData><autoFilter ref="A1:{last_column}{last_row}"/></worksheet>'
+    headers_resumen=['VIN','Marca','Modelo','Versión','Año','Estado','Fecha adquisición','Costo de compra','Ajuste compra','Grúa','Flete','ISV pagado','STD','Almacenaje','Gasto aduanero / impuestos','Costos adicionales / taller','Costo total']
+    columns_resumen=['vin','marca','modelo','version','anio','estado','fecha_adquisicion','precio_compra','ajuste_compra','grua','flete','isv_pagado','std','almacenaje','gasto_aduanero','costos_adicionales','costo_total']
+    headers_detalle=['Fecha','VIN','Marca','Modelo','Estado','Categoría','Concepto','Proveedor','Documento','Monto','Observaciones']
+    columns_detalle=['fecha','vin','marca','modelo','estado','categoria','concepto','proveedor','documento','monto','observaciones']
+    currency_resumen={'precio_compra','ajuste_compra','grua','flete','isv_pagado','std','almacenaje','gasto_aduanero','costos_adicionales','costo_total'}
+    sheet1=sheet_xml(headers_resumen,columns_resumen,resumen,(22,15,18,15,10,14,15,16,15,13,13,14,13,14,25,24,16),{'anio',*currency_resumen},currency_resumen)
+    sheet2=sheet_xml(headers_detalle,columns_detalle,detalle,(14,22,15,18,14,20,32,24,18,16,44),{'monto'},{'monto'})
+    styles_xml='<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><numFmts count="1"><numFmt numFmtId="164" formatCode="&quot;L&quot; #,##0.00"/></numFmts><fonts count="2"><font><sz val="10"/><name val="Calibri"/></font><font><b/><color rgb="FFFFFFFF"/><sz val="10"/><name val="Calibri"/></font></fonts><fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FF175CD3"/><bgColor indexed="64"/></patternFill></fill></fills><borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellXfs count="3"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/><xf numFmtId="0" fontId="1" fillId="1" borderId="0" applyFont="1" applyFill="1"/><xf numFmtId="164" fontId="0" fillId="0" borderId="0" applyNumberFormat="1"/></cellXfs></styleSheet>'
+    output=io.BytesIO()
+    with zipfile.ZipFile(output,'w',zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr('[Content_Types].xml','<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/worksheets/sheet2.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>')
+        archive.writestr('_rels/.rels','<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>')
+        archive.writestr('xl/workbook.xml','<?xml version="1.0" encoding="UTF-8"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Componentes de costo" sheetId="1" r:id="rId1"/><sheet name="Detalle de gastos" sheetId="2" r:id="rId2"/></sheets></workbook>')
+        archive.writestr('xl/_rels/workbook.xml.rels','<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>')
+        archive.writestr('xl/styles.xml',styles_xml); archive.writestr('xl/worksheets/sheet1.xml',sheet1); archive.writestr('xl/worksheets/sheet2.xml',sheet2)
+    output.seek(0); return output
+
 @app.get('/api/reportes/ventas')
 def reporte_ventas_por_fechas():
     error=validar_acceso_reporte_ventas()
@@ -4144,6 +4217,12 @@ def exportar_reporte_ventas_excel():
     suffix=f'{desde or "inicio"}_a_{hasta or "hoy"}'
     return send_file(archivo_excel_ventas(filas_reporte_ventas(desde,hasta)),as_attachment=True,
         download_name=f'reporte_ventas_{suffix}.xlsx',mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+
+@app.get('/api/reportes/componentes-costo/exportar')
+def exportar_componentes_costo_excel():
+    resumen,detalle=filas_reporte_componentes_costo()
+    return send_file(archivo_excel_componentes_costo(resumen,detalle),as_attachment=True,
+        download_name='componentes_costo_vehiculos.xlsx',mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
 
 @app.get('/api/ventas/<int:sid>')
 def get_venta(sid):
