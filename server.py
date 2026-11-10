@@ -2563,6 +2563,78 @@ def conciliacion_inventario():
         diferencia_total=round(sum(item['diferencia'] for item in resumen),2),
     )
 
+@app.get('/api/contabilidad/auditoria-costos-sin-asiento')
+def auditoria_costos_sin_asiento():
+    """Auditoría de solo lectura de costos que afectan el auxiliar operativo.
+
+    Los costos de vehículo conservan el documento, pero no todos nacieron con
+    una partida. Este reporte identifica cada renglón por su propio documento;
+    no infiere un asiento solo porque exista otra póliza del mismo importe.
+    """
+    desde=(request.args.get('desde') or '').strip()
+    hasta=(request.args.get('hasta') or '').strip()
+    try:
+        if desde: datetime.strptime(desde,'%Y-%m-%d')
+        if hasta: datetime.strptime(hasta,'%Y-%m-%d')
+    except ValueError:
+        return jsonify(error='Las fechas deben tener el formato AAAA-MM-DD.'),400
+    if not desde or not hasta or desde>hasta:
+        return jsonify(error='Indique un rango de fechas válido.'),400
+    c=db()
+    inventory_ids={row['id'] for row in c.execute("SELECT id FROM cuentas_contables WHERE codigo IN ('1103','1104','1105')")}
+    rows=[]
+    costs=c.execute('''SELECT cv.*,v.vin,v.marca,v.modelo,v.estado
+        FROM costos_vehiculo cv JOIN vehiculos v ON v.id=cv.vehiculo_id
+        WHERE cv.fecha>=? AND cv.fecha<=? ORDER BY cv.fecha,cv.id''',(desde,hasta)).fetchall()
+    for cost in costs:
+        source_type=None; source_id=None
+        if cost['categoria']=='Repuestos / OT':
+            part=c.execute('''SELECT r.id FROM repuestos_ot r JOIN ordenes_trabajo o ON o.id=r.orden_trabajo_id
+                WHERE o.vehiculo_id=? AND COALESCE(r.factura,'')=COALESCE(?, '')
+                  AND ROUND(r.total,2)=ROUND(?,2) ORDER BY r.id DESC LIMIT 1''',
+                (cost['vehiculo_id'],cost['documento'],cost['monto'])).fetchone()
+            if part: source_type='repuesto_ot'; source_id=part['id']
+        elif cost['categoria']=='Mano de obra / OT':
+            order=c.execute('''SELECT id FROM ordenes_trabajo WHERE vehiculo_id=? AND numero_ot=?
+                ORDER BY id DESC LIMIT 1''',(cost['vehiculo_id'],cost['documento'])).fetchone()
+            if order: source_type='cierre_ot'; source_id=order['id']
+        accounted=False
+        if source_type:
+            accounted=bool(c.execute('''SELECT 1 FROM partidas p JOIN asientos_contables a ON a.id=p.asiento_id
+                WHERE a.referencia_tipo=? AND a.referencia_id=? AND p.vehiculo_id=?
+                  AND p.cuenta_id IN ({}) AND p.debe>0 LIMIT 1'''.format(','.join('?' for _ in inventory_ids)),
+                (source_type,source_id,cost['vehiculo_id'],*inventory_ids)).fetchone())
+        rows.append({'id':cost['id'],'fecha':cost['fecha'],'vin':cost['vin'],
+            'vehiculo':f"{cost['marca'] or ''} {cost['modelo'] or ''}".strip(),'etapa':cost['estado'],
+            'categoria':cost['categoria'],'concepto':cost['concepto'],'documento':cost['documento'],
+            'monto':round(float(cost['monto'] or 0),2),'origen_contable':source_type,
+            'tiene_asiento_inventario':accounted})
+    sin_asiento=[row for row in rows if not row['tiene_asiento_inventario']]
+    def total(items): return round(sum(row['monto'] for row in items),2)
+    por_mes={}
+    for row in sin_asiento:
+        month=str(row['fecha'])[:7]
+        data=por_mes.setdefault(month,{'registros':0,'monto':0.0})
+        data['registros']+=1; data['monto']=round(data['monto']+row['monto'],2)
+    # Los componentes de Costeo no tienen bitácora por cada campo: solo se
+    # conserva la última actualización de la ficha. Se reportan aparte para
+    # no mezclarlos indebidamente con un monto histórico comprobable.
+    component_rows=c.execute('''SELECT ca.vehiculo_id,v.vin,ca.fecha_actualizacion,
+            COALESCE(ca.grua,0)+COALESCE(ca.flete,0)+COALESCE(ca.isv_pagado,0)+
+            COALESCE(ca.cl_std,0)+COALESCE(ca.almacenaje,0)+COALESCE(ca.gastos_aduaneros,0) monto
+        FROM costos_adquisicion ca JOIN vehiculos v ON v.id=ca.vehiculo_id
+        WHERE substr(COALESCE(ca.fecha_actualizacion,''),1,10)>=?
+          AND substr(COALESCE(ca.fecha_actualizacion,''),1,10)<=?''',(desde,hasta)).fetchall()
+    components=[{'vin':row['vin'],'fecha_actualizacion':row['fecha_actualizacion'],
+                 'monto_vigente':round(float(row['monto'] or 0),2)} for row in component_rows if float(row['monto'] or 0)]
+    c.close()
+    return jsonify(desde=desde,hasta=hasta,
+        costos_registrados=len(rows),monto_registrado=total(rows),
+        sin_asiento_registros=len(sin_asiento),sin_asiento_monto=total(sin_asiento),
+        sin_asiento_por_mes=por_mes,sin_asiento=sin_asiento,
+        componentes_costeo_sin_historial_por_campo=components,
+        nota_componentes='Los componentes de Costeo se guardan como saldo vigente; si fueron modificados después, no se puede reconstruir su valor histórico por mes sin una bitácora de importes.')
+
 @app.post('/api/contabilidad/conciliacion-inventario/asignar-migraciones')
 def asignar_conciliacion_migraciones():
     """Asigna por VIN la póliza global de conciliación histórica.
