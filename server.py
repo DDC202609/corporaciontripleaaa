@@ -2627,7 +2627,17 @@ def auditoria_costos_sin_asiento():
           AND substr(COALESCE(ca.fecha_actualizacion,''),1,10)<=?''',(desde,hasta)).fetchall()
     components=[{'vin':row['vin'],'fecha_actualizacion':row['fecha_actualizacion'],
                  'monto_vigente':round(float(row['monto'] or 0),2)} for row in component_rows if float(row['monto'] or 0)]
+    summary={
+        'desde':desde,'hasta':hasta,
+        'costos_registrados':len(rows),'monto_registrado':total(rows),
+        'sin_asiento_registros':len(sin_asiento),'sin_asiento_monto':total(sin_asiento),
+        'sin_asiento_por_mes':por_mes,
+        'componentes_costeo_registros':len(components),
+        'componentes_costeo_monto_vigente':round(sum(row['monto_vigente'] for row in components),2),
+    }
     c.close()
+    if request.args.get('resumen')=='1':
+        return jsonify(summary)
     return jsonify(desde=desde,hasta=hasta,
         costos_registrados=len(rows),monto_registrado=total(rows),
         sin_asiento_registros=len(sin_asiento),sin_asiento_monto=total(sin_asiento),
