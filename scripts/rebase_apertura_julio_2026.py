@@ -8,13 +8,17 @@ from __future__ import annotations
 
 import sqlite3
 import sys
+import os
 from datetime import datetime
 from pathlib import Path
 import shutil
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DB = ROOT / "data" / "autolote.sqlite"
+# En Render la base operativa vive en el disco persistente.  Se permite
+# inyectarla explícitamente para que este mantenimiento nunca modifique la
+# copia temporal incluida en el despliegue.
+DB = Path(os.environ.get("AUTOLOTE_DB_PATH", ROOT / "data" / "autolote.sqlite"))
 CUTOFF = "2026-08-01"
 OPENING_DATE = "2026-07-31"
 OPENING_DESCRIPTION = "Apertura contable oficial al 31-jul-2026"
