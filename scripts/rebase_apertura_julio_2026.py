@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import sqlite3
 import sys
+from datetime import datetime
 from pathlib import Path
+import shutil
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -19,7 +21,7 @@ OPENING_DESCRIPTION = "Apertura contable oficial al 31-jul-2026"
 SYNTHETIC_PAYMENT_PREFIX = "AJUSTE-CXP-HIST-20260916%"
 
 BANKS = (
-    ("BAC", 733_804.05),
+    ("BAC", 733_804.00),
     ("Ficohsa", 292_213.00),
     ("Atlántida Personal AFJ", 1_250_000.00),
     ("Occidente", 478_834.00),
@@ -28,7 +30,7 @@ OPENING_LINES = (
     ("1103", 11_398_515.00, 0, "Saldo inicial · Inventario DPV"),
     ("1105", 4_823_595.00, 0, "Saldo inicial · Inventario en tránsito"),
     ("1104", 7_713_957.00, 0, "Saldo inicial · Inventario en taller"),
-    ("1101", 2_754_851.05, 0, "Saldo inicial · Bancos"),
+    ("1101", 2_754_851.00, 0, "Saldo inicial · Bancos"),
     ("2104", 0, 6_000_000.00, "Saldo inicial · Exclusión de capital / CxP socios"),
     ("2105", 0, 450_000.00, "Saldo inicial · Otras CxP · José Elías Paz"),
     ("2105", 0, 437_500.00, "Saldo inicial · Otras CxP · Moisés Fajardo"),
@@ -36,8 +38,7 @@ OPENING_LINES = (
     ("2201", 0, 700_000.00, "Saldo inicial · Préstamo Ficohsa"),
     ("2201", 0, 215_000.00, "Saldo inicial · Préstamo Davivienda"),
     ("3101", 0, 50_000.00, "Saldo inicial · Capital social"),
-    # Ajusta L 0.05 derivado del saldo bancario detallado recibido.
-    ("3103", 0, 18_363_418.05, "Saldo inicial · Resultados acumulados"),
+    ("3103", 0, 18_363_418.00, "Saldo inicial · Resultados acumulados"),
 )
 
 
@@ -116,6 +117,12 @@ def rebase(apply=False):
         if not apply:
             print("Revisión finalizada. Use --apply para ejecutar la rebase.")
             return
+
+        backup_dir = ROOT / "data" / "respaldos_contables"
+        backup_dir.mkdir(exist_ok=True)
+        backup = backup_dir / f"autolote-antes-rebase-31jul-{datetime.now():%Y%m%d-%H%M%S}.sqlite"
+        shutil.copy2(DB, backup)
+        print(f"Respaldo creado: {backup}")
 
         cursor.execute("BEGIN")
         ensure_other_payables_account(cursor)
