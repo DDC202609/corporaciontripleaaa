@@ -5256,7 +5256,7 @@ def put_planificacion_compra_autorizaciones_semanales():
 
 def archivo_excel_integracion_compra(rows,semana):
     """Exportación XLSX pequeña, compatible con Excel, del resumen semanal."""
-    headers=['Semana','Modelo','Año','Sugerido','Autorizado']
+    headers=['Semana','Modelo','Año','Sugerido','Autorizado','Costo promedio','Monto autorizado']
     def col(index):
         text=''
         while index:
@@ -5269,10 +5269,10 @@ def archivo_excel_integracion_compra(rows,semana):
         return f'<c r="{reference}"{style} t="inlineStr"><is><t>{xml_escape(str(value))}</t></is></c>'
     xml_rows=['<row r="1">'+''.join(cell(f'{col(i)}1',value,True) for i,value in enumerate(headers,1))+'</row>']
     for row_number,row in enumerate(rows,2):
-        values=[semana,row['modelo'],row['anio'],row['sugerido'],row['autorizado']]
+        values=[semana,row['modelo'],row['anio'],row['sugerido'],row['autorizado'],row['costo_promedio'],row['monto_autorizado']]
         xml_rows.append(f'<row r="{row_number}">'+''.join(cell(f'{col(i)}{row_number}',value) for i,value in enumerate(values,1))+'</row>')
     last_row=max(1,len(rows)+1)
-    sheet='<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" state="frozen"/></sheetView></sheetViews><cols><col min="1" max="1" width="14" customWidth="1"/><col min="2" max="2" width="22" customWidth="1"/><col min="3" max="5" width="14" customWidth="1"/></cols><sheetData>'+''.join(xml_rows)+f'</sheetData><autoFilter ref="A1:E{last_row}"/></worksheet>'
+    sheet='<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" state="frozen"/></sheetView></sheetViews><cols><col min="1" max="1" width="14" customWidth="1"/><col min="2" max="2" width="22" customWidth="1"/><col min="3" max="5" width="14" customWidth="1"/><col min="6" max="7" width="18" customWidth="1"/></cols><sheetData>'+''.join(xml_rows)+f'</sheetData><autoFilter ref="A1:G{last_row}"/></worksheet>'
     styles='<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="2"><font><sz val="10"/><name val="Calibri"/></font><font><b/><color rgb="FFFFFFFF"/><sz val="10"/><name val="Calibri"/></font></fonts><fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FF175CD3"/><bgColor indexed="64"/></patternFill></fill></fills><borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/><xf numFmtId="0" fontId="1" fillId="1" borderId="0" applyFont="1" applyFill="1"/></cellXfs></styleSheet>'
     output=io.BytesIO()
     with zipfile.ZipFile(output,'w',zipfile.ZIP_DEFLATED) as archive:
@@ -5295,7 +5295,10 @@ def exportar_integracion_compra():
             for detail in model['distribucion']:
                 sugerido=int(detail.get('sugerido') or 0); autorizado=int(detail.get('autorizada') or 0)
                 if sugerido or autorizado:
-                    rows.append({'modelo':model['modelo'],'anio':int(detail['anio']),'sugerido':sugerido,'autorizado':autorizado})
+                    costo=round(float(detail.get('costo_promedio_autorizado') or 0),2)
+                    rows.append({'modelo':model['modelo'],'anio':int(detail['anio']),'sugerido':sugerido,
+                                 'autorizado':autorizado,'costo_promedio':costo,
+                                 'monto_autorizado':round(autorizado*costo,2)})
     finally: c.close()
     rows.sort(key=lambda item:(item['modelo'],item['anio']))
     return send_file(archivo_excel_integracion_compra(rows,semana),as_attachment=True,
