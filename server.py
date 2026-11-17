@@ -5074,6 +5074,7 @@ def datos_planificacion_compra(c, semanas=12, semana_autorizacion=None):
         model=_modelo_planificacion(row['modelo']); models.add(model)
         sales[model]=int(row['cantidad'] or 0)
     costos_promedio={}
+    costos_promedio_por_anio={}
     for row in c.execute('''SELECT v.modelo,
             AVG(CASE WHEN COALESCE(a.costo_compra,0)>0 THEN a.costo_compra
                      WHEN COALESCE(v.precio_compra,0)>0 THEN v.precio_compra END) costo_promedio
@@ -5081,6 +5082,15 @@ def datos_planificacion_compra(c, semanas=12, semana_autorizacion=None):
         WHERE COALESCE(a.costo_compra,v.precio_compra,0)>0
         GROUP BY v.modelo'''):
         costos_promedio[_modelo_planificacion(row['modelo'])]=round(float(row['costo_promedio'] or 0),2)
+    for row in c.execute('''SELECT v.modelo,v.anio,
+            AVG(CASE WHEN COALESCE(a.costo_compra,0)>0 THEN a.costo_compra
+                     WHEN COALESCE(v.precio_compra,0)>0 THEN v.precio_compra END) costo_promedio
+        FROM vehiculos v LEFT JOIN adquisiciones a ON a.vehiculo_id=v.id
+        WHERE COALESCE(a.costo_compra,v.precio_compra,0)>0 AND v.anio IS NOT NULL
+        GROUP BY v.modelo,v.anio'''):
+        try: anio=int(row['anio'])
+        except (TypeError,ValueError): continue
+        costos_promedio_por_anio[(_modelo_planificacion(row['modelo']),anio)]=round(float(row['costo_promedio'] or 0),2)
     transit_by_model={model:[0]*semanas for model in models}; workshop_by_model={model:[0]*semanas for model in models}
     transit_records=[]
     without_eta=[]; without_delivery=[]
@@ -5150,9 +5160,18 @@ def datos_planificacion_compra(c, semanas=12, semana_autorizacion=None):
             value=param['distribucion'].get(year,0)
             actual=current['anios'].get(year,0)
             anio=int(year)
+            costo_anio=costos_promedio_por_anio.get((model,anio))
+            if costo_anio is None:
+                # Si no hay compras de ese año exacto, se usa la referencia
+                # más próxima del mismo modelo; en empate se privilegia el
+                # año más reciente.
+                referencias=[(costo_year,costo) for (costo_model,costo_year),costo in costos_promedio_por_anio.items()
+                             if costo_model==model]
+                costo_anio=min(referencias,key=lambda item:(abs(item[0]-anio),-item[0]))[1] if referencias else 0
             distribution.append({'anio':anio,'ideal':value,'actual':actual,'sugerido':max(0,value-actual),
                                  'autorizada':autorizaciones.get((model,anio),0),
-                                 'costo_promedio_autorizado':costos_autorizados.get((model,anio),costos_promedio.get(model,0))})
+                                 'costo_promedio_autorizado':costos_autorizados.get((model,anio),costo_anio),
+                                 'costo_promedio_modelo_anio':costo_anio})
         # El sugerido se compra por unidades completas: medio vehículo o más
         # requiere una unidad; cualquier fracción menor no genera compra.
         faltante_bruto=max(0,meta_dinamica-current_total)
