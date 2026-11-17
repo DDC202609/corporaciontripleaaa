@@ -5294,7 +5294,7 @@ def exportar_integracion_compra():
         for model in data['modelos']:
             for detail in model['distribucion']:
                 sugerido=int(detail.get('sugerido') or 0); autorizado=int(detail.get('autorizada') or 0)
-                if sugerido or autorizado:
+                if autorizado:
                     costo=round(float(detail.get('costo_promedio_autorizado') or 0),2)
                     rows.append({'modelo':model['modelo'],'anio':int(detail['anio']),'sugerido':sugerido,
                                  'autorizado':autorizado,'costo_promedio':costo,
