@@ -521,6 +521,20 @@ def init_db(sync_history=True):
         actualizado_en TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         PRIMARY KEY(modelo,anio)
     )''')
+    # Las nuevas autorizaciones se revisan semanalmente.  La tabla anterior se
+    # conserva como histórico para no modificar decisiones ya registradas.
+    c.execute('''CREATE TABLE IF NOT EXISTS planificacion_compra_autorizaciones_semanales(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        semana TEXT NOT NULL,
+        modelo TEXT NOT NULL COLLATE NOCASE,
+        anio INTEGER NOT NULL,
+        cantidad INTEGER NOT NULL DEFAULT 0,
+        costo_promedio REAL NOT NULL DEFAULT 0,
+        actualizado_en TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(semana,modelo,anio)
+    )''')
+    c.execute('''CREATE INDEX IF NOT EXISTS idx_planificacion_compra_autorizaciones_semana
+                 ON planificacion_compra_autorizaciones_semanales(semana,modelo,anio)''')
     c.execute('''CREATE TABLE IF NOT EXISTS ordenes_trabajo(
         id INTEGER PRIMARY KEY AUTOINCREMENT,vehiculo_id INTEGER NOT NULL REFERENCES vehiculos(id),adquisicion_id INTEGER REFERENCES adquisiciones(id),
         fecha TEXT NOT NULL,estado TEXT NOT NULL DEFAULT 'Pendiente',detalle TEXT,creado_en TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)''')
@@ -4891,19 +4905,23 @@ def get_planificacion_financiera():
     # La compra autorizada se muestra aparte de la sugerida. Es una intención
     # aprobada por gerencia: no crea una adquisición, CxP ni asiento contable.
     compras_autorizadas=[]
-    for modelo in planificacion_compra['modelos']:
-        costo_promedio=costos_promedio.get(modelo['modelo'],0)
-        for detalle in modelo.get('distribucion') or []:
-            unidades=max(0,int(detalle.get('autorizada') or 0))
-            if not unidades: continue
-            compras_autorizadas.append({
-                'fecha_compromiso':inicio_plan.isoformat(),
-                'semana_compra':(inicio_plan-timedelta(days=inicio_plan.weekday())).isoformat(),
-                'modelo':modelo['modelo'],'anio':int(detalle['anio']),'unidades':unidades,
-                'costo_promedio':costo_promedio,'pendiente':round(unidades*costo_promedio,2),
-                'origen':'Compra autorizada','etapa':'Compra autorizada',
-                'motivo':'Autorización manual desde integración de compra sugerida.',
-            })
+    # Cada autorización pertenece a su semana de revisión.  De ese modo la
+    # planificación de caja conserva el histórico y no reubica una decisión
+    # de una semana anterior en la semana actual.
+    for detalle in c.execute('''SELECT semana,modelo,anio,cantidad,costo_promedio
+                                FROM planificacion_compra_autorizaciones_semanales
+                                WHERE substr(semana,1,7)=? AND cantidad>0
+                                ORDER BY semana,modelo,anio''',(mes,)).fetchall():
+        modelo=_modelo_planificacion(detalle['modelo'])
+        unidades=max(0,int(detalle['cantidad'] or 0))
+        costo=float(detalle['costo_promedio'] or 0) or costos_promedio.get(modelo,0)
+        compras_autorizadas.append({
+            'fecha_compromiso':detalle['semana'],'semana_compra':detalle['semana'],
+            'modelo':modelo,'anio':int(detalle['anio']),'unidades':unidades,
+            'costo_promedio':round(costo,2),'pendiente':round(unidades*costo,2),
+            'origen':'Compra autorizada','etapa':'Compra autorizada',
+            'motivo':'Autorización semanal desde planificación de compra.',
+        })
     compras_autorizadas.sort(key=lambda item:(item['modelo'],item['anio']))
     autorizadas_del_mes=[item for item in compras_autorizadas if item['fecha_compromiso'][:7]==mes]
     summary['compra_sugerida']=round(sum(item['pendiente'] for item in compras_del_mes),2)
@@ -4947,6 +4965,17 @@ def _redondear_unidad_compra(cantidad):
     """Convierte un faltante no negativo a una cantidad comprable entera."""
     return int(max(0,float(cantidad or 0))+0.5)
 
+def _semana_planificacion(valor=None):
+    """Devuelve el lunes de la semana solicitada, o el de la semana actual."""
+    if valor:
+        try:
+            fecha=datetime.strptime(str(valor)[:10],'%Y-%m-%d').date()
+        except (TypeError,ValueError):
+            raise ValueError
+    else:
+        fecha=ahora_operacion().date()
+    return fecha-timedelta(days=fecha.weekday())
+
 def _normalizar_parametros_planificacion(items):
     if not isinstance(items,list): raise ValueError
     normalized=[]; seen=set()
@@ -4980,19 +5009,24 @@ def _guardar_parametros_planificacion(items):
         c.rollback(); raise
     finally: c.close()
 
-def datos_planificacion_compra(c, semanas=12):
+def datos_planificacion_compra(c, semanas=12, semana_autorizacion=None):
     """Calcula la disponibilidad semanal sin crear compras ni asientos."""
-    today=datetime.now().date()
-    monday=today-timedelta(days=today.weekday())
+    today=ahora_operacion().date()
+    monday=_semana_planificacion()
+    authorization_week=_semana_planificacion(semana_autorizacion)
     weeks=[monday+timedelta(days=index*7) for index in range(semanas)]
     year_values=set(range(2010,today.year+1))
     parameters={}
     autorizaciones={}
-    for row in c.execute('SELECT modelo,anio,cantidad FROM planificacion_compra_autorizaciones'):
+    costos_autorizados={}
+    for row in c.execute('''SELECT modelo,anio,cantidad,costo_promedio
+                            FROM planificacion_compra_autorizaciones_semanales
+                            WHERE semana=?''',(authorization_week.isoformat(),)):
         modelo=_modelo_planificacion(row['modelo'])
         try: anio=int(row['anio'])
         except (TypeError,ValueError): continue
         autorizaciones[(modelo,anio)]=max(0,int(row['cantidad'] or 0))
+        costos_autorizados[(modelo,anio)]=round(float(row['costo_promedio'] or 0),2)
     for row in c.execute('SELECT * FROM planificacion_compra_parametros'):
         item=dict(row)
         try: distribution=json.loads(item.get('distribucion_anios') or '{}')
@@ -5029,7 +5063,9 @@ def datos_planificacion_compra(c, semanas=12):
         if row['anio']:
             year=str(int(row['anio'])); year_values.add(int(year))
             item['anios'][year]=item['anios'].get(year,0)+quantity
-    start_month=(today.replace(day=1)-timedelta(days=335)).isoformat()
+    # Promedio móvil de tres meses: es la base de la demanda usada para
+    # dimensionar la compra sugerida y no una meta estática de inventario.
+    start_month=(today-timedelta(days=90)).isoformat()
     sales={}
     for row in c.execute("""SELECT v.modelo,COUNT(*) cantidad FROM ventas ve
         JOIN vehiculos v ON v.id=ve.vehiculo_id
@@ -5080,8 +5116,12 @@ def datos_planificacion_compra(c, semanas=12):
     for model in sorted(models,key=lambda item:(-sales.get(item,0),item)):
         current=inventory.get(model,{'DPV':0,'En Taller':0,'En Tránsito':0,'Consignación':0,'anios':{}})
         param=parameters.get(model,{'dpv':0,'taller':0,'transito':0,'distribucion':{}})
-        average=round(sales.get(model,0)/12,2)
+        average=round(sales.get(model,0)/3,2)
         target_total=param['dpv']+param['taller']+param['transito']
+        # Se cubre el ciclo normal: 45 días de tránsito + 30 días de taller.
+        # La meta configurada nunca se reduce; las ventas sólo pueden elevarla.
+        demanda_reposicion=average*(75/30.4375)
+        meta_dinamica=max(float(target_total),demanda_reposicion)
         # El total y el faltante consideran las cuatro etapas operativas.
         # Quedan excluidos Vendido, Devuelto, Reservado y cualquier otra etapa.
         current_total=current['DPV']+current['En Taller']+current['En Tránsito']+current['Consignación']
@@ -5092,7 +5132,7 @@ def datos_planificacion_compra(c, semanas=12):
             deliveries+=workshop_by_model.get(model,[0]*semanas)[index]
             weekly_demand=average/4.345
             demand_total+=weekly_demand
-            available=max(0,current['DPV']+arrivals+deliveries-demand_total)
+            available=max(0,current['DPV']+current['Consignación']+arrivals+deliveries-demand_total)
             shortage=max(0,param['dpv']-available)
             projection.append({'inicio':week.isoformat(),'transito':transit_by_model.get(model,[0]*semanas)[index],
                                'taller':workshop_by_model.get(model,[0]*semanas)[index],
@@ -5111,25 +5151,30 @@ def datos_planificacion_compra(c, semanas=12):
             actual=current['anios'].get(year,0)
             anio=int(year)
             distribution.append({'anio':anio,'ideal':value,'actual':actual,'sugerido':max(0,value-actual),
-                                 'autorizada':autorizaciones.get((model,anio),0)})
+                                 'autorizada':autorizaciones.get((model,anio),0),
+                                 'costo_promedio_autorizado':costos_autorizados.get((model,anio),costos_promedio.get(model,0))})
         # El sugerido se compra por unidades completas: medio vehículo o más
         # requiere una unidad; cualquier fracción menor no genera compra.
-        faltante_bruto=max(0,target_total-current_total)
+        faltante_bruto=max(0,meta_dinamica-current_total)
         faltante_compra=_redondear_unidad_compra(faltante_bruto)
-        rows.append({'modelo':model,'promedio_mensual':average,'ventas_12_meses':sales.get(model,0),
+        rows.append({'modelo':model,'promedio_mensual':average,'ventas_3_meses':sales.get(model,0),
                      'inventario_actual':current,'inventario_optimo':param,'inventario_optimo_total':target_total,
+                     'meta_dinamica':round(meta_dinamica,2),'demanda_reposicion':round(demanda_reposicion,2),
                      'existencia_total':physical_total,'existencia_para_compra':current_total,'faltante_compra':faltante_compra,
                      'sugerido_compra':faltante_compra,'costo_promedio':costos_promedio.get(model,0),
                      'distribucion':distribution,'proyeccion':projection})
     for week in weekly:
         for key in ('demanda','faltante_dpv'): week[key]=round(week[key],2)
     return {'anios':sorted(year_values),'modelos':rows,'semanas':weekly,'transitos':transit_records,
-            'sin_eta':without_eta,'sin_entrega':without_delivery,'periodo_ventas':{'desde':start_month,'hasta':today.isoformat()}}
+            'sin_eta':without_eta,'sin_entrega':without_delivery,'semana_autorizacion':authorization_week.isoformat(),
+            'periodo_ventas':{'desde':start_month,'hasta':today.isoformat(),'meses':3}}
 
 @app.get('/api/planificacion-compra')
 def get_planificacion_compra():
+    try: semana=_semana_planificacion(request.args.get('semana')).isoformat()
+    except ValueError: return jsonify(error='Ingrese una semana válida.'),400
     c=db()
-    try: data=datos_planificacion_compra(c)
+    try: data=datos_planificacion_compra(c,semana_autorizacion=semana)
     finally: c.close()
     return jsonify(data)
 
@@ -5158,6 +5203,84 @@ def put_planificacion_compra_autorizaciones():
         c.rollback(); raise
     finally: c.close()
     return jsonify(ok=True,modelo=modelo,anio=anio,cantidad=cantidad)
+
+@app.put('/api/planificacion-compra/autorizaciones-semanales')
+def put_planificacion_compra_autorizaciones_semanales():
+    """Guarda una autorización semanal sin crear compra, CxP ni asientos."""
+    data=request.get_json(silent=True) or {}
+    try:
+        semana=_semana_planificacion(data.get('semana')).isoformat()
+        modelo=_modelo_planificacion(data.get('modelo'))
+        anio=int(data.get('anio'))
+        cantidad=max(0,int(float(data.get('cantidad',0) or 0)))
+        costo=max(0,float(data.get('costo_promedio',0) or 0))
+        if not modelo or not 1900<=anio<=2100: raise ValueError
+    except (TypeError,ValueError,OverflowError):
+        return jsonify(error='Revise la semana, modelo, año, cantidad y costo promedio.'),400
+    c=db()
+    try:
+        if cantidad:
+            c.execute('''INSERT INTO planificacion_compra_autorizaciones_semanales(
+                    semana,modelo,anio,cantidad,costo_promedio,actualizado_en)
+                VALUES(?,?,?,?,?,CURRENT_TIMESTAMP)
+                ON CONFLICT(semana,modelo,anio) DO UPDATE SET
+                    cantidad=excluded.cantidad,costo_promedio=excluded.costo_promedio,
+                    actualizado_en=CURRENT_TIMESTAMP''',(semana,modelo,anio,cantidad,costo))
+        else:
+            c.execute('''DELETE FROM planificacion_compra_autorizaciones_semanales
+                         WHERE semana=? AND modelo=? AND anio=?''',(semana,modelo,anio))
+        c.commit()
+    except Exception:
+        c.rollback(); raise
+    finally: c.close()
+    return jsonify(ok=True,semana=semana,modelo=modelo,anio=anio,cantidad=cantidad,costo_promedio=round(costo,2))
+
+def archivo_excel_integracion_compra(rows,semana):
+    """Exportación XLSX pequeña, compatible con Excel, del resumen semanal."""
+    headers=['Semana','Modelo','Año','Sugerido','Autorizado']
+    def col(index):
+        text=''
+        while index:
+            index,remainder=divmod(index-1,26); text=chr(65+remainder)+text
+        return text
+    def cell(reference,value,header=False):
+        style=' s="1"' if header else ''
+        if isinstance(value,(int,float)):
+            return f'<c r="{reference}"{style}><v>{value}</v></c>'
+        return f'<c r="{reference}"{style} t="inlineStr"><is><t>{xml_escape(str(value))}</t></is></c>'
+    xml_rows=['<row r="1">'+''.join(cell(f'{col(i)}1',value,True) for i,value in enumerate(headers,1))+'</row>']
+    for row_number,row in enumerate(rows,2):
+        values=[semana,row['modelo'],row['anio'],row['sugerido'],row['autorizado']]
+        xml_rows.append(f'<row r="{row_number}">'+''.join(cell(f'{col(i)}{row_number}',value) for i,value in enumerate(values,1))+'</row>')
+    last_row=max(1,len(rows)+1)
+    sheet='<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" state="frozen"/></sheetView></sheetViews><cols><col min="1" max="1" width="14" customWidth="1"/><col min="2" max="2" width="22" customWidth="1"/><col min="3" max="5" width="14" customWidth="1"/></cols><sheetData>'+''.join(xml_rows)+f'</sheetData><autoFilter ref="A1:E{last_row}"/></worksheet>'
+    styles='<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="2"><font><sz val="10"/><name val="Calibri"/></font><font><b/><color rgb="FFFFFFFF"/><sz val="10"/><name val="Calibri"/></font></fonts><fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FF175CD3"/><bgColor indexed="64"/></patternFill></fill></fills><borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/><xf numFmtId="0" fontId="1" fillId="1" borderId="0" applyFont="1" applyFill="1"/></cellXfs></styleSheet>'
+    output=io.BytesIO()
+    with zipfile.ZipFile(output,'w',zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr('[Content_Types].xml','<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>')
+        archive.writestr('_rels/.rels','<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>')
+        archive.writestr('xl/workbook.xml','<?xml version="1.0" encoding="UTF-8"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Compra semanal" sheetId="1" r:id="rId1"/></sheets></workbook>')
+        archive.writestr('xl/_rels/workbook.xml.rels','<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>')
+        archive.writestr('xl/styles.xml',styles); archive.writestr('xl/worksheets/sheet1.xml',sheet)
+    output.seek(0); return output
+
+@app.get('/api/planificacion-compra/integracion/exportar')
+def exportar_integracion_compra():
+    try: semana=_semana_planificacion(request.args.get('semana')).isoformat()
+    except ValueError: return jsonify(error='Ingrese una semana válida.'),400
+    c=db()
+    try:
+        data=datos_planificacion_compra(c,semana_autorizacion=semana)
+        rows=[]
+        for model in data['modelos']:
+            for detail in model['distribucion']:
+                sugerido=int(detail.get('sugerido') or 0); autorizado=int(detail.get('autorizada') or 0)
+                if sugerido or autorizado:
+                    rows.append({'modelo':model['modelo'],'anio':int(detail['anio']),'sugerido':sugerido,'autorizado':autorizado})
+    finally: c.close()
+    rows.sort(key=lambda item:(item['modelo'],item['anio']))
+    return send_file(archivo_excel_integracion_compra(rows,semana),as_attachment=True,
+        download_name=f'integracion_compra_{semana}.xlsx',mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
 
 @app.put('/api/planificacion-compra/parametros')
 def put_planificacion_compra_parametros():
