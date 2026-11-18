@@ -43,7 +43,7 @@ ACCESS_MODULES=(
     ('ventas','Ventas y cobros'),('vendedores','Vendedores'),('inventario','Consulta de inventario'),('conteo_inventario','Conteo físico de inventario'),
     ('catalogo','Catálogo contable'),('centros_costo','Centros de costo'),('cartera','Cuentas por cobrar y pagar'),('contabilidad','Contabilidad'),
     ('caja_bancos','Caja y bancos'),('gastos','Registro de gastos'),('comisiones','Comisiones'),('planillas','Planillas'),('contratos','Contratos'),
-    ('planificacion_financiera','Planificación financiera'),('planificacion_compra','Planificación de compra'),('reporte_ventas','Reporte de ventas'),('reporte_combustible','Reporte de combustible'),('reporte_ciclo_conversion','Reporte de ciclo de conversión'),('auditoria','Bitácora de auditoría'),
+    ('planificacion_financiera','Planificación financiera'),('planificacion_compra','Planificación de compra'),('reporte_ventas','Reporte de ventas'),('reporte_combustible','Reporte de combustible'),('reporte_ciclo_conversion','Reporte de ciclo de conversión'),('reporte_antiguedad_inventario','Reporte de antigüedad de inventario'),('auditoria','Bitácora de auditoría'),
 )
 
 def init_access_control_schema():
@@ -85,9 +85,9 @@ def init_access_control_schema():
                   (name,description,is_admin,is_system))
     profiles={row['nombre']:row['id'] for row in c.execute('SELECT id,nombre FROM perfiles')}
     all_modules={key for key,_ in ACCESS_MODULES}
-    operational={'dashboard','vehiculos','informacion_vehiculo','proveedores','adquisiciones','taller','costeo','ventas','inventario','conteo_inventario','catalogo','centros_costo','vendedores','gastos','cartera','planificacion_compra','planillas','reporte_ventas','reporte_combustible','reporte_ciclo_conversion'}
+    operational={'dashboard','vehiculos','informacion_vehiculo','proveedores','adquisiciones','taller','costeo','ventas','inventario','conteo_inventario','catalogo','centros_costo','vendedores','gastos','cartera','planificacion_compra','planillas','reporte_ventas','reporte_combustible','reporte_ciclo_conversion','reporte_antiguedad_inventario'}
     sales={'dashboard','vehiculos','ventas','vendedores','inventario','caja_bancos','comisiones'}
-    consultation={'dashboard','vehiculos','inventario','conteo_inventario','contabilidad','caja_bancos','ventas','reporte_ventas','reporte_combustible','reporte_ciclo_conversion'}
+    consultation={'dashboard','vehiculos','inventario','conteo_inventario','contabilidad','caja_bancos','ventas','reporte_ventas','reporte_combustible','reporte_ciclo_conversion','reporte_antiguedad_inventario'}
     for profile_name,allowed in (('Administrador',all_modules),('Operaciones',operational),('Ventas',sales),('Consulta',consultation)):
         profile_id=profiles.get(profile_name)
         if not profile_id: continue
@@ -159,6 +159,7 @@ def request_module(path):
     if path.startswith('/api/reportes/ventas'): return 'reporte_ventas'
     if path.startswith('/api/reportes/combustible'): return 'reporte_combustible'
     if path.startswith('/api/reportes/ciclo-conversion'): return 'reporte_ciclo_conversion'
+    if path.startswith('/api/reportes/antiguedad-inventario'): return 'reporte_antiguedad_inventario'
     if path.startswith('/api/conteos-inventario'): return 'conteo_inventario'
     if path.startswith('/api/contabilidad'): return 'contabilidad'
     if path.startswith('/api/cuentas-por-'): return 'cartera'
@@ -4503,6 +4504,41 @@ def exportar_reporte_ciclo_conversion_excel():
     suffix=f'{desde or "inicio"}_a_{hasta or "hoy"}'
     return send_file(archivo_excel_ciclo_conversion(filas_reporte_ciclo_conversion(desde,hasta)),as_attachment=True,
         download_name=f'ciclo_conversion_{suffix}.xlsx',mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+
+def filas_reporte_antiguedad_inventario():
+    """Inventario disponible en DPV, con su costo y antigüedad a la fecha."""
+    c=db()
+    try:
+        fecha_adquisicion="COALESCE((SELECT MIN(a.fecha) FROM adquisiciones a WHERE a.vehiculo_id=v.id),v.fecha_adquisicion)"
+        hoy=ahora_operacion().strftime('%Y-%m-%d')
+        rows=c.execute(f'''SELECT v.id vehiculo_id,v.vin,v.marca,v.modelo,v.anio,v.precio_compra,
+            COALESCE(ca.ajuste_compra,0) ajuste_compra,COALESCE(ca.grua,0) grua,COALESCE(ca.flete,0) flete,
+            COALESCE(ca.isv_pagado,0) isv_pagado,COALESCE(ca.cl_std,0) cl_std,
+            COALESCE(ca.almacenaje,0) almacenaje,COALESCE(ca.gastos_aduaneros,0) gastos_aduaneros,
+            {fecha_adquisicion} fecha_adquisicion,
+            CASE WHEN {fecha_adquisicion} IS NOT NULL
+                 THEN MAX(0,CAST(julianday(?) - julianday({fecha_adquisicion}) AS INTEGER)) END antiguedad_dias
+            FROM vehiculos v
+            LEFT JOIN costos_adquisicion ca ON ca.vehiculo_id=v.id
+            WHERE v.estado='DPV'
+            ORDER BY {fecha_adquisicion} IS NULL,{fecha_adquisicion} ASC,v.vin ASC''',(hoy,)).fetchall()
+        result=[]
+        for row in rows:
+            item=dict(row)
+            item['costo_total_costeo']=round(sum(float(item[key] or 0) for key in (
+                'precio_compra','ajuste_compra','grua','flete','isv_pagado','cl_std','almacenaje','gastos_aduaneros'
+            )),2)
+            item['gastos_reparaciones']=round(float(c.execute(
+                'SELECT COALESCE(SUM(monto),0) FROM costos_vehiculo WHERE vehiculo_id=?',(item['vehiculo_id'],)
+            ).fetchone()[0] or 0),2)
+            result.append(item)
+        return result
+    finally:
+        c.close()
+
+@app.get('/api/reportes/antiguedad-inventario')
+def reporte_antiguedad_inventario():
+    return jsonify(filas_reporte_antiguedad_inventario())
 
 @app.get('/api/reportes/componentes-costo/exportar')
 def exportar_componentes_costo_excel():
