@@ -43,7 +43,7 @@ ACCESS_MODULES=(
     ('ventas','Ventas y cobros'),('vendedores','Vendedores'),('inventario','Consulta de inventario'),('conteo_inventario','Conteo físico de inventario'),
     ('catalogo','Catálogo contable'),('centros_costo','Centros de costo'),('cartera','Cuentas por cobrar y pagar'),('contabilidad','Contabilidad'),
     ('caja_bancos','Caja y bancos'),('gastos','Registro de gastos'),('comisiones','Comisiones'),('planillas','Planillas'),('contratos','Contratos'),
-    ('planificacion_financiera','Planificación financiera'),('planificacion_compra','Planificación de compra'),('reporte_ventas','Reporte de ventas'),('reporte_combustible','Reporte de combustible'),('auditoria','Bitácora de auditoría'),
+    ('planificacion_financiera','Planificación financiera'),('planificacion_compra','Planificación de compra'),('reporte_ventas','Reporte de ventas'),('reporte_combustible','Reporte de combustible'),('reporte_ciclo_conversion','Reporte de ciclo de conversión'),('auditoria','Bitácora de auditoría'),
 )
 
 def init_access_control_schema():
@@ -85,9 +85,9 @@ def init_access_control_schema():
                   (name,description,is_admin,is_system))
     profiles={row['nombre']:row['id'] for row in c.execute('SELECT id,nombre FROM perfiles')}
     all_modules={key for key,_ in ACCESS_MODULES}
-    operational={'dashboard','vehiculos','informacion_vehiculo','proveedores','adquisiciones','taller','costeo','ventas','inventario','conteo_inventario','catalogo','centros_costo','vendedores','gastos','cartera','planificacion_compra','planillas','reporte_ventas','reporte_combustible'}
+    operational={'dashboard','vehiculos','informacion_vehiculo','proveedores','adquisiciones','taller','costeo','ventas','inventario','conteo_inventario','catalogo','centros_costo','vendedores','gastos','cartera','planificacion_compra','planillas','reporte_ventas','reporte_combustible','reporte_ciclo_conversion'}
     sales={'dashboard','vehiculos','ventas','vendedores','inventario','caja_bancos','comisiones'}
-    consultation={'dashboard','vehiculos','inventario','conteo_inventario','contabilidad','caja_bancos','ventas','reporte_ventas','reporte_combustible'}
+    consultation={'dashboard','vehiculos','inventario','conteo_inventario','contabilidad','caja_bancos','ventas','reporte_ventas','reporte_combustible','reporte_ciclo_conversion'}
     for profile_name,allowed in (('Administrador',all_modules),('Operaciones',operational),('Ventas',sales),('Consulta',consultation)):
         profile_id=profiles.get(profile_name)
         if not profile_id: continue
@@ -158,6 +158,7 @@ def request_module(path):
     if path.startswith('/api/planificacion-compra'): return 'planificacion_compra'
     if path.startswith('/api/reportes/ventas'): return 'reporte_ventas'
     if path.startswith('/api/reportes/combustible'): return 'reporte_combustible'
+    if path.startswith('/api/reportes/ciclo-conversion'): return 'reporte_ciclo_conversion'
     if path.startswith('/api/conteos-inventario'): return 'conteo_inventario'
     if path.startswith('/api/contabilidad'): return 'contabilidad'
     if path.startswith('/api/cuentas-por-'): return 'cartera'
@@ -4420,6 +4421,29 @@ def reporte_combustible_por_vehiculo():
             vehicle=' · '.join(filter(None,[item.get('vin'), ' '.join(filter(None,[item.get('marca'),item.get('modelo')])),item.get('placa')]))
             item['vehiculo']=vehicle or 'Sin vehículo asignado'
             rows.append(item)
+        return jsonify(rows)
+    finally:
+        c.close()
+
+@app.get('/api/reportes/ciclo-conversion')
+def reporte_ciclo_conversion():
+    """Mide los días desde la primera adquisición registrada hasta la venta."""
+    desde,hasta,error=parametros_reporte_ventas()
+    if error: return jsonify(error=error),400
+    c=db()
+    try:
+        fecha_adquisicion="COALESCE((SELECT MIN(a.fecha) FROM adquisiciones a WHERE a.vehiculo_id=v.id),v.fecha_adquisicion)"
+        sql=f'''SELECT ve.id,ve.numero_transaccion,ve.fecha fecha_venta,
+            v.vin,v.marca,v.modelo,v.version,v.anio,v.placa,{fecha_adquisicion} fecha_adquisicion,
+            CASE WHEN {fecha_adquisicion} IS NOT NULL
+                THEN CAST(julianday(ve.fecha)-julianday({fecha_adquisicion}) AS INTEGER) END dias_conversion
+            FROM ventas ve JOIN vehiculos v ON v.id=ve.vehiculo_id WHERE 1=1'''
+        args=[]
+        if desde:
+            sql+=' AND ve.fecha>=?'; args.append(desde)
+        if hasta:
+            sql+=' AND ve.fecha<=?'; args.append(hasta)
+        rows=[dict(row) for row in c.execute(sql+' ORDER BY ve.fecha DESC,COALESCE(ve.correlativo,0) DESC,ve.id DESC',args).fetchall()]
         return jsonify(rows)
     finally:
         c.close()
