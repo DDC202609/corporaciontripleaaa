@@ -4425,11 +4425,8 @@ def reporte_combustible_por_vehiculo():
     finally:
         c.close()
 
-@app.get('/api/reportes/ciclo-conversion')
-def reporte_ciclo_conversion():
+def filas_reporte_ciclo_conversion(desde,hasta):
     """Mide los días desde la primera adquisición registrada hasta la venta."""
-    desde,hasta,error=parametros_reporte_ventas()
-    if error: return jsonify(error=error),400
     c=db()
     try:
         fecha_adquisicion="COALESCE((SELECT MIN(a.fecha) FROM adquisiciones a WHERE a.vehiculo_id=v.id),v.fecha_adquisicion)"
@@ -4448,10 +4445,57 @@ def reporte_ciclo_conversion():
             item=dict(row)
             item['costo']=round(float(costo_consolidado(c,item['vehiculo_id']) or 0),2)
             item['venta']=round(float(item.get('venta') or 0),2)
+            item['vehiculo']=' · '.join(filter(None,[item.get('vin'),' '.join(filter(None,[item.get('marca'),item.get('modelo')])),item.get('placa')])) or '—'
             rows.append(item)
-        return jsonify(rows)
+        return rows
     finally:
         c.close()
+
+def archivo_excel_ciclo_conversion(rows):
+    """Exportación ligera y compatible con Excel del ciclo de conversión."""
+    headers=['No. transacción','VIN','Marca','Modelo','Año','Fecha adquisición','Fecha venta','Costo','Venta','Ciclo de conversión (días)']
+    columns=['numero_transaccion','vin','marca','modelo','anio','fecha_adquisicion','fecha_venta','costo','venta','dias_conversion']
+    def col(index):
+        text=''
+        while index:
+            index,remainder=divmod(index-1,26); text=chr(65+remainder)+text
+        return text
+    def cell(reference,value,style=None,numeric=False):
+        style_attr=f' s="{style}"' if style is not None else ''
+        if numeric and value is not None:
+            return f'<c r="{reference}"{style_attr}><v>{float(value)}</v></c>'
+        safe=xml_escape(str(value if value not in (None,'') else '—'))
+        return f'<c r="{reference}"{style_attr} t="inlineStr"><is><t>{safe}</t></is></c>'
+    lines=['<row r="1">'+''.join(cell(f'{col(index)}1',value,1) for index,value in enumerate(headers,1))+'</row>']
+    for row_number,row in enumerate(rows,2):
+        values=[]
+        for index,key in enumerate(columns,1):
+            values.append(cell(f'{col(index)}{row_number}',row.get(key),2 if key in {'costo','venta'} else None,key in {'costo','venta','dias_conversion'}))
+        lines.append(f'<row r="{row_number}">'+''.join(values)+'</row>')
+    sheet='<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews><sheetFormatPr defaultRowHeight="15"/><cols>'+''.join(f'<col min="{index}" max="{index}" width="{width}" customWidth="1"/>' for index,width in enumerate((18,22,16,20,10,18,16,16,16,27),1))+'</cols><sheetData>'+''.join(lines)+'</sheetData><autoFilter ref="A1:J'+str(max(1,len(rows)+1))+'"/></worksheet>'
+    styles_xml='<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><numFmts count="1"><numFmt numFmtId="164" formatCode="&quot;L&quot; #,##0.00"/></numFmts><fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><color rgb="FFFFFFFF"/><sz val="11"/><name val="Calibri"/></font></fonts><fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FF175CD3"/><bgColor indexed="64"/></patternFill></fill></fills><borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellXfs count="3"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/><xf numFmtId="0" fontId="1" fillId="1" borderId="0" applyFont="1" applyFill="1"/><xf numFmtId="164" fontId="0" fillId="0" borderId="0" applyNumberFormat="1"/></cellXfs></styleSheet>'
+    output=io.BytesIO()
+    with zipfile.ZipFile(output,'w',zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr('[Content_Types].xml','<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>')
+        archive.writestr('_rels/.rels','<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>')
+        archive.writestr('xl/workbook.xml','<?xml version="1.0" encoding="UTF-8"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Ciclo de conversión" sheetId="1" r:id="rId1"/></sheets></workbook>')
+        archive.writestr('xl/_rels/workbook.xml.rels','<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>')
+        archive.writestr('xl/styles.xml',styles_xml); archive.writestr('xl/worksheets/sheet1.xml',sheet)
+    output.seek(0); return output
+
+@app.get('/api/reportes/ciclo-conversion')
+def reporte_ciclo_conversion():
+    desde,hasta,error=parametros_reporte_ventas()
+    if error: return jsonify(error=error),400
+    return jsonify(filas_reporte_ciclo_conversion(desde,hasta))
+
+@app.get('/api/reportes/ciclo-conversion/exportar')
+def exportar_reporte_ciclo_conversion_excel():
+    desde,hasta,error=parametros_reporte_ventas()
+    if error: return jsonify(error=error),400
+    suffix=f'{desde or "inicio"}_a_{hasta or "hoy"}'
+    return send_file(archivo_excel_ciclo_conversion(filas_reporte_ciclo_conversion(desde,hasta)),as_attachment=True,
+        download_name=f'ciclo_conversion_{suffix}.xlsx',mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
 
 @app.get('/api/reportes/componentes-costo/exportar')
 def exportar_componentes_costo_excel():
