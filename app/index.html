@@ -1725,11 +1725,16 @@ let expenseRows=[];
 function expenseDetailValue(label,value){return `<div><div class="label">${esc(label)}</div><b>${value||'—'}</b></div>`}
 function openExpenseDetail(id){
   let row=expenseRows.find(item=>Number(item.id)===Number(id));if(!row)return showNotice('No fue posible encontrar el gasto seleccionado.','error');
+  const esCombustible=String(row.concepto||'').trim().toLocaleLowerCase()==='combustibles';
+  const vehiculoAbastecido=row.vehiculo_vin
+    ?`${esc(row.vehiculo_vin)} · ${esc([row.vehiculo_marca,row.vehiculo_modelo].filter(Boolean).join(' '))}${row.vehiculo_placa?` · ${esc(row.vehiculo_placa)}`:''}`
+    :'Sin vehículo asignado';
   $('expenseDetailContent').innerHTML=[
     expenseDetailValue('Fecha de pago',esc(row.fecha_pago)),expenseDetailValue('Concepto',esc(row.concepto)),
     expenseDetailValue('Cuenta contable',`${esc(row.cuenta_codigo||'—')} · ${esc(row.cuenta_nombre||'—')}`),expenseDetailValue('Documento',esc(row.documento||'—')),
     expenseDetailValue('Proveedor',esc(row.proveedor_nombre||'—')),expenseDetailValue('Forma de pago',esc(row.forma_pago||'—')),
     expenseDetailValue('Banco',esc(row.banco||'—')),expenseDetailValue('Referencia',esc(row.referencia||'—')),
+    ...(esCombustible?[expenseDetailValue('Vehículo / VIN abastecido',vehiculoAbastecido)]:[]),
     expenseDetailValue('Sub total',money(row.subtotal)),expenseDetailValue('ISV',money(row.isv)),expenseDetailValue('Total',money(row.total)),
     `<div class="span2"><div class="label">Observaciones</div><b>${esc(row.observaciones||'—')}</b></div>`
   ].join('');
