@@ -4433,7 +4433,7 @@ def reporte_ciclo_conversion():
     c=db()
     try:
         fecha_adquisicion="COALESCE((SELECT MIN(a.fecha) FROM adquisiciones a WHERE a.vehiculo_id=v.id),v.fecha_adquisicion)"
-        sql=f'''SELECT ve.id,ve.numero_transaccion,ve.fecha fecha_venta,
+        sql=f'''SELECT ve.id,ve.vehiculo_id,ve.numero_transaccion,ve.fecha fecha_venta,ve.precio venta,
             v.vin,v.marca,v.modelo,v.version,v.anio,v.placa,{fecha_adquisicion} fecha_adquisicion,
             CASE WHEN {fecha_adquisicion} IS NOT NULL
                 THEN CAST(julianday(ve.fecha)-julianday({fecha_adquisicion}) AS INTEGER) END dias_conversion
@@ -4443,7 +4443,12 @@ def reporte_ciclo_conversion():
             sql+=' AND ve.fecha>=?'; args.append(desde)
         if hasta:
             sql+=' AND ve.fecha<=?'; args.append(hasta)
-        rows=[dict(row) for row in c.execute(sql+' ORDER BY ve.fecha DESC,COALESCE(ve.correlativo,0) DESC,ve.id DESC',args).fetchall()]
+        rows=[]
+        for row in c.execute(sql+' ORDER BY ve.fecha DESC,COALESCE(ve.correlativo,0) DESC,ve.id DESC',args).fetchall():
+            item=dict(row)
+            item['costo']=round(float(costo_consolidado(c,item['vehiculo_id']) or 0),2)
+            item['venta']=round(float(item.get('venta') or 0),2)
+            rows.append(item)
         return jsonify(rows)
     finally:
         c.close()
