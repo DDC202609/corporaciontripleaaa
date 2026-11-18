@@ -4431,7 +4431,7 @@ def filas_reporte_ciclo_conversion(desde,hasta):
     try:
         fecha_adquisicion="COALESCE((SELECT MIN(a.fecha) FROM adquisiciones a WHERE a.vehiculo_id=v.id),v.fecha_adquisicion)"
         sql=f'''SELECT ve.id,ve.vehiculo_id,ve.numero_transaccion,ve.fecha fecha_venta,ve.precio venta,
-            v.vin,v.marca,v.modelo,v.version,v.anio,v.placa,{fecha_adquisicion} fecha_adquisicion,
+            v.vin,v.marca,v.modelo,v.version,v.anio,v.placa,v.tipo_compra,{fecha_adquisicion} fecha_adquisicion,
             CASE WHEN {fecha_adquisicion} IS NOT NULL
                 THEN CAST(julianday(ve.fecha)-julianday({fecha_adquisicion}) AS INTEGER) END dias_conversion
             FROM ventas ve JOIN vehiculos v ON v.id=ve.vehiculo_id WHERE 1=1'''
@@ -4453,8 +4453,8 @@ def filas_reporte_ciclo_conversion(desde,hasta):
 
 def archivo_excel_ciclo_conversion(rows):
     """Exportación ligera y compatible con Excel del ciclo de conversión."""
-    headers=['No. transacción','VIN','Marca','Modelo','Año','Fecha adquisición','Fecha venta','Costo','Venta','Ciclo de conversión (días)']
-    columns=['numero_transaccion','vin','marca','modelo','anio','fecha_adquisicion','fecha_venta','costo','venta','dias_conversion']
+    headers=['No. transacción','VIN','Marca','Modelo','Año','Tipo de compra','Fecha adquisición','Fecha venta','Costo','Venta','Ciclo de conversión (días)']
+    columns=['numero_transaccion','vin','marca','modelo','anio','tipo_compra','fecha_adquisicion','fecha_venta','costo','venta','dias_conversion']
     def col(index):
         text=''
         while index:
@@ -4472,7 +4472,7 @@ def archivo_excel_ciclo_conversion(rows):
         for index,key in enumerate(columns,1):
             values.append(cell(f'{col(index)}{row_number}',row.get(key),2 if key in {'costo','venta'} else None,key in {'costo','venta','dias_conversion'}))
         lines.append(f'<row r="{row_number}">'+''.join(values)+'</row>')
-    sheet='<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews><sheetFormatPr defaultRowHeight="15"/><cols>'+''.join(f'<col min="{index}" max="{index}" width="{width}" customWidth="1"/>' for index,width in enumerate((18,22,16,20,10,18,16,16,16,27),1))+'</cols><sheetData>'+''.join(lines)+'</sheetData><autoFilter ref="A1:J'+str(max(1,len(rows)+1))+'"/></worksheet>'
+    sheet='<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews><sheetFormatPr defaultRowHeight="15"/><cols>'+''.join(f'<col min="{index}" max="{index}" width="{width}" customWidth="1"/>' for index,width in enumerate((18,22,16,20,10,18,18,16,16,16,27),1))+'</cols><sheetData>'+''.join(lines)+'</sheetData><autoFilter ref="A1:K'+str(max(1,len(rows)+1))+'"/></worksheet>'
     styles_xml='<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><numFmts count="1"><numFmt numFmtId="164" formatCode="&quot;L&quot; #,##0.00"/></numFmts><fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><color rgb="FFFFFFFF"/><sz val="11"/><name val="Calibri"/></font></fonts><fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FF175CD3"/><bgColor indexed="64"/></patternFill></fill></fills><borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellXfs count="3"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/><xf numFmtId="0" fontId="1" fillId="1" borderId="0" applyFont="1" applyFill="1"/><xf numFmtId="164" fontId="0" fillId="0" borderId="0" applyNumberFormat="1"/></cellXfs></styleSheet>'
     output=io.BytesIO()
     with zipfile.ZipFile(output,'w',zipfile.ZIP_DEFLATED) as archive:
