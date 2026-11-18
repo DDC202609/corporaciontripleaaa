@@ -43,7 +43,7 @@ ACCESS_MODULES=(
     ('ventas','Ventas y cobros'),('vendedores','Vendedores'),('inventario','Consulta de inventario'),('conteo_inventario','Conteo físico de inventario'),
     ('catalogo','Catálogo contable'),('centros_costo','Centros de costo'),('cartera','Cuentas por cobrar y pagar'),('contabilidad','Contabilidad'),
     ('caja_bancos','Caja y bancos'),('gastos','Registro de gastos'),('comisiones','Comisiones'),('planillas','Planillas'),('contratos','Contratos'),
-    ('planificacion_financiera','Planificación financiera'),('planificacion_compra','Planificación de compra'),('reporte_ventas','Reporte de ventas'),('auditoria','Bitácora de auditoría'),
+    ('planificacion_financiera','Planificación financiera'),('planificacion_compra','Planificación de compra'),('reporte_ventas','Reporte de ventas'),('reporte_combustible','Reporte de combustible'),('auditoria','Bitácora de auditoría'),
 )
 
 def init_access_control_schema():
@@ -85,9 +85,9 @@ def init_access_control_schema():
                   (name,description,is_admin,is_system))
     profiles={row['nombre']:row['id'] for row in c.execute('SELECT id,nombre FROM perfiles')}
     all_modules={key for key,_ in ACCESS_MODULES}
-    operational={'dashboard','vehiculos','informacion_vehiculo','proveedores','adquisiciones','taller','costeo','ventas','inventario','conteo_inventario','catalogo','centros_costo','vendedores','gastos','cartera','planificacion_compra','planillas','reporte_ventas'}
+    operational={'dashboard','vehiculos','informacion_vehiculo','proveedores','adquisiciones','taller','costeo','ventas','inventario','conteo_inventario','catalogo','centros_costo','vendedores','gastos','cartera','planificacion_compra','planillas','reporte_ventas','reporte_combustible'}
     sales={'dashboard','vehiculos','ventas','vendedores','inventario','caja_bancos','comisiones'}
-    consultation={'dashboard','vehiculos','inventario','conteo_inventario','contabilidad','caja_bancos','ventas','reporte_ventas'}
+    consultation={'dashboard','vehiculos','inventario','conteo_inventario','contabilidad','caja_bancos','ventas','reporte_ventas','reporte_combustible'}
     for profile_name,allowed in (('Administrador',all_modules),('Operaciones',operational),('Ventas',sales),('Consulta',consultation)):
         profile_id=profiles.get(profile_name)
         if not profile_id: continue
@@ -157,6 +157,7 @@ def request_module(path):
     if path.startswith('/api/planificacion-financiera'): return 'planificacion_financiera'
     if path.startswith('/api/planificacion-compra'): return 'planificacion_compra'
     if path.startswith('/api/reportes/ventas'): return 'reporte_ventas'
+    if path.startswith('/api/reportes/combustible'): return 'reporte_combustible'
     if path.startswith('/api/conteos-inventario'): return 'conteo_inventario'
     if path.startswith('/api/contabilidad'): return 'contabilidad'
     if path.startswith('/api/cuentas-por-'): return 'cartera'
@@ -4394,6 +4395,34 @@ def exportar_reporte_ventas_excel():
     suffix=f'{desde or "inicio"}_a_{hasta or "hoy"}'
     return send_file(archivo_excel_ventas(filas_reporte_ventas(desde,hasta)),as_attachment=True,
         download_name=f'reporte_ventas_{suffix}.xlsx',mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+
+@app.get('/api/reportes/combustible')
+def reporte_combustible_por_vehiculo():
+    """Compras de combustible, conservando visibles los históricos sin VIN."""
+    desde,hasta,error=parametros_reporte_ventas()
+    if error: return jsonify(error=error),400
+    c=db()
+    try:
+        sql='''SELECT go.id,go.fecha,go.total,go.proveedor gasolinera,go.documento,
+            v.vin,v.marca,v.modelo,v.placa,go.vehiculo_id
+            FROM gastos_operativos go
+            LEFT JOIN conceptos_gasto cg ON cg.id=go.concepto_id
+            LEFT JOIN vehiculos v ON v.id=go.vehiculo_id
+            WHERE LOWER(TRIM(COALESCE(cg.nombre,go.categoria,'')))='combustibles' '''
+        args=[]
+        if desde:
+            sql+=' AND go.fecha>=?'; args.append(desde)
+        if hasta:
+            sql+=' AND go.fecha<=?'; args.append(hasta)
+        rows=[]
+        for row in c.execute(sql+' ORDER BY go.fecha DESC,go.id DESC',args).fetchall():
+            item=dict(row)
+            vehicle=' · '.join(filter(None,[item.get('vin'), ' '.join(filter(None,[item.get('marca'),item.get('modelo')])),item.get('placa')]))
+            item['vehiculo']=vehicle or 'Sin vehículo asignado'
+            rows.append(item)
+        return jsonify(rows)
+    finally:
+        c.close()
 
 @app.get('/api/reportes/componentes-costo/exportar')
 def exportar_componentes_costo_excel():

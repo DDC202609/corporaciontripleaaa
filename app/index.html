@@ -606,7 +606,7 @@ document.head.insertAdjacentHTML('beforeend',`<style>
 .access-tabs{display:flex;gap:8px;margin:16px 0}.permission-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px 16px;margin-top:14px}.permission-row{display:grid;grid-template-columns:1fr 74px 88px;gap:8px;align-items:center;padding:9px 10px;border:1px solid #e4e7ec;border-radius:8px;font-size:13px}.permission-head{color:#667085;font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.04em;background:#f8fafc}.permission-row input{width:auto;justify-self:center}.access-badge{display:inline-flex;padding:3px 8px;border-radius:99px;background:#ecfdf3;color:#067647;font-size:12px;font-weight:800}.access-badge.inactive{background:#f2f4f7;color:#667085}@media(max-width:950px){.permission-grid{grid-template-columns:1fr}} 
 </style>`);
 const accessModules=[
-  ['dashboard','Dashboard'],['vehiculos','Vehículos'],['informacion_vehiculo','Información de vehículo'],['proveedores','Proveedores'],['adquisiciones','Adquisiciones'],['taller','Taller'],['costeo','Costeo'],['ventas','Ventas y cobros'],['vendedores','Vendedores'],['inventario','Consulta de inventario'],['reporte_ventas','Reporte de ventas'],['catalogo','Catálogo contable'],['centros_costo','Centros de costo'],['contabilidad','Contabilidad'],['caja_bancos','Caja y bancos'],['gastos','Registro de gastos'],['comisiones','Comisiones']
+  ['dashboard','Dashboard'],['vehiculos','Vehículos'],['informacion_vehiculo','Información de vehículo'],['proveedores','Proveedores'],['adquisiciones','Adquisiciones'],['taller','Taller'],['costeo','Costeo'],['ventas','Ventas y cobros'],['vendedores','Vendedores'],['inventario','Consulta de inventario'],['reporte_ventas','Reporte de ventas'],['reporte_combustible','Reporte de combustible'],['catalogo','Catálogo contable'],['centros_costo','Centros de costo'],['contabilidad','Contabilidad'],['caja_bancos','Caja y bancos'],['gastos','Registro de gastos'],['comisiones','Comisiones']
 ];
 let accessSession=null,accessProfiles=[],accessUsers=[];
 let navForAccess=document.querySelector('aside nav'),logoutForAccess=$('logoutNavigation');
@@ -1833,6 +1833,23 @@ const applyAccessUIWithSalesReport=applyAccessUI;
 applyAccessUI=function(){applyAccessUIWithSalesReport();let alias=String(accessSession?.usuario||'').toLowerCase().split('@')[0].replace(/[^a-z0-9]/g,''),limited='alorenzo';$('salesReportNavigation')?.classList.toggle('hidden',alias===limited)};
 const goWithSalesReport=go;
 go=function(id,button){goWithSalesReport(id,button);if(id==='salesReport')void loadSalesReport()};
+/* Reporte de combustible: permite revisar qué unidad se abasteció y detectar
+   cualquier gasto histórico que todavía no tenga VIN relacionado. */
+if(!$('fuelReport'))document.querySelector('main').insertAdjacentHTML('beforeend',`<section id="fuelReport" class="hidden"><div class="top"><div><h1>Reporte de combustible</h1><div class="sub">Compras de combustible registradas por vehículo y gasolinera.</div></div></div><div class="panel"><div class="toolbar"><div class="field" style="margin:0"><label>Desde</label><input id="fuelReportFrom" type="date"></div><div class="field" style="margin:0"><label>Hasta</label><input id="fuelReportTo" type="date"></div><button class="primary" type="button" onclick="loadFuelReport()">Aplicar filtro</button><button class="btn2" type="button" onclick="clearFuelReportFilters()">Limpiar</button></div></div><div class="panel wide-table"><div class="detailhead"><div><h2 style="margin:0">Combustible por vehículo</h2><div id="fuelReportSummary" class="sub">Consulte las compras de combustible realizadas.</div></div></div><table><thead><tr><th>Fecha</th><th>Vehículo</th><th>Monto</th><th>Gasolinera</th></tr></thead><tbody id="fuelReportBody"><tr><td colspan="4" class="sub">Aplique un filtro para consultar los registros.</td></tr></tbody></table></div></section>`);
+function clearFuelReportFilters(){$('fuelReportFrom').value='';$('fuelReportTo').value='';void loadFuelReport()}
+async function loadFuelReport(){
+  let desde=$('fuelReportFrom').value,hasta=$('fuelReportTo').value,params=new URLSearchParams();if(desde)params.set('desde',desde);if(hasta)params.set('hasta',hasta);
+  let response=await fetch(`/api/reportes/combustible${params.toString()?`?${params}`:''}`),result=await response.json();
+  if(!response.ok){$('fuelReportBody').innerHTML=`<tr><td colspan="4" class="sub">${esc(result.error||'No fue posible consultar el reporte.')}</td></tr>`;return showNotice(result.error||'No fue posible consultar el reporte.','error')}
+  let total=result.reduce((sum,row)=>sum+Number(row.total||0),0),sinVin=result.filter(row=>!row.vehiculo_id).length;
+  $('fuelReportSummary').textContent=`${result.length} compra(s) · Total: ${money(total)}${sinVin?` · ${sinVin} sin VIN asignado`:''}`;
+  $('fuelReportBody').innerHTML=result.map(row=>`<tr><td>${salesReportDate(row.fecha)}</td><td>${esc(row.vehiculo||'Sin vehículo asignado')}</td><td><b>${money(row.total)}</b></td><td>${esc(row.gasolinera||'—')}</td></tr>`).join('')||'<tr><td colspan="4" class="sub">No hay compras de combustible en el rango seleccionado.</td></tr>';
+}
+if(consultationsGroup&&!$('fuelReportNavigation')){let body=consultationsGroup.querySelector('.nav-group-body')||consultationsGroup;body.insertAdjacentHTML('beforeend','<button id="fuelReportNavigation" onclick="go(\'fuelReport\',this)">⛽ <span>Reporte de combustible</span></button>')}
+const accessModuleForNavigationWithFuelReport=accessModuleForNavigation;
+accessModuleForNavigation=function(id){return id==='fuelReport'?'reporte_combustible':accessModuleForNavigationWithFuelReport(id)};
+const goWithFuelReport=go;
+go=function(id,button){goWithFuelReport(id,button);if(id==='fuelReport')void loadFuelReport()};
 /* Pagos de costeo: Grúa, Flete e impuestos no pueden aumentar el inventario
    sin dejar documentada la contrapartida. Ajuste de compra conserva su flujo
    propio contra CxP y deliberadamente no aparece en este bloque. */
