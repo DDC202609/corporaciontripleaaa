@@ -4432,10 +4432,14 @@ def filas_reporte_ciclo_conversion(desde,hasta):
         fecha_adquisicion="COALESCE((SELECT MIN(a.fecha) FROM adquisiciones a WHERE a.vehiculo_id=v.id),v.fecha_adquisicion)"
         sql=f'''SELECT ve.id,ve.vehiculo_id,ve.numero_transaccion,ve.fecha fecha_venta,ve.precio venta,
             COALESCE(ve.precio_lista,COALESCE(ve.precio,0)+COALESCE(ve.descuento,0)) precio_lista,
-            v.vin,v.marca,v.modelo,v.version,v.anio,v.placa,v.tipo_compra,v.proveedor proveedor,{fecha_adquisicion} fecha_adquisicion,
+            v.vin,v.marca,v.modelo,v.version,v.anio,v.placa,v.tipo_compra,v.proveedor proveedor,v.precio_compra,
+            COALESCE(ca.ajuste_compra,0) ajuste_compra,COALESCE(ca.grua,0) grua,COALESCE(ca.flete,0) flete,
+            COALESCE(ca.isv_pagado,0) isv_pagado,COALESCE(ca.cl_std,0) cl_std,COALESCE(ca.almacenaje,0) almacenaje,
+            COALESCE(ca.gastos_aduaneros,0) gastos_aduaneros,{fecha_adquisicion} fecha_adquisicion,
             CASE WHEN {fecha_adquisicion} IS NOT NULL
                 THEN CAST(julianday(ve.fecha)-julianday({fecha_adquisicion}) AS INTEGER) END dias_conversion
-            FROM ventas ve JOIN vehiculos v ON v.id=ve.vehiculo_id WHERE 1=1'''
+            FROM ventas ve JOIN vehiculos v ON v.id=ve.vehiculo_id
+            LEFT JOIN costos_adquisicion ca ON ca.vehiculo_id=v.id WHERE 1=1'''
         args=[]
         if desde:
             sql+=' AND ve.fecha>=?'; args.append(desde)
@@ -4444,6 +4448,8 @@ def filas_reporte_ciclo_conversion(desde,hasta):
         rows=[]
         for row in c.execute(sql+' ORDER BY ve.fecha DESC,COALESCE(ve.correlativo,0) DESC,ve.id DESC',args).fetchall():
             item=dict(row)
+            item['costo_total_costeo']=round(sum(float(item[key] or 0) for key in ('precio_compra','ajuste_compra','grua','flete','isv_pagado','cl_std','almacenaje','gastos_aduaneros')),2)
+            item['gastos_reparaciones']=round(float(c.execute('SELECT COALESCE(SUM(monto),0) FROM costos_vehiculo WHERE vehiculo_id=?',(item['vehiculo_id'],)).fetchone()[0] or 0),2)
             item['costo']=round(float(costo_consolidado(c,item['vehiculo_id']) or 0),2)
             item['venta']=round(float(item.get('venta') or 0),2)
             item['vehiculo']=' · '.join(filter(None,[item.get('vin'),' '.join(filter(None,[item.get('marca'),item.get('modelo')])),item.get('placa')])) or '—'
@@ -4454,8 +4460,8 @@ def filas_reporte_ciclo_conversion(desde,hasta):
 
 def archivo_excel_ciclo_conversion(rows):
     """Exportación ligera y compatible con Excel del ciclo de conversión."""
-    headers=['No. transacción','VIN','Marca','Modelo','Año','Tipo de compra','Proveedor','Fecha adquisición','Fecha venta','Costo','Precio de lista','Venta','Ciclo de conversión (días)']
-    columns=['numero_transaccion','vin','marca','modelo','anio','tipo_compra','proveedor','fecha_adquisicion','fecha_venta','costo','precio_lista','venta','dias_conversion']
+    headers=['No. transacción','VIN','Marca','Modelo','Año','Tipo de compra','Proveedor','Fecha adquisición','Fecha venta','Costo total de costeo','Gastos de reparaciones','Costo consolidado','Precio de lista','Venta','Ciclo de conversión (días)']
+    columns=['numero_transaccion','vin','marca','modelo','anio','tipo_compra','proveedor','fecha_adquisicion','fecha_venta','costo_total_costeo','gastos_reparaciones','costo','precio_lista','venta','dias_conversion']
     def col(index):
         text=''
         while index:
@@ -4471,9 +4477,9 @@ def archivo_excel_ciclo_conversion(rows):
     for row_number,row in enumerate(rows,2):
         values=[]
         for index,key in enumerate(columns,1):
-            values.append(cell(f'{col(index)}{row_number}',row.get(key),2 if key in {'costo','precio_lista','venta'} else None,key in {'costo','precio_lista','venta','dias_conversion'}))
+            values.append(cell(f'{col(index)}{row_number}',row.get(key),2 if key in {'costo_total_costeo','gastos_reparaciones','costo','precio_lista','venta'} else None,key in {'costo_total_costeo','gastos_reparaciones','costo','precio_lista','venta','dias_conversion'}))
         lines.append(f'<row r="{row_number}">'+''.join(values)+'</row>')
-    sheet='<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews><sheetFormatPr defaultRowHeight="15"/><cols>'+''.join(f'<col min="{index}" max="{index}" width="{width}" customWidth="1"/>' for index,width in enumerate((18,22,16,20,10,18,28,18,16,16,16,16,27),1))+'</cols><sheetData>'+''.join(lines)+'</sheetData><autoFilter ref="A1:M'+str(max(1,len(rows)+1))+'"/></worksheet>'
+    sheet='<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews><sheetFormatPr defaultRowHeight="15"/><cols>'+''.join(f'<col min="{index}" max="{index}" width="{width}" customWidth="1"/>' for index,width in enumerate((18,22,16,20,10,18,28,18,16,19,21,18,16,16,27),1))+'</cols><sheetData>'+''.join(lines)+'</sheetData><autoFilter ref="A1:O'+str(max(1,len(rows)+1))+'"/></worksheet>'
     styles_xml='<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><numFmts count="1"><numFmt numFmtId="164" formatCode="&quot;L&quot; #,##0.00"/></numFmts><fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><color rgb="FFFFFFFF"/><sz val="11"/><name val="Calibri"/></font></fonts><fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FF175CD3"/><bgColor indexed="64"/></patternFill></fill></fills><borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellXfs count="3"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/><xf numFmtId="0" fontId="1" fillId="1" borderId="0" applyFont="1" applyFill="1"/><xf numFmtId="164" fontId="0" fillId="0" borderId="0" applyNumberFormat="1"/></cellXfs></styleSheet>'
     output=io.BytesIO()
     with zipfile.ZipFile(output,'w',zipfile.ZIP_DEFLATED) as archive:
