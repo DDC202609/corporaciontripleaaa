@@ -4511,7 +4511,7 @@ def filas_reporte_antiguedad_inventario():
     try:
         fecha_adquisicion="COALESCE((SELECT MIN(a.fecha) FROM adquisiciones a WHERE a.vehiculo_id=v.id),v.fecha_adquisicion)"
         hoy=ahora_operacion().strftime('%Y-%m-%d')
-        rows=c.execute(f'''SELECT v.id vehiculo_id,v.vin,v.marca,v.modelo,v.anio,v.precio_compra,
+        rows=c.execute(f'''SELECT v.id vehiculo_id,v.vin,v.marca,v.modelo,v.anio,v.proveedor,v.precio_venta,v.precio_compra,
             COALESCE(ca.ajuste_compra,0) ajuste_compra,COALESCE(ca.grua,0) grua,COALESCE(ca.flete,0) flete,
             COALESCE(ca.isv_pagado,0) isv_pagado,COALESCE(ca.cl_std,0) cl_std,
             COALESCE(ca.almacenaje,0) almacenaje,COALESCE(ca.gastos_aduaneros,0) gastos_aduaneros,
